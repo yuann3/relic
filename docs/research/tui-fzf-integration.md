@@ -335,7 +335,7 @@ Measure headless and full builds separately:
 
 ## Prototype storyboard
 
-[Prove the interactive search workspace](../../.scratch/relic-v0-1/issues/08-prove-the-interactive-search-workspace.md) should implement only:
+[Prove the interactive search workspace](https://github.com/yuann3/relic/issues/10) should implement only:
 
 1. deterministic fixture DB with 100k/1M searchable observations;
 2. shared `Search` app command and versioned JSON CLI;

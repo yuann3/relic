@@ -23,7 +23,7 @@ query
 
 Use `rusqlite` with a known bundled SQLite/FTS5 build for release artifacts, compact integer row IDs, externally stored sanitized text indexed by FTS5, bounded read-only Git subprocesses, and ordinary threads only for the model's depth-one child calls. Do not add Tokio, an ORM, async SQL, `git2`, embeddings, a vector store, a scripting VM, a plugin system, or a daemon.
 
-This is a design hypothesis until [Prove the ingestion and search performance envelope](../../.scratch/relic-v0-1/issues/06-prove-ingestion-and-search-performance.md) measures it. No latency or throughput below is presented as already achieved.
+This is a design hypothesis until [Prove the ingestion and search performance envelope](https://github.com/yuann3/relic/issues/8) measures it. No latency or throughput below is presented as already achieved.
 
 ## Why one synchronous process
 
