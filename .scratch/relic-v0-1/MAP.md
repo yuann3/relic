@@ -26,6 +26,8 @@ Ship a working Relic v0.1 for macOS and Linux: import local experience artifacts
 ## Decisions so far
 
 - [Define the Relic v0.1 destination](issues/00-define-relic-v0-1-destination.md) — The MVP includes execution through cited recall, explicit validation, skill compilation/activation, and measured held-out reuse; harnessd remains separate.
+- [Specify the bounded RLM and model boundary](issues/03-specify-rlm-and-model-boundary.md) — Use a seven-operator, depth-one typed RLM kernel with scoped evidence handles, hierarchical budgets, deterministic abstention, and one blocking capability-negotiated Chat Completions adapter.
+- [Determine whether Codex subscription authentication is officially usable](issues/04-determine-codex-subscription-authentication.md) — Optionally delegate to stable installed `codex login`/`codex exec`; never own OAuth or credentials, and keep separately billed OpenAI-compatible HTTP as the fallback.
 
 ## Not yet specified
 
