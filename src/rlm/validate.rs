@@ -1,0 +1,533 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::rlm::protocol::*;
+
+/// The kind of result an operator produces or consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleKind {
+    EvidenceSet,
+    AssessmentSet,
+    Inspection,
+}
+
+/// A plan that passed structural and semantic validation.
+#[derive(Debug)]
+pub struct ValidatedPlan {
+    pub ops: Vec<PlanOpV1>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ValidationError {
+    EmptyPlan,
+    TooManyOps { count: usize, max: usize },
+    DuplicateOpId(String),
+    UnknownInputRef { op_id: String, ref_id: String },
+    ForwardReference { op_id: String, ref_id: String },
+    WrongInputKind { op_id: String, expected: HandleKind, got: HandleKind },
+    StaleStateVersion { expected: u32, got: u32 },
+    SearchTooManyTerms { op_id: String, count: usize, max: usize },
+    SearchNoTerms { op_id: String },
+    LimitZero { op_id: String },
+    AssessBatchSizeZero { op_id: String },
+    AssessMaxItemsExceeded { op_id: String, count: u32, max: u32 },
+    ExpandWindowExceeded { op_id: String, per_side: u32, max: u32 },
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+const MAX_OPS_PER_PLAN: usize = 8;
+const MAX_SEARCH_TERMS: usize = 12;
+const MAX_ASSESS_ITEMS: u32 = 64;
+const MAX_EXPAND_PER_SIDE: u32 = 32;
+
+/// Validate a plan structurally and semantically.
+pub fn validate_plan(
+    action: &RootActionV1,
+    current_state_version: u32,
+) -> Result<ValidatedPlan, ValidationError> {
+    if action.expected_state_version != current_state_version {
+        return Err(ValidationError::StaleStateVersion {
+            expected: current_state_version,
+            got: action.expected_state_version,
+        });
+    }
+
+    let plan = action.plan.as_ref().ok_or(ValidationError::EmptyPlan)?;
+
+    if plan.ops.is_empty() {
+        return Err(ValidationError::EmptyPlan);
+    }
+    if plan.ops.len() > MAX_OPS_PER_PLAN {
+        return Err(ValidationError::TooManyOps {
+            count: plan.ops.len(),
+            max: MAX_OPS_PER_PLAN,
+        });
+    }
+
+    // Check for duplicate op_ids and build index.
+    let mut seen_ids = HashSet::new();
+    let mut op_index: HashMap<&str, usize> = HashMap::new();
+    for (i, op) in plan.ops.iter().enumerate() {
+        let id = op_id(op);
+        if !seen_ids.insert(id) {
+            return Err(ValidationError::DuplicateOpId(id.to_string()));
+        }
+        op_index.insert(id, i);
+    }
+
+    // Validate each op: resolve inputs, check kinds, check limits.
+    let mut output_kinds: HashMap<&str, HandleKind> = HashMap::new();
+
+    for (i, op) in plan.ops.iter().enumerate() {
+        let id = op_id(op);
+
+        // Validate operator-specific limits.
+        validate_op_limits(op)?;
+
+        // Resolve inputs and check for forward references.
+        for input in op_inputs(op) {
+            if let InputRefV1::Output(ref_id) = input {
+                match op_index.get(ref_id.as_str()) {
+                    None => {
+                        return Err(ValidationError::UnknownInputRef {
+                            op_id: id.to_string(),
+                            ref_id: ref_id.clone(),
+                        });
+                    }
+                    Some(&ref_pos) if ref_pos >= i => {
+                        return Err(ValidationError::ForwardReference {
+                            op_id: id.to_string(),
+                            ref_id: ref_id.clone(),
+                        });
+                    }
+                    Some(_) => {}
+                }
+
+                // Check input kind compatibility.
+                if let Some(&input_kind) = output_kinds.get(ref_id.as_str()) {
+                    let expected = expected_input_kind(op);
+                    if let Some(exp) = expected
+                        && exp != input_kind
+                    {
+                        return Err(ValidationError::WrongInputKind {
+                            op_id: id.to_string(),
+                            expected: exp,
+                            got: input_kind,
+                        });
+                    }
+                }
+            }
+            // Handle references are validated at execution time (they refer to
+            // pre-existing handles in the registry, not plan outputs).
+        }
+
+        output_kinds.insert(id, output_kind(op));
+    }
+
+    Ok(ValidatedPlan {
+        ops: plan.ops.clone(),
+    })
+}
+
+fn op_id(op: &PlanOpV1) -> &str {
+    match op {
+        PlanOpV1::Search(s) => &s.op_id,
+        PlanOpV1::Expand(e) => &e.op_id,
+        PlanOpV1::Relate(r) => &r.op_id,
+        PlanOpV1::Combine(c) => &c.op_id,
+        PlanOpV1::Assess(a) => &a.op_id,
+        PlanOpV1::Select(s) => &s.op_id,
+        PlanOpV1::Inspect(i) => &i.op_id,
+    }
+}
+
+fn op_inputs(op: &PlanOpV1) -> Vec<&InputRefV1> {
+    match op {
+        PlanOpV1::Search(_) => vec![],
+        PlanOpV1::Expand(e) => vec![&e.input],
+        PlanOpV1::Relate(r) => vec![&r.input],
+        PlanOpV1::Combine(c) => c.inputs.iter().collect(),
+        PlanOpV1::Assess(a) => vec![&a.input],
+        PlanOpV1::Select(s) => vec![&s.input],
+        PlanOpV1::Inspect(i) => vec![&i.input],
+    }
+}
+
+fn output_kind(op: &PlanOpV1) -> HandleKind {
+    match op {
+        PlanOpV1::Search(_) => HandleKind::EvidenceSet,
+        PlanOpV1::Expand(_) => HandleKind::EvidenceSet,
+        PlanOpV1::Relate(_) => HandleKind::EvidenceSet,
+        PlanOpV1::Combine(_) => HandleKind::EvidenceSet,
+        PlanOpV1::Assess(_) => HandleKind::AssessmentSet,
+        PlanOpV1::Select(_) => HandleKind::EvidenceSet,
+        PlanOpV1::Inspect(_) => HandleKind::Inspection,
+    }
+}
+
+/// What input kind does this operator expect? None means "any".
+fn expected_input_kind(op: &PlanOpV1) -> Option<HandleKind> {
+    match op {
+        PlanOpV1::Search(_) => None,
+        PlanOpV1::Expand(_) => Some(HandleKind::EvidenceSet),
+        PlanOpV1::Relate(_) => Some(HandleKind::EvidenceSet),
+        PlanOpV1::Combine(_) => Some(HandleKind::EvidenceSet),
+        PlanOpV1::Assess(_) => Some(HandleKind::EvidenceSet),
+        PlanOpV1::Select(_) => Some(HandleKind::AssessmentSet),
+        PlanOpV1::Inspect(_) => Some(HandleKind::EvidenceSet),
+    }
+}
+
+fn validate_op_limits(op: &PlanOpV1) -> Result<(), ValidationError> {
+    match op {
+        PlanOpV1::Search(s) => {
+            if s.terms.is_empty() {
+                return Err(ValidationError::SearchNoTerms {
+                    op_id: s.op_id.clone(),
+                });
+            }
+            if s.terms.len() > MAX_SEARCH_TERMS {
+                return Err(ValidationError::SearchTooManyTerms {
+                    op_id: s.op_id.clone(),
+                    count: s.terms.len(),
+                    max: MAX_SEARCH_TERMS,
+                });
+            }
+            if s.limit == 0 {
+                return Err(ValidationError::LimitZero {
+                    op_id: s.op_id.clone(),
+                });
+            }
+        }
+        PlanOpV1::Expand(e) => {
+            if e.limit == 0 {
+                return Err(ValidationError::LimitZero {
+                    op_id: e.op_id.clone(),
+                });
+            }
+            if e.before > MAX_EXPAND_PER_SIDE {
+                return Err(ValidationError::ExpandWindowExceeded {
+                    op_id: e.op_id.clone(),
+                    per_side: e.before,
+                    max: MAX_EXPAND_PER_SIDE,
+                });
+            }
+            if e.after > MAX_EXPAND_PER_SIDE {
+                return Err(ValidationError::ExpandWindowExceeded {
+                    op_id: e.op_id.clone(),
+                    per_side: e.after,
+                    max: MAX_EXPAND_PER_SIDE,
+                });
+            }
+        }
+        PlanOpV1::Assess(a) => {
+            if a.batch_size == 0 {
+                return Err(ValidationError::AssessBatchSizeZero {
+                    op_id: a.op_id.clone(),
+                });
+            }
+            if a.max_items > MAX_ASSESS_ITEMS {
+                return Err(ValidationError::AssessMaxItemsExceeded {
+                    op_id: a.op_id.clone(),
+                    count: a.max_items,
+                    max: MAX_ASSESS_ITEMS,
+                });
+            }
+            if a.max_items == 0 {
+                return Err(ValidationError::LimitZero {
+                    op_id: a.op_id.clone(),
+                });
+            }
+        }
+        PlanOpV1::Relate(r) => {
+            if r.limit == 0 {
+                return Err(ValidationError::LimitZero {
+                    op_id: r.op_id.clone(),
+                });
+            }
+        }
+        PlanOpV1::Combine(c) => {
+            if c.limit == 0 {
+                return Err(ValidationError::LimitZero {
+                    op_id: c.op_id.clone(),
+                });
+            }
+        }
+        PlanOpV1::Select(s) => {
+            if s.limit == 0 {
+                return Err(ValidationError::LimitZero {
+                    op_id: s.op_id.clone(),
+                });
+            }
+        }
+        PlanOpV1::Inspect(i) => {
+            if i.limit == 0 {
+                return Err(ValidationError::LimitZero {
+                    op_id: i.op_id.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_action(state_version: u32, ops: Vec<PlanOpV1>) -> RootActionV1 {
+        RootActionV1 {
+            version: 1,
+            expected_state_version: state_version,
+            kind: RootActionKind::Plan,
+            plan: Some(PlanV1 { ops }),
+            finish: None,
+        }
+    }
+
+    fn search(id: &str, terms: &[&str], limit: u32) -> PlanOpV1 {
+        PlanOpV1::Search(SearchV1 {
+            op_id: id.to_string(),
+            terms: terms.iter().map(|s| s.to_string()).collect(),
+            match_mode: MatchMode::Any,
+            limit,
+        })
+    }
+
+    fn expand(id: &str, input_op: &str) -> PlanOpV1 {
+        PlanOpV1::Expand(ExpandV1 {
+            op_id: id.to_string(),
+            input: InputRefV1::Output(input_op.to_string()),
+            scope: ExpandScope::SameSource,
+            before: 5,
+            after: 5,
+            limit: 100,
+        })
+    }
+
+    fn assess(id: &str, input_op: &str) -> PlanOpV1 {
+        PlanOpV1::Assess(AssessV1 {
+            op_id: id.to_string(),
+            input: InputRefV1::Output(input_op.to_string()),
+            objective: "test".to_string(),
+            max_items: 32,
+            batch_size: 4,
+        })
+    }
+
+    fn select(id: &str, input_op: &str) -> PlanOpV1 {
+        PlanOpV1::Select(SelectV1 {
+            op_id: id.to_string(),
+            input: InputRefV1::Output(input_op.to_string()),
+            verdicts: vec![Verdict::Supports],
+            limit: 20,
+        })
+    }
+
+    fn inspect(id: &str, input_op: &str) -> PlanOpV1 {
+        PlanOpV1::Inspect(InspectV1 {
+            op_id: id.to_string(),
+            input: InputRefV1::Output(input_op.to_string()),
+            limit: 12,
+            max_item_bytes: 2048,
+        })
+    }
+
+    #[test]
+    fn valid_plan_passes() {
+        let action = make_action(0, vec![
+            search("s1", &["cargo"], 50),
+            expand("e1", "s1"),
+            assess("a1", "e1"),
+            select("k1", "a1"),
+            inspect("i1", "k1"),
+        ]);
+        assert!(validate_plan(&action, 0).is_ok());
+    }
+
+    #[test]
+    fn empty_plan_rejected() {
+        let action = make_action(0, vec![]);
+        assert_eq!(validate_plan(&action, 0).unwrap_err(), ValidationError::EmptyPlan);
+    }
+
+    #[test]
+    fn too_many_ops_rejected() {
+        let ops: Vec<PlanOpV1> = (0..9)
+            .map(|i| search(&format!("s{i}"), &["cargo"], 50))
+            .collect();
+        let action = make_action(0, ops);
+        assert!(matches!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::TooManyOps { count: 9, max: 8 }
+        ));
+    }
+
+    #[test]
+    fn duplicate_op_id_rejected() {
+        let action = make_action(0, vec![
+            search("s1", &["cargo"], 50),
+            search("s1", &["git"], 50),
+        ]);
+        assert_eq!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::DuplicateOpId("s1".to_string())
+        );
+    }
+
+    #[test]
+    fn forward_reference_rejected() {
+        let action = make_action(0, vec![
+            expand("e1", "s1"),
+            search("s1", &["cargo"], 50),
+        ]);
+        assert!(matches!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::ForwardReference { .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_input_ref_rejected() {
+        let action = make_action(0, vec![
+            expand("e1", "nonexistent"),
+        ]);
+        assert!(matches!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::UnknownInputRef { .. }
+        ));
+    }
+
+    #[test]
+    fn wrong_input_kind_rejected() {
+        // select expects assessment_set, but search produces evidence_set
+        let action = make_action(0, vec![
+            search("s1", &["cargo"], 50),
+            select("k1", "s1"),
+        ]);
+        assert!(matches!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::WrongInputKind {
+                expected: HandleKind::AssessmentSet,
+                got: HandleKind::EvidenceSet,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stale_state_version_rejected() {
+        let action = make_action(2, vec![
+            search("s1", &["cargo"], 50),
+        ]);
+        assert_eq!(
+            validate_plan(&action, 5).unwrap_err(),
+            ValidationError::StaleStateVersion { expected: 5, got: 2 }
+        );
+    }
+
+    #[test]
+    fn search_too_many_terms_rejected() {
+        let terms: Vec<&str> = (0..13).map(|_| "x").collect();
+        let action = make_action(0, vec![search("s1", &terms, 50)]);
+        assert!(matches!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::SearchTooManyTerms { .. }
+        ));
+    }
+
+    #[test]
+    fn search_no_terms_rejected() {
+        let action = make_action(0, vec![search("s1", &[], 50)]);
+        assert!(matches!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::SearchNoTerms { .. }
+        ));
+    }
+
+    #[test]
+    fn limit_zero_rejected() {
+        let action = make_action(0, vec![search("s1", &["cargo"], 0)]);
+        assert!(matches!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::LimitZero { .. }
+        ));
+    }
+
+    #[test]
+    fn assess_batch_size_zero_rejected() {
+        let action = make_action(0, vec![
+            search("s1", &["cargo"], 50),
+            PlanOpV1::Assess(AssessV1 {
+                op_id: "a1".to_string(),
+                input: InputRefV1::Output("s1".to_string()),
+                objective: "test".to_string(),
+                max_items: 8,
+                batch_size: 0,
+            }),
+        ]);
+        assert!(matches!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::AssessBatchSizeZero { .. }
+        ));
+    }
+
+    #[test]
+    fn assess_max_items_exceeded_rejected() {
+        let action = make_action(0, vec![
+            search("s1", &["cargo"], 50),
+            PlanOpV1::Assess(AssessV1 {
+                op_id: "a1".to_string(),
+                input: InputRefV1::Output("s1".to_string()),
+                objective: "test".to_string(),
+                max_items: 65,
+                batch_size: 4,
+            }),
+        ]);
+        assert!(matches!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::AssessMaxItemsExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn expand_window_exceeded_rejected() {
+        let action = make_action(0, vec![
+            search("s1", &["cargo"], 50),
+            PlanOpV1::Expand(ExpandV1 {
+                op_id: "e1".to_string(),
+                input: InputRefV1::Output("s1".to_string()),
+                scope: ExpandScope::SameSource,
+                before: 33,
+                after: 5,
+                limit: 100,
+            }),
+        ]);
+        assert!(matches!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::ExpandWindowExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn arbitrary_json_never_panics() {
+        let bad_inputs = [
+            "null", "42", "\"hello\"", "[]", "{}",
+            r#"{"version":1,"expected_state_version":0,"kind":"plan","plan":{"ops":[null]}}"#,
+            r#"{"version":1,"expected_state_version":0,"kind":"plan","plan":{"ops":[{"op":"search"}]}}"#,
+            r#"{"op":"search","op_id":true}"#,
+        ];
+        for input in &bad_inputs {
+            // Must not panic — Ok or Err both fine.
+            let _ = serde_json::from_str::<RootActionV1>(input);
+            let _ = serde_json::from_str::<ChildResultV1>(input);
+            let _ = serde_json::from_str::<PlanOpV1>(input);
+        }
+    }
+}

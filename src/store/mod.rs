@@ -120,6 +120,24 @@ impl Store {
         self.conn.query_row("SELECT COUNT(*) FROM observation", [], |row| row.get(0))
     }
 
+    /// Create a dummy source + revision for tests. Returns the revision_id.
+    pub fn insert_raw_source_and_revision(&self) -> Result<i64, rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO source (logical_id, kind, private_locator, parser_contract, enabled)
+             VALUES (X'01', 1, X'00', 'zsh/v1', 1)",
+            [],
+        )?;
+        let source_id = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "INSERT INTO source_revision (source_id, revision_key, opened_len, stable_len,
+                boundary_guard, snapshot_fingerprint, parser_contract, redaction_revision,
+                imported_at_ms, complete)
+             VALUES (?1, X'AA', 1000, 1000, X'BB', X'CC', 'zsh/v1', 'r1', 0, 1)",
+            [source_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// Checkpoint the WAL. Call after large imports to compact the database.
     pub fn checkpoint(&self) -> Result<(), rusqlite::Error> {
         self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -217,6 +235,29 @@ impl Store {
         }
 
         Ok(hits)
+    }
+
+    /// Get neighboring observations within the same revision, by ordinal range.
+    pub fn get_neighbors(
+        &self,
+        revision_id: i64,
+        center_ordinal: i64,
+        before: u32,
+        after: u32,
+    ) -> Result<Vec<StoredObservation>, rusqlite::Error> {
+        let lo = center_ordinal - before as i64;
+        let hi = center_ordinal + after as i64;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, revision_id, ordinal, kind, observed_at_ms, safe_text,
+                    safe_hash, keyed_fingerprint, flags, provenance, locator
+             FROM observation
+             WHERE revision_id = ?1 AND ordinal >= ?2 AND ordinal <= ?3
+             ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![revision_id, lo, hi], |row| {
+            row_to_stored_observation(row)
+        })?;
+        rows.collect()
     }
 
     /// Read a single observation by row ID.
