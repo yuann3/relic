@@ -9,6 +9,7 @@ rusqlite = { version = "0.35", features = ["bundled", "modern_sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+ureq = { version = "3", features = ["json"] }
 
 [[bin]]
 name = "relic"
@@ -21,3 +22,8 @@ bench = false
 name = "perf_spike"
 path = "benches/perf_spike.rs"
 bench = false
+
+# PROTOTYPE — delete after P1 is resolved
+[[bin]]
+name = "jev_spike"
+path = "spikes/jev_spike.rs"
