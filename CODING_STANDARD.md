@@ -1,15 +1,43 @@
 # Coding Standard
 
-## Tautological tests considered harmful
+`cargo clippy -- -D warnings` and `cargo test` enforce mechanical rules. Don't review what the toolchain already catches.
 
-Tests must verify meaningful behavior through public interfaces. A test that cannot fail when the implementation is wrong — or that passes by restating the implementation — is worse than no test. Every test must be able to catch a real bug.
+## Surgical changes
 
-Prohibited patterns:
-- Asserting that a constructor returns a value you just constructed
-- Asserting that a setter sets a field
-- Mocking the thing under test then asserting the mock's behavior
-- `assert!(true)` or `assert_eq!(x, x)`
+- Change what the task needs. Nothing else.
+- No drive-by refactors, renames, or dependency bumps.
+- Bugs found along the way are follow-ups, not in-scope fixes.
+- Every change should delete something. A change that only adds is suspect.
 
-## Clippy must always be green
+## Simplicity
 
-All code must pass `cargo clippy -- -D warnings` with zero diagnostics. CI and local development both enforce this. No `#[allow(clippy::*)]` without a comment explaining why the lint is wrong for that specific case.
+- Simplest thing that works.
+- No abstraction until there is a second caller.
+- Prefer deleting to adding.
+
+## No backward compatibility
+
+- Break APIs freely. Update every call site.
+- No compat shims, deprecation paths, or re-exports for old names.
+
+## Tests
+
+- Every test must fail when the implementation is wrong.
+- No asserting against your own mock. No `assert!(true)`.
+- A fix without a reproducing test is a guess.
+- Test the seam, not the halves — run real data through both sides.
+- Scratch scripts stay scratch. Don't promote throwaway checks to committed tests.
+
+## Comments
+
+- Comment why, never what.
+- Worth it: rejected alternatives, silent traps, vendored edits, non-obvious values.
+- Not worth it: restating the next line, section banners, commented-out code.
+
+## Error visibility
+
+- A caught-and-retried error must leave a visible trace. Silent retries are hidden crashes.
+
+## Clippy
+
+`cargo clippy -- -D warnings` must pass with zero diagnostics. No `#[allow(clippy::*)]` without a comment explaining why.
