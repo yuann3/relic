@@ -4,8 +4,12 @@
 //!
 //! Run with:
 //!   cargo run --release --bin fixture_db -- target/fixtures/1m.db 1000000
-//!   cargo run --release --bin interactive_fts -- target/fixtures/1m.db target/fts-variants [RUNS]
+//!   cargo run --release --bin interactive_fts -- target/fixtures/1m.db target/fts-variants [RUNS] [--hot]
+//!
+//! `--hot` runs only the high-frequency-token prefix study (`hot_study`),
+//! which takes minutes instead of the full run's ~40.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -200,21 +204,27 @@ fn open_read(path: &Path) -> Connection {
 fn apply_schema(conn: &Connection, options: &str) -> Result<f64, rusqlite::Error> {
     let t = Instant::now();
     if !options.is_empty() {
-        conn.execute_batch(&format!(
-            "DROP TABLE observation_fts;
-             CREATE VIRTUAL TABLE observation_fts USING fts5(
-                 safe_text,
-                 content='observation',
-                 content_rowid='id',
-                 tokenize='unicode61 remove_diacritics 2',
-                 {options}
-             );
-             INSERT INTO observation_fts(observation_fts) VALUES('rebuild');"
-        ))?;
+        recreate_fts(conn, options)?;
     }
     let rebuild = t.elapsed().as_secs_f64();
     conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(rebuild)
+}
+
+/// Drop `observation_fts` and rebuild it from `observation` with the shipped
+/// arguments plus `options` (empty = the shipped schema exactly).
+fn recreate_fts(conn: &Connection, options: &str) -> Result<(), rusqlite::Error> {
+    let extra = if options.is_empty() { String::new() } else { format!(",\n{options}") };
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS observation_fts;
+         CREATE VIRTUAL TABLE observation_fts USING fts5(
+             safe_text,
+             content='observation',
+             content_rowid='id',
+             tokenize='unicode61 remove_diacritics 2'{extra}
+         );
+         INSERT INTO observation_fts(observation_fts) VALUES('rebuild');"
+    ))
 }
 
 fn build_variant(src: &Path, dir: &Path, schema: &Schema) -> (PathBuf, f64) {
@@ -288,12 +298,14 @@ struct Measured {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let hot_only = args.iter().any(|a| a == "--hot");
+    args.retain(|a| a != "--hot");
     let (src, work, runs) = match args.as_slice() {
         [s, w] => (s, w, 50),
         [s, w, r] => (s, w, r.parse().expect("RUNS must be a number")),
         _ => {
-            eprintln!("usage: interactive_fts <SOURCE.db> <WORK_DIR> [RUNS]");
+            eprintln!("usage: interactive_fts <SOURCE.db> <WORK_DIR> [RUNS] [--hot]");
             std::process::exit(2);
         }
     };
@@ -301,7 +313,7 @@ fn main() {
     let work = Path::new(work);
     fs::create_dir_all(work).unwrap();
 
-    println!("=== interactive FTS measurements ===");
+    println!("=== interactive FTS measurements{} ===", if hot_only { " (--hot)" } else { "" });
     println!("host: {}", shell("sysctl", &["-n", "hw.model", "machdep.cpu.brand_string", "hw.ncpu", "hw.memsize"]));
     println!("os: {}", shell("sw_vers", &["-productVersion"]));
     println!("load before: {}", shell("sysctl", &["-n", "vm.loadavg"]));
@@ -324,6 +336,12 @@ fn main() {
         mib(source_bytes),
         db_bytes(src)
     );
+
+    if hot_only {
+        hot_study(src, work, runs, source_bytes);
+        println!("\nload after: {}", shell("sysctl", &["-n", "vm.loadavg"]));
+        return;
+    }
 
     // --- Build and size every schema variant. ---
     println!("## Size per schema (after rebuild + VACUUM)\n");
@@ -582,6 +600,8 @@ fn main() {
         end_to_end(&paths[si], SCHEMAS[si].name, si == 0, runs);
     }
 
+    hot_study(src, work, runs, source_bytes);
+
     println!("\nload after: {}", shell("sysctl", &["-n", "vm.loadavg"]));
 }
 
@@ -694,6 +714,535 @@ fn end_to_end(path: &Path, name: &str, with_store: bool, runs: usize) {
     println!();
 }
 
+// ---------------------------------------------------------------------------
+// Hot-token prefixes.
+//
+// FTS5 answers a prefix token that has no prefix index of exactly its length
+// by merging the full doclist of every term under the prefix before the first
+// row comes out, so `ORDER BY rowid DESC LIMIT n` cannot exit early. The cost
+// follows the postings under the prefix, not its length: on the fixture
+// `"task"*` (one term, 93% of rows) costs far more than the whole word
+// `"task"`. This study finds the cheapest schema whose worst keystroke stays
+// under the gate when the corpus has dominant tokens.
+// ---------------------------------------------------------------------------
+
+/// How many of the most frequent tokens get every prefix length. Eight
+/// reaches the two most frequent tokens longer than four characters on the
+/// fixture (`config`, `cargo`).
+const HOT_TOKENS: usize = 8;
+/// Leading words for two-word keystrokes. On the fixture `git` never shares
+/// a row with `# task-N`; `cargo` always does.
+const HOT_LEADS: [&str; 2] = ["git", "cargo"];
+const HOT_PAGE: usize = 200;
+const GATE_MS: f64 = 20.0;
+/// Extra prefixes for the rewrite and cost-model tables: wide expansions
+/// (many small terms) rather than one dominant term.
+const WIDE_PROBES: [&str; 4] = ["c", "t", "1", "12"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Corpus {
+    /// The 1M fixture as built.
+    Fixture,
+    /// The fixture with `# task-N` renamed `# taskid-N`: the dominant token
+    /// becomes six characters, longer than any indexed prefix length.
+    LongHot,
+}
+
+impl Corpus {
+    fn label(self) -> &'static str {
+        match self {
+            Corpus::Fixture => "fixture",
+            Corpus::LongHot => "taskid corpus (fixture with `# task-N` renamed `# taskid-N`)",
+        }
+    }
+
+    fn hot_tokens(self) -> usize {
+        match self {
+            Corpus::Fixture => HOT_TOKENS,
+            Corpus::LongHot => 1,
+        }
+    }
+}
+
+struct HotSchema {
+    name: &'static str,
+    file: &'static str,
+    options: &'static str,
+    corpus: Corpus,
+}
+
+const fn hs(name: &'static str, file: &'static str, options: &'static str, corpus: Corpus) -> HotSchema {
+    HotSchema { name, file, options, corpus }
+}
+
+/// The first schema of each corpus is that corpus's reference.
+const HOT_SCHEMAS: &[HotSchema] = &[
+    hs("baseline", "hot_baseline", "", Corpus::Fixture),
+    hs("prefix='2'", "hot_prefix2", "prefix='2'", Corpus::Fixture),
+    hs("prefix='2 3'", "hot_prefix23", "prefix='2 3'", Corpus::Fixture),
+    hs("prefix='2 3 4'", "hot_prefix234", "prefix='2 3 4'", Corpus::Fixture),
+    hs("prefix='1 2 3 4'", "hot_prefix1234", "prefix='1 2 3 4'", Corpus::Fixture),
+    hs("taskid baseline", "hot_taskid_baseline", "", Corpus::LongHot),
+    hs("taskid prefix='2'", "hot_taskid_prefix2", "prefix='2'", Corpus::LongHot),
+    hs("taskid prefix='2 3 4'", "hot_taskid_prefix234", "prefix='2 3 4'", Corpus::LongHot),
+];
+
+/// A keystroke-shaped query with an owned text, so it can be generated from
+/// the corpus's own vocabulary.
+struct Keystroke {
+    text: String,
+    prefix: bool,
+    class: &'static str,
+}
+
+impl Keystroke {
+    fn new(text: impl Into<String>, prefix: bool, class: &'static str) -> Self {
+        Keystroke { text: text.into(), prefix, class }
+    }
+
+    fn escaped(&self) -> String {
+        escape(&self.text, self.prefix)
+    }
+
+    fn last(&self) -> &str {
+        self.text.split_whitespace().last().unwrap_or("")
+    }
+
+    fn head(&self) -> Vec<&str> {
+        let words: Vec<&str> = self.text.split_whitespace().collect();
+        words[..words.len().saturating_sub(1)].to_vec()
+    }
+
+    /// Characters in the `*` token; `None` for a whole-word query.
+    fn prefix_chars(&self) -> Option<usize> {
+        self.prefix.then(|| self.last().chars().count())
+    }
+
+    /// Whether the TUI sends it to FTS under its `MIN_PREFIX_CHARS` gate.
+    fn sent_by_tui(&self) -> bool {
+        self.prefix_chars().is_none_or(|n| n >= app::MIN_PREFIX_CHARS)
+    }
+}
+
+/// Every term with its document count, sorted by term. Read through a temp
+/// fts5vocab table, so nothing is written to the database file.
+fn vocabulary(conn: &Connection) -> Vec<(String, i64)> {
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.hot_vocab
+             USING fts5vocab(main, observation_fts, 'row');",
+    )
+    .unwrap();
+    let mut stmt = conn.prepare("SELECT term, doc FROM temp.hot_vocab ORDER BY term").unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The terms a prefix token expands to (byte-wise, like FTS5).
+fn expansion<'a>(vocab: &'a [(String, i64)], prefix: &str) -> &'a [(String, i64)] {
+    let start = vocab.partition_point(|(t, _)| t.as_str() < prefix);
+    let len = vocab[start..].iter().take_while(|(t, _)| t.starts_with(prefix)).count();
+    &vocab[start..start + len]
+}
+
+/// Terms and postings the last token touches: every expanded term for a
+/// prefix, the exact term for a whole word.
+fn touched(vocab: &[(String, i64)], k: &Keystroke) -> (usize, i64) {
+    let last = k.last().to_lowercase();
+    let terms: Vec<&(String, i64)> = if k.prefix {
+        expansion(vocab, &last).iter().collect()
+    } else {
+        vocab.iter().filter(|(t, _)| *t == last).collect()
+    };
+    (terms.len(), terms.iter().map(|(_, d)| d).sum())
+}
+
+/// Each prefix from two characters up to the full token, the whole word, and
+/// the same behind each lead word.
+fn hot_keystrokes(hot: &[(String, i64)]) -> Vec<Keystroke> {
+    let mut out = Vec::new();
+    for (token, _) in hot {
+        let chars: Vec<char> = token.chars().collect();
+        let prefixes: Vec<String> = (2..=chars.len()).map(|n| chars[..n].iter().collect()).collect();
+        for p in &prefixes {
+            out.push(Keystroke::new(p.as_str(), true, "hot prefix"));
+        }
+        out.push(Keystroke::new(token.as_str(), false, "hot word"));
+        for lead in HOT_LEADS.iter().filter(|&&l| l != token) {
+            for p in &prefixes {
+                out.push(Keystroke::new(format!("{lead} {p}"), true, "lead + hot prefix"));
+            }
+            out.push(Keystroke::new(format!("{lead} {token}"), false, "lead + hot word"));
+        }
+    }
+    out
+}
+
+/// `head AND (last_expr)`, with each head word quoted whole.
+fn with_last(k: &Keystroke, last_expr: &str) -> String {
+    let head = escape(&k.head().join(" "), false);
+    if head.is_empty() { format!("({last_expr})") } else { format!("{head} AND ({last_expr})") }
+}
+
+fn quote(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
+}
+
+/// Rewrite: the last token as a whole word OR as a prefix.
+fn word_or_prefix(k: &Keystroke) -> String {
+    let w = quote(k.last());
+    with_last(k, &format!("{w} OR {w}*"))
+}
+
+/// Rewrite: the prefix replaced by an OR of the terms it expands to. `None`
+/// when nothing matches the prefix (the result is then empty).
+fn or_of_terms(k: &Keystroke, terms: &[String]) -> Option<String> {
+    (!terms.is_empty())
+        .then(|| with_last(k, &terms.iter().map(|t| quote(t)).collect::<Vec<_>>().join(" OR ")))
+}
+
+/// Exclusive upper bound for a term range scan over `prefix*`.
+fn prefix_upper(prefix: &str) -> String {
+    format!("{prefix}\u{10FFFF}")
+}
+
+/// Terms under `prefix`, read from the temp fts5vocab table per keystroke.
+fn scan_terms(conn: &Connection, prefix: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare_cached("SELECT term FROM temp.hot_vocab WHERE term >= ?1 AND term < ?2")
+        .unwrap();
+    stmt.query_map([prefix, &prefix_upper(prefix)], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// Rows for the rowid-DESC page of an FTS expression; `None` means empty.
+fn page_rows(conn: &Connection, expr: Option<&str>, lower: Option<i64>) -> Vec<i64> {
+    match expr {
+        None => Vec::new(),
+        Some(e) => fts_rowids(conn, &fts_sql(Order::RowidDesc, lower.is_some()), &fts_params(e, HOT_PAGE + 1, lower))
+            .expect("fts query"),
+    }
+}
+
+/// Rewrite: run the last token as a whole word first. A full page of whole
+/// word hits proves the prefix page lies at or above its oldest rowid, so the
+/// prefix query is bounded there. Same rows as the plain prefix query.
+fn exact_first(conn: &Connection, k: &Keystroke) -> Vec<i64> {
+    let words = page_rows(conn, Some(&escape(&k.text, false)), None);
+    let lower = (words.len() == HOT_PAGE + 1).then(|| words[words.len() - 1] - 1);
+    page_rows(conn, Some(&k.escaped()), lower)
+}
+
+fn build_hot_variant(src: &Path, dir: &Path, schema: &HotSchema) -> PathBuf {
+    let dst = dir.join(format!("{}.db", schema.file));
+    for ext in ["db-wal", "db-shm"] {
+        let _ = fs::remove_file(dst.with_extension(ext));
+    }
+    fs::copy(src, &dst).expect("copy source db");
+    let conn = Connection::open(&dst).unwrap();
+    match schema.corpus {
+        Corpus::Fixture => {
+            apply_schema(&conn, schema.options).expect("apply schema variant");
+        }
+        Corpus::LongHot => {
+            conn.execute_batch(
+                "DROP TABLE observation_fts;
+                 UPDATE observation SET safe_text = replace(safe_text, '# task-', '# taskid-');",
+            )
+            .unwrap();
+            recreate_fts(&conn, schema.options).unwrap();
+            conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+    }
+    dst
+}
+
+fn p95(s: Stats) -> String {
+    format!("{:.2}", s.p95)
+}
+
+fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
+    println!("\n# Hot-token prefixes: rowid DESC, page {HOT_PAGE} (limit {}), p95 ms\n", HOT_PAGE + 1);
+    println!("## Size per hot-study schema (after rebuild + VACUUM)\n");
+    println!("| variant | corpus | DB MiB | ratio to source | fts MiB |");
+    println!("|---|---|---|---|---|");
+    let mut paths = Vec::new();
+    let mut ratios = Vec::new();
+    for schema in HOT_SCHEMAS {
+        let path = build_hot_variant(src, work, schema);
+        let bytes = db_bytes(&path) as f64;
+        let fts = size_breakdown(&open_read(&path))
+            .iter()
+            .find(|(n, _)| n == "fts")
+            .map_or(0.0, |(_, b)| *b as f64);
+        println!(
+            "| {} | {} | {} | {:.2}x | {} |",
+            schema.name,
+            if schema.corpus == Corpus::Fixture { "fixture" } else { "taskid" },
+            mib(bytes),
+            bytes / source_bytes,
+            mib(fts)
+        );
+        paths.push(path);
+        ratios.push(bytes / source_bytes);
+    }
+    eprintln!("built hot variants");
+
+    for corpus in [Corpus::Fixture, Corpus::LongHot] {
+        let variants: Vec<usize> =
+            (0..HOT_SCHEMAS.len()).filter(|&i| HOT_SCHEMAS[i].corpus == corpus).collect();
+        let base = open_read(&paths[variants[0]]);
+        let mut vocab = Vec::new();
+        let (vocab_load, _) = measure(runs.min(10), || {
+            vocab = vocabulary(&base);
+            vocab.len()
+        });
+        let records: i64 = base.query_row("SELECT count(*) FROM observation", [], |r| r.get(0)).unwrap();
+
+        println!("\n## {}\n", corpus.label());
+        println!(
+            "Full term list through fts5vocab (what an in-memory term cache would load): {} terms, {} ms (p50 / p95 / max, {} runs)\n",
+            vocab.len(),
+            cell(vocab_load),
+            runs.min(10)
+        );
+        println!("### Top 10 tokens by document frequency (fts5vocab 'row', {} distinct terms)\n", vocab.len());
+        println!("| # | token | chars | rows containing it | share of rows |");
+        println!("|---|---|---|---|---|");
+        let mut by_doc: Vec<(String, i64)> = vocab.clone();
+        by_doc.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (i, (t, d)) in by_doc.iter().take(10).enumerate() {
+            println!(
+                "| {} | `{t}` | {} | {d} | {:.1}% |",
+                i + 1,
+                t.chars().count(),
+                100.0 * *d as f64 / records as f64
+            );
+        }
+
+        // Keystroke set: the #10 set (fixture only), then the hot set.
+        let mut keys: Vec<Keystroke> = Vec::new();
+        if corpus == Corpus::Fixture {
+            keys.extend(QUERIES.iter().map(|q| Keystroke::new(q.text, q.prefix, q.class)));
+        }
+        keys.extend(hot_keystrokes(&by_doc[..corpus.hot_tokens().min(by_doc.len())]));
+        let mut seen = HashSet::new();
+        keys.retain(|k| seen.insert(k.escaped()));
+
+        // Time every keystroke on every schema of this corpus.
+        let mut timed: Vec<Vec<(Stats, Vec<i64>)>> = Vec::new();
+        for &vi in &variants {
+            let conn = open_read(&paths[vi]);
+            let row = keys
+                .iter()
+                .map(|k| {
+                    let mut rows = Vec::new();
+                    let (stats, _) = measure(runs, || {
+                        rows = page_rows(&conn, Some(&k.escaped()), None);
+                        rows.len()
+                    });
+                    (stats, rows)
+                })
+                .collect();
+            timed.push(row);
+            eprintln!("timed hot set on {}", HOT_SCHEMAS[vi].name);
+        }
+
+        println!(
+            "\n### Every keystroke (p95 ms; `!` marks rows that differ from {})\n",
+            HOT_SCHEMAS[variants[0]].name
+        );
+        let mut header =
+            "| query | class | `*` chars | terms under last token | postings under last token | matches |".to_owned();
+        for &vi in &variants {
+            header.push_str(&format!(" {} |", HOT_SCHEMAS[vi].name));
+        }
+        println!("{header}");
+        println!("|---|---|---|---|---|---|{}", "---|".repeat(variants.len()));
+        for (ki, k) in keys.iter().enumerate() {
+            let (terms, postings) = touched(&vocab, k);
+            let matches: i64 = base
+                .query_row(
+                    "SELECT count(*) FROM observation_fts WHERE observation_fts MATCH ?1",
+                    [k.escaped()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut line = format!(
+                "| `{}` | {} | {} | {terms} | {postings} | {matches} |",
+                k.escaped(),
+                k.class,
+                k.prefix_chars().map_or("word".to_owned(), |n| n.to_string()),
+            );
+            for row in &timed {
+                let (s, rows) = &row[ki];
+                let same = rows == &timed[0][ki].1;
+                line.push_str(&format!(" {}{} |", p95(*s), if same { "" } else { " !" }));
+            }
+            println!("{line}");
+        }
+
+        println!("\n### Summary: worst keystroke per schema\n");
+        println!(
+            "| variant | ratio to source | worst p95, keystrokes the TUI sends (last token >= {} chars or whole) | that query | worst p95, 1-char included | sent keystrokes > {GATE_MS} ms | sent keystrokes > 10 ms | rows differ |",
+            app::MIN_PREFIX_CHARS
+        );
+        println!("|---|---|---|---|---|---|---|---|");
+        for (row, &vi) in timed.iter().zip(&variants) {
+            let sent = || keys.iter().enumerate().filter(|(_, k)| k.sent_by_tui());
+            let (worst_i, worst) = sent()
+                .map(|(ki, _)| (ki, row[ki].0.p95))
+                .fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+            let all = row.iter().map(|(s, _)| s.p95).fold(0.0, f64::max);
+            let over = |ms: f64| sent().filter(|&(ki, _)| row[ki].0.p95 > ms).count();
+            let differ = (0..keys.len()).filter(|&ki| row[ki].1 != timed[0][ki].1).count();
+            println!(
+                "| {} | {:.2}x | {:.2} | `{}` | {:.2} | {} of {} | {} | {differ} |",
+                HOT_SCHEMAS[vi].name,
+                ratios[vi],
+                worst,
+                keys[worst_i].escaped(),
+                all,
+                over(GATE_MS),
+                sent().count(),
+                over(10.0),
+            );
+        }
+
+        // Hybrid: a prefix whose length has no prefix index becomes an OR of
+        // its expanded whole terms from the in-memory term list.
+        println!("\n### Hybrid: prefix index for short prefixes, OR of expanded terms above it (p95 ms)\n");
+        println!(
+            "| schema | OR rewrite for `*` tokens of | worst p95, keystrokes the TUI sends | that query | 2nd worst | most terms in one OR | sent keystrokes > {GATE_MS} ms | rows differ from plain |"
+        );
+        println!("|---|---|---|---|---|---|---|---|");
+        for (vj, &vi) in variants.iter().enumerate() {
+            let min_or = match HOT_SCHEMAS[vi].options {
+                "" => 2,
+                "prefix='2'" => 3,
+                _ => continue,
+            };
+            let conn = open_read(&paths[vi]);
+            let mut worst: Vec<(f64, usize)> = Vec::new();
+            let mut widest = 0;
+            let mut differ = 0;
+            for (ki, k) in keys.iter().enumerate().filter(|(_, k)| k.sent_by_tui()) {
+                let expr = if k.prefix_chars().is_some_and(|n| n >= min_or) {
+                    let terms: Vec<String> =
+                        expansion(&vocab, &k.last().to_lowercase()).iter().map(|(t, _)| t.clone()).collect();
+                    widest = widest.max(terms.len());
+                    or_of_terms(k, &terms)
+                } else {
+                    Some(k.escaped())
+                };
+                let mut rows = Vec::new();
+                let (s, _) = measure(runs, || {
+                    rows = page_rows(&conn, expr.as_deref(), None);
+                    rows.len()
+                });
+                differ += usize::from(rows != timed[vj][ki].1);
+                worst.push((s.p95, ki));
+            }
+            worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+            println!(
+                "| {} | >= {min_or} chars | {:.2} | `{}` | {:.2} (`{}`) | {widest} | {} | {differ} |",
+                HOT_SCHEMAS[vi].name,
+                worst[0].0,
+                keys[worst[0].1].escaped(),
+                worst[1].0,
+                keys[worst[1].1].escaped(),
+                worst.iter().filter(|w| w.0 > GATE_MS).count(),
+            );
+        }
+
+        if corpus == Corpus::Fixture {
+            rewrites(&base, &vocab, &keys, runs);
+        }
+    }
+}
+
+/// Index-free rewrites of a prefix keystroke on the baseline schema, against
+/// the plain prefix query they would replace.
+fn rewrites(conn: &Connection, vocab: &[(String, i64)], keys: &[Keystroke], runs: usize) {
+    let mut probes: Vec<Keystroke> = keys
+        .iter()
+        .filter(|k| k.prefix && (k.class.starts_with("hot") || k.class.starts_with("lead")))
+        .map(|k| Keystroke::new(k.text.as_str(), true, k.class))
+        .collect();
+    probes.extend(WIDE_PROBES.iter().map(|p| Keystroke::new(*p, true, "wide probe")));
+
+    println!("\n### Query rewrites on the baseline schema (p95 ms)\n");
+    println!(
+        "Columns: plain prefix (what Store sends); whole word only (changes results); word OR prefix; \
+         exact-first (whole-word page bounds a `rowid >=` range on the prefix query; same rows); \
+         per-keystroke fts5vocab term scan; OR of the expanded whole terms given a term list; \
+         scan + OR together (same rows).\n"
+    );
+    println!(
+        "| query | terms | postings | plain | whole word only | rows kept | word OR prefix | exact-first | rows same | vocab scan | OR of terms | scan + OR | rows same |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut model = Vec::new();
+    for k in &probes {
+        let (terms, postings) = touched(vocab, k);
+        let last = k.last().to_lowercase();
+        let expanded: Vec<String> = expansion(vocab, &last).iter().map(|(t, _)| t.clone()).collect();
+        let plain_rows = page_rows(conn, Some(&k.escaped()), None);
+
+        let (plain, _) = measure(runs, || page_rows(conn, Some(&k.escaped()), None).len());
+        let word_expr = escape(&k.text, false);
+        let word_rows = page_rows(conn, Some(&word_expr), None);
+        let (word, _) = measure(runs, || page_rows(conn, Some(&word_expr), None).len());
+        let kept = word_rows.iter().filter(|r| plain_rows.contains(r)).count();
+        let wop = word_or_prefix(k);
+        let (wop_s, _) = measure(runs, || page_rows(conn, Some(&wop), None).len());
+        let (exact, _) = measure(runs, || exact_first(conn, k).len());
+        let exact_same = exact_first(conn, k) == plain_rows;
+        let (scan, n) = measure(runs, || scan_terms(conn, &last).len());
+        assert_eq!(n, terms, "vocab scan disagrees with the in-memory vocabulary for {last:?}");
+        let or_expr = or_of_terms(k, &expanded);
+        let (or_s, _) = measure(runs, || page_rows(conn, or_expr.as_deref(), None).len());
+        let (both, _) = measure(runs, || {
+            let terms = scan_terms(conn, &last);
+            page_rows(conn, or_of_terms(k, &terms).as_deref(), None).len()
+        });
+        let or_same = page_rows(conn, or_expr.as_deref(), None) == plain_rows;
+        println!(
+            "| `{}` | {terms} | {postings} | {} | {} | {kept} of {} | {} | {} | {} | {} | {} | {} | {} |",
+            k.escaped(),
+            p95(plain),
+            p95(word),
+            plain_rows.len(),
+            p95(wop_s),
+            p95(exact),
+            if exact_same { "yes" } else { "NO" },
+            p95(scan),
+            p95(or_s),
+            p95(both),
+            if or_same { "yes" } else { "NO" },
+        );
+        if k.head().is_empty() {
+            model.push((k.escaped(), terms, postings, plain));
+        }
+    }
+
+    println!("\n### Cost model: single-token prefix on the baseline schema\n");
+    println!("| query | terms | postings | p50 ms | p95 ms | ns per posting (p50) |");
+    println!("|---|---|---|---|---|---|");
+    model.sort_by_key(|m| m.2);
+    for (q, terms, postings, s) in &model {
+        println!(
+            "| `{q}` | {terms} | {postings} | {:.2} | {:.2} | {:.1} |",
+            s.p50,
+            s.p95,
+            s.p50 * 1e6 / (*postings).max(1) as f64
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,5 +1347,87 @@ mod tests {
         assert_eq!((s.p50, s.p95, s.max), (50.0, 95.0, 100.0));
         let one = stats(vec![7.0]);
         assert_eq!((one.p50, one.p95, one.max), (7.0, 7.0, 7.0));
+    }
+
+    #[test]
+    fn hot_keystrokes_cover_every_prefix_length() {
+        let texts = |hot: &[(String, i64)]| -> Vec<(String, bool)> {
+            hot_keystrokes(hot).into_iter().map(|k| (k.text, k.prefix)).collect()
+        };
+        let task = texts(&[("task".to_owned(), 9)]);
+        for want in [("ta", true), ("tas", true), ("task", true), ("task", false), ("git ta", true), ("cargo tas", true), ("cargo task", false)] {
+            assert!(task.contains(&(want.0.to_owned(), want.1)), "{want:?} missing from {task:?}");
+        }
+        assert!(!task.iter().any(|(t, _)| t == "t"), "1-char prefixes are gated, not hot keystrokes");
+        // A hot token that is itself a lead word is not paired with itself.
+        assert!(!texts(&[("git".to_owned(), 9)]).iter().any(|(t, _)| t.starts_with("git gi")));
+    }
+
+    #[test]
+    fn expansion_is_the_bytewise_term_range() {
+        let vocab: Vec<(String, i64)> =
+            ["ta", "table", "tag", "task", "tasks", "tb", "z"].iter().map(|t| (t.to_string(), 1)).collect();
+        let terms = |p: &str| expansion(&vocab, p).iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>();
+        assert_eq!(terms("ta"), ["ta", "table", "tag", "task", "tasks"]);
+        assert_eq!(terms("task"), ["task", "tasks"]);
+        assert!(terms("q").is_empty());
+        assert!(prefix_upper("task").as_str() > "tasks~");
+    }
+
+    /// More than a page of `task` rows, with newer `tasks`/`tar` rows mixed
+    /// in, so the exact-first bound and the term expansion both matter.
+    fn hot_fixture_db(dir: &Path) -> PathBuf {
+        let history = dir.join("zsh_history");
+        let mut f = fs::File::create(&history).unwrap();
+        for i in 0..600 {
+            let cmd = match i % 5 {
+                0 => format!("tasks list {i}"),
+                1 => format!("tar xf a{i}.tar"),
+                2 => format!("git push # task-{i}"),
+                _ => format!("cargo build # task-{i}"),
+            };
+            writeln!(f, ": {}:0;{cmd}", 1_700_000_000 + i).unwrap();
+        }
+        let db = dir.join("hot.db");
+        let mut store = Store::open(&db).unwrap();
+        import_file(&mut store, &history, SourceKind::Zsh, &Redactor::new()).unwrap();
+        store.checkpoint().unwrap();
+        db
+    }
+
+    #[test]
+    fn prefix_preserving_rewrites_return_the_plain_prefix_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_read(&hot_fixture_db(dir.path()));
+        let vocab = vocabulary(&conn);
+        for text in ["ta", "tas", "task", "cargo ta", "cargo task", "git tas"] {
+            let k = Keystroke::new(text, true, "test");
+            let plain = page_rows(&conn, Some(&k.escaped()), None);
+            assert!(!plain.is_empty(), "{text}");
+            assert_eq!(exact_first(&conn, &k), plain, "exact-first {text}");
+            let terms = scan_terms(&conn, k.last());
+            assert_eq!(terms.len(), touched(&vocab, &k).0, "{text}");
+            assert_eq!(page_rows(&conn, or_of_terms(&k, &terms).as_deref(), None), plain, "terms {text}");
+            assert_eq!(page_rows(&conn, Some(&word_or_prefix(&k)), None), plain, "word OR prefix {text}");
+        }
+        // The exact-first bound is exercised: `task` alone fills a page.
+        let words = page_rows(&conn, Some("\"task\""), None);
+        assert_eq!(words.len(), HOT_PAGE + 1);
+        // Whole word only drops newer `tasks` rows: it changes the results.
+        let k = Keystroke::new("task", true, "test");
+        assert_ne!(words, page_rows(&conn, Some(&k.escaped()), None));
+        assert_eq!(or_of_terms(&Keystroke::new("zz", true, "test"), &[]), None);
+    }
+
+    #[test]
+    fn long_hot_variant_renames_the_dominant_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = hot_fixture_db(dir.path());
+        let schema = hs("t", "long", "prefix='2 3 4'", Corpus::LongHot);
+        let conn = open_read(&build_hot_variant(&src, dir.path(), &schema));
+        let vocab = vocabulary(&conn);
+        assert!(vocab.iter().any(|(t, _)| t == "taskid"));
+        assert!(!vocab.iter().any(|(t, _)| t == "task"));
+        assert!(!page_rows(&conn, Some("\"cargo\" \"taski\"*"), None).is_empty());
     }
 }
