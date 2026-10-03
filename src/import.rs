@@ -222,11 +222,7 @@ mod tests {
         let history_path = dir.path().join("zsh_history");
         {
             let mut f = fs::File::create(&history_path).unwrap();
-            write!(
-                f,
-                ": 1700000000:0;API_KEY=sk12345 cargo deploy\n"
-            )
-            .unwrap();
+            writeln!(f, ": 1700000000:0;API_KEY=sk12345 cargo deploy").unwrap();
         }
 
         let mut store = Store::open_memory().unwrap();
@@ -288,7 +284,7 @@ mod tests {
         let history_path = dir.path().join("zsh_history");
         {
             let mut f = fs::File::create(&history_path).unwrap();
-            write!(f, ": 1700000000:0;cargo build\n").unwrap();
+            writeln!(f, ": 1700000000:0;cargo build").unwrap();
         }
 
         let mut store = Store::open_memory().unwrap();
@@ -300,7 +296,7 @@ mod tests {
         // Append to file (different length).
         {
             let mut f = fs::OpenOptions::new().append(true).open(&history_path).unwrap();
-            write!(f, ": 1700000001:0;cargo test\n").unwrap();
+            writeln!(f, ": 1700000001:0;cargo test").unwrap();
         }
 
         // File is now longer — should reimport.
