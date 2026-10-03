@@ -13,6 +13,12 @@ pub const PAGE_LIMIT: usize = 200;
 /// Bounds the query so a huge paste cannot become a huge FTS expression.
 pub const QUERY_MAX_CHARS: usize = 256;
 pub const DOUBLE_INTERRUPT: Duration = Duration::from_secs(1);
+/// Rows the evidence pane draws above the text (`view::evidence`).
+const EVIDENCE_HEADER_ROWS: usize = 7;
+/// Columns inside the narrowest evidence pane the layout draws: 30% of the
+/// 100-column wide layout, less borders. Wrapping is estimated at this
+/// width so that scrolling never stops short of the text's last row.
+const EVIDENCE_MIN_COLS: usize = 28;
 
 /// Budget the confirmation promises. The fake recall stays inside it so the
 /// meter reads like the real one will.
@@ -187,6 +193,18 @@ impl EvidenceState {
     fn clear(&mut self) {
         *self = Self::default();
     }
+
+    /// Estimated rows the shown evidence wraps to. Scrolling stops once the
+    /// last of them reaches the top of the pane.
+    fn rows(&self) -> usize {
+        self.shown().map_or(0, |o| {
+            EVIDENCE_HEADER_ROWS
+                + o.safe_text
+                    .split('\n')
+                    .map(|l| l.chars().count().div_ceil(EVIDENCE_MIN_COLS).max(1))
+                    .sum::<usize>()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,7 +374,12 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
                     }
                 }
                 Err(e) => {
+                    // The old page belongs to a different query; showing it
+                    // under "search: failed" would pass it off as this one's.
                     m.search.error = Some(e);
+                    m.search.page = None;
+                    m.search.selected = 0;
+                    m.evidence.clear();
                     vec![]
                 }
             }
@@ -530,6 +553,7 @@ fn on_interrupt(m: &mut UiModel, at: Instant) -> Vec<UiEffect> {
 /// an in-flight result for the old text can never land on the new text.
 fn query_changed(m: &mut UiModel) -> Vec<UiEffect> {
     m.search.generation += 1;
+    m.search.error = None;
     m.notice = None;
     // An empty query is still a search: it pages the newest commands.
     m.search.pending = true;
@@ -568,7 +592,12 @@ fn move_by(m: &mut UiModel, delta: isize) -> Vec<UiEffect> {
             vec![]
         }
         Focus::Evidence => {
-            m.evidence.scroll = m.evidence.scroll.saturating_add_signed(delta as i16);
+            let end = u16::try_from(m.evidence.rows().saturating_sub(1)).unwrap_or(u16::MAX);
+            m.evidence.scroll = m
+                .evidence
+                .scroll
+                .saturating_add_signed(delta as i16)
+                .min(end);
             vec![]
         }
         Focus::Recall => vec![],
@@ -858,6 +887,61 @@ mod tests {
         assert_eq!(m.search.latency, Some(Duration::from_millis(3)));
         // The first hit's timeline loads right away.
         assert!(matches!(e[..], [UiEffect::OpenEvidence { id: 7 }]));
+    }
+
+    #[test]
+    fn a_failed_search_drops_the_old_page_and_the_next_edit_clears_the_error() {
+        let mut m = with_results();
+        update(
+            &mut m,
+            UiAction::EvidenceLoaded {
+                id: 10,
+                result: Ok(Some(view(10))),
+            },
+        );
+        keys(&mut m, "x");
+        let g = m.search.generation;
+        update(
+            &mut m,
+            UiAction::SearchDone {
+                generation: g,
+                result: Err("database is locked".into()),
+                elapsed: Duration::from_millis(3),
+            },
+        );
+        assert!(
+            m.search.page.is_none(),
+            "the old query's page must not show under the failed one"
+        );
+        assert!(m.search.selected_hit().is_none());
+        assert!(m.evidence.view.is_none() && m.evidence.wanted.is_none());
+        assert_eq!(m.search.error.as_deref(), Some("database is locked"));
+
+        let e = keys(&mut m, "y");
+        assert_eq!(searches(&e).len(), 1);
+        assert_eq!(m.search.error, None, "a new query is not failed yet");
+        assert!(m.search.pending);
+    }
+
+    #[test]
+    fn evidence_scroll_stops_at_the_end_of_the_content() {
+        let mut m = with_results();
+        update(
+            &mut m,
+            UiAction::EvidenceLoaded {
+                id: 10,
+                result: Ok(Some(view(10))),
+            },
+        );
+        m.focus = Focus::Evidence;
+        for _ in 0..1000 {
+            update(&mut m, UiAction::Key(Key::Down));
+        }
+        let end = m.evidence.scroll;
+        // Seven field lines and one line of text.
+        assert!((1..8).contains(&end), "scrolled to {end}");
+        update(&mut m, UiAction::Key(Key::Up));
+        assert_eq!(m.evidence.scroll, end - 1, "one key back from the end");
     }
 
     #[test]

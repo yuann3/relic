@@ -688,6 +688,24 @@ mod tests {
     }
 
     #[test]
+    fn evidence_scroll_reaches_the_end_of_a_wrapped_command_and_stops() {
+        let words: Vec<String> = (0..40).map(|i| format!("arg{i:02}")).collect();
+        let long = format!("{} TAILWORD", words.join(" "));
+        let store = store_with(&["ls", &long]);
+        let mut m = typed(&store, "arg00", false);
+        drive(&mut m, &store, UiAction::Key(Key::Enter));
+        assert_eq!(m.focus, Focus::Evidence);
+        for _ in 0..1000 {
+            drive(&mut m, &store, UiAction::Key(Key::Down));
+        }
+        assert!(m.evidence.scroll < 100, "scrolled to {}", m.evidence.scroll);
+        // The narrowest evidence pane (wide layout at 100 columns) and a
+        // short one: one line of text wraps to many rows here.
+        let s = text(&render(&m, 100, 14));
+        assert!(s.contains("TAILWORD"), "{s}");
+    }
+
+    #[test]
     fn tiny_terminal_says_so() {
         let store = store_with(NGINX);
         let m = typed(&store, "certb", false);

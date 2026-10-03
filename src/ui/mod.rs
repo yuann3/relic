@@ -13,15 +13,16 @@ mod view;
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, BufWriter, Stdout, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 
 use crate::app::{self, MatchMode, SearchRequest};
 use crate::picker::{self, PickError};
@@ -42,7 +43,6 @@ const TIMELINE_CONTEXT: u32 = 8;
 const ACTION_QUEUE: usize = 256;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-type Term = Terminal<CrosstermBackend<Stdout>>;
 
 pub fn run(db: &Path) -> Result<()> {
     let started = Instant::now();
@@ -51,6 +51,10 @@ pub fn run(db: &Path) -> Result<()> {
     let store = Store::open(db)?;
     let mono = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
+
+    let mut guard = TerminalGuard::enter()?;
+    // Spawned only once the terminal is ours, so a failed entry has no
+    // thread to stop.
     let mailbox = Arc::new(Mailbox::default());
     let worker = {
         let (db, mb, tx) = (db.to_path_buf(), Arc::clone(&mailbox), tx.clone());
@@ -58,8 +62,6 @@ pub fn run(db: &Path) -> Result<()> {
             .name("relic-search".into())
             .spawn(move || search_worker(&db, &mb, &tx, debounce()))?
     };
-
-    let mut guard = TerminalGuard::enter()?;
     let outcome = (|| {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         terminal.clear()?;
@@ -85,20 +87,28 @@ pub fn run(db: &Path) -> Result<()> {
         drop(rt);
         r
     })();
-    mailbox.close();
     let restored = guard.restore();
-    let _ = worker.join();
+    stop_worker(&mailbox, rx, worker);
     outcome?;
     restored?;
     Ok(())
 }
 
-struct Runtime {
+/// Closes the mailbox and joins the search worker. The receiver goes first:
+/// a worker blocked sending into a full channel that nobody drains any more
+/// only wakes when the send fails.
+fn stop_worker(mailbox: &Mailbox, rx: Receiver<UiAction>, worker: JoinHandle<()>) {
+    mailbox.close();
+    drop(rx);
+    let _ = worker.join();
+}
+
+struct Runtime<B: Backend> {
     store: Store,
     mailbox: Arc<Mailbox>,
     tx: SyncSender<UiAction>,
     input: InputReader,
-    terminal: Term,
+    terminal: Terminal<B>,
     recall: Option<(u64, Arc<AtomicBool>)>,
     trace: Trace,
     /// Newest search sent to the worker and when, for key-to-frame timing.
@@ -108,7 +118,10 @@ struct Runtime {
     started: Instant,
 }
 
-impl Runtime {
+impl<B: Backend> Runtime<B>
+where
+    B::Error: 'static,
+{
     fn event_loop(
         &mut self,
         guard: &mut TerminalGuard,
@@ -119,6 +132,12 @@ impl Runtime {
         let mut next_tick = Instant::now() + PROGRESS_TICK;
         let mut first_frame = true;
         loop {
+            // Before any draw: the panic hook has already restored the
+            // terminal, so a frame now would paint over the primary screen
+            // and the panic message.
+            if term::panicked() {
+                return Err("a relic thread panicked; see the message above".into());
+            }
             if m.dirty {
                 let t = Instant::now();
                 self.terminal.draw(|f| view::view(f, &m))?;
@@ -141,9 +160,6 @@ impl Runtime {
                         ms(drawn - issued)
                     ));
                 }
-            }
-            if term::panicked() {
-                return Err("a relic thread panicked; see the message above".into());
             }
 
             if queue.is_empty() {
@@ -375,6 +391,18 @@ fn search_worker(db: &Path, mailbox: &Mailbox, tx: &SyncSender<UiAction>, deboun
     }
 }
 
+/// Runs `f` on its own thread and fails the test if it has not returned
+/// within 5 s, so a deadlock is a failure rather than a hung suite.
+#[cfg(test)]
+fn within<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| panic!("{what} did not return: deadlocked"))
+}
+
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
@@ -429,6 +457,7 @@ mod tests {
     /// A worker over a real two-command database.
     fn worker(
         debounce: Duration,
+        capacity: usize,
     ) -> (
         Arc<Mailbox>,
         Receiver<UiAction>,
@@ -448,7 +477,7 @@ mod tests {
         crate::import::import_file(&mut s, &hist, crate::import::SourceKind::Zsh, &redactor)
             .unwrap();
         let mb = Arc::new(Mailbox::default());
-        let (tx, rx) = mpsc::sync_channel(8);
+        let (tx, rx) = mpsc::sync_channel(capacity);
         let h = {
             let mb = Arc::clone(&mb);
             std::thread::spawn(move || search_worker(&db, &mb, &tx, debounce))
@@ -466,11 +495,12 @@ mod tests {
     }
 
     use crate::app::SearchPage;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn worker_debounces_bursts_and_answers_the_latest_generation() {
         let debounce = Duration::from_millis(75);
-        let (mb, rx, h, _dir) = worker(debounce);
+        let (mb, rx, h, _dir) = worker(debounce, 8);
         // Typed faster than the debounce: only the last one runs.
         for (g, q) in [(1, "g"), (2, "gi"), (3, "git"), (4, "c"), (5, "car")] {
             mb.put(job(g, q, Instant::now()));
@@ -490,7 +520,7 @@ mod tests {
     #[test]
     fn time_spent_queued_counts_toward_the_debounce() {
         let debounce = Duration::from_millis(300);
-        let (mb, rx, h, _dir) = worker(debounce);
+        let (mb, rx, h, _dir) = worker(debounce, 8);
         // Pressed 400 ms ago (it waited behind a slow search): run now, do
         // not start a fresh quiet period.
         let t = Instant::now();
@@ -503,6 +533,77 @@ mod tests {
         );
         mb.close();
         h.join().unwrap();
+    }
+
+    fn mailbox_empty(mb: &Mailbox) -> bool {
+        mb.slot.lock().unwrap().0.is_none()
+    }
+
+    #[test]
+    fn stopping_the_worker_does_not_wait_on_a_full_channel() {
+        let (mb, rx, h, _dir) = worker(Duration::ZERO, 1);
+        // The first result fills the channel; the worker then blocks
+        // sending the second, as when the UI stops draining on exit. The
+        // pause between them keeps the two jobs from coalescing.
+        for g in 1..=2 {
+            mb.put(job(g, "cargo", Instant::now()));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(mailbox_empty(&mb), "the worker took both jobs");
+        within("stop_worker", move || stop_worker(&mb, rx, h));
+    }
+
+    /// The real event loop on a test backend, with a terminal reader that
+    /// never has input.
+    fn runtime(tx: SyncSender<UiAction>) -> Runtime<TestBackend> {
+        Runtime {
+            store: Store::open_memory().unwrap(),
+            mailbox: Arc::new(Mailbox::default()),
+            tx: tx.clone(),
+            input: InputReader::spawn_with(tx, || {
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(None)
+            }),
+            terminal: Terminal::new(TestBackend::new(100, 30)).unwrap(),
+            recall: None,
+            trace: Trace(None),
+            issued: None,
+            awaiting_frame: None,
+            started: Instant::now(),
+        }
+    }
+
+    fn screen(t: &Terminal<TestBackend>) -> String {
+        t.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn a_panic_elsewhere_stops_the_loop_before_the_next_frame() {
+        let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
+        let mut rt = runtime(tx.clone());
+        let mailbox = Arc::clone(&rt.mailbox);
+        std::thread::spawn(move || {
+            // The startup search is in the mailbox once the first frame is
+            // drawn; shortly after, the loop is waiting for input.
+            while mailbox_empty(&mailbox) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            term::mark_panicked();
+            tx.send(UiAction::Key(model::Key::Char('x'))).unwrap();
+        });
+        let r = rt.event_loop(&mut TerminalGuard::detached(), &rx, UiModel::new(true));
+        assert!(r.is_err());
+        let s = screen(&rt.terminal);
+        assert!(
+            s.contains("> type to search"),
+            "the key handled after the panic must not reach the screen: {s}"
+        );
     }
 
     #[test]
