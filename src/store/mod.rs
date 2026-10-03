@@ -205,6 +205,11 @@ impl Store {
         self.search_fts(&escape_fts_query(query, true), limit, false)
     }
 
+    /// Newest-first matches where every word matches whole.
+    pub fn search_recent(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
+        self.search_fts(&escape_fts_query(query, false), limit, false)
+    }
+
     /// The newest observations, unfiltered.
     pub fn recent(&self, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
         let mut stmt = self.conn.prepare_cached(
@@ -226,7 +231,7 @@ impl Store {
             return Ok(vec![]);
         }
 
-        // Step 1: Get top-N rowids from FTS5 with rank optimization.
+        // Step 1: top-N rowids from FTS5, by rank or newest first.
         let sql = if by_rank {
             "SELECT rowid, rank FROM observation_fts
              WHERE observation_fts MATCH ?1
@@ -255,8 +260,7 @@ impl Store {
         }
 
         let mut obs_stmt = self.conn.prepare_cached(
-            "SELECT id, observed_at_ms, kind, safe_text, revision_id, ordinal
-             FROM observation WHERE id = ?1",
+            "SELECT id, observed_at_ms, kind, safe_text FROM observation WHERE id = ?1",
         )?;
 
         let mut hits = Vec::with_capacity(ranked.len());
@@ -266,8 +270,6 @@ impl Store {
                     let kind_val: i64 = row.get(2)?;
                     Ok(SearchHit {
                         id: row.get(0)?,
-                        revision_id: row.get(4)?,
-                        ordinal: row.get(5)?,
                         observed_at_ms: row.get(1)?,
                         kind: ObservationKind::from_i64(kind_val)
                             .unwrap_or(ObservationKind::ZshCommand),
@@ -582,23 +584,6 @@ mod tests {
         );
         assert_eq!(texts(store.search("git", 1).unwrap()), ["git"]);
         assert_eq!(texts(store.recent(2).unwrap()), ["git push origin main --force", "ls"]);
-    }
-
-    #[test]
-    fn search_hit_locates_its_timeline() {
-        let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
-        store.insert_observations(&[
-            make_observation(rev_id, 0, "cd project"),
-            make_observation(rev_id, 1, "certbot renew"),
-            make_observation(rev_id, 2, "systemctl reload nginx"),
-        ]).unwrap();
-
-        let hit = &store.search("certbot", 10).unwrap()[0];
-        assert_eq!((hit.revision_id, hit.ordinal), (rev_id, 1));
-        let around = store.get_neighbors(hit.revision_id, hit.ordinal, 1, 1).unwrap();
-        let texts: Vec<&str> = around.iter().map(|o| o.safe_text.as_str()).collect();
-        assert_eq!(texts, ["cd project", "certbot renew", "systemctl reload nginx"]);
     }
 
     #[test]

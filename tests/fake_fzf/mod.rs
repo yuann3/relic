@@ -75,8 +75,6 @@ pub fn page(ids: &[i64]) -> SearchPage {
                 observed_at_ms: Some(1_700_000_000_000),
                 source: "zsh",
                 text: format!("cmd {id}"),
-                revision_id: 1,
-                ordinal: id,
             })
             .collect(),
     }

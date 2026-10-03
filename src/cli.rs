@@ -18,7 +18,7 @@ USAGE:
 OPTIONS:
     --db PATH     Database file. Default: $RELIC_DB, else
                   $XDG_DATA_HOME/relic/relic.db (~/.local/share/relic/relic.db)
-    --limit N     Maximum results (default 20, capped at 5000)
+    --limit N     Maximum results (default 20, or 5000 with --fzf; capped at 5000)
     --prefix      Let the last word match as a prefix, as the TUI does
     --json        Print one relic.search/v1 document on stdout
     --fzf         Pick one result with fzf and show its evidence
@@ -38,7 +38,8 @@ pub enum Command {
 pub struct SearchArgs {
     pub query: String,
     pub db: Option<PathBuf>,
-    pub limit: usize,
+    /// None means the output's default page size.
+    pub limit: Option<usize>,
     pub prefix: bool,
     pub output: Output,
 }
@@ -98,7 +99,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
 fn parse_search(
     mut args: impl Iterator<Item = Result<String, String>>,
 ) -> Result<Command, String> {
-    let (mut words, mut db, mut limit, mut prefix) = (Vec::new(), None, 20, false);
+    let (mut words, mut db, mut limit, mut prefix) = (Vec::new(), None, None, false);
     let (mut json, mut fzf) = (false, false);
     let mut options_done = false;
     while let Some(a) = args.next().transpose()? {
@@ -107,12 +108,13 @@ fn parse_search(
             "--" => options_done = true,
             "--db" => db = Some(value(&mut args, "--db")?.into()),
             "--limit" => {
-                limit = value(&mut args, "--limit")?
+                let n: usize = value(&mut args, "--limit")?
                     .parse()
                     .map_err(|_| "--limit needs a positive number".to_string())?;
-                if limit == 0 {
+                if n == 0 {
                     return Err("--limit needs a positive number".into());
                 }
+                limit = Some(n);
             }
             "--prefix" => prefix = true,
             "--json" => json = true,
@@ -187,7 +189,8 @@ mod tests {
     fn search_joins_words_and_reads_options() {
         let s = search(&["search", "certbot", "--limit", "5", "renew", "--json", "--db", "x.db"]);
         assert_eq!(s.query, "certbot renew");
-        assert_eq!(s.limit, 5);
+        assert_eq!(s.limit, Some(5));
+        assert_eq!(search(&["search", "x"]).limit, None);
         assert_eq!(s.output, Output::Json);
         assert_eq!(s.db, Some(PathBuf::from("x.db")));
         assert!(!s.prefix);

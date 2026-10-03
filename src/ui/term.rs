@@ -66,7 +66,7 @@ impl TerminalGuard {
 
     pub fn enter() -> io::Result<Self> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            return Err(io::Error::other("relic ui needs an interactive terminal"));
+            return Err(io::Error::other("ui needs an interactive terminal"));
         }
         install_panic_hook();
         let mut g = Self(());

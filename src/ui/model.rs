@@ -352,6 +352,10 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
                     m.search.selected = 0;
                     let first = page.hits.first().map(|h| h.id);
                     m.search.page = Some(page);
+                    // Evidence the user opened while this search ran stays put.
+                    if matches!(m.focus, Focus::Evidence | Focus::Timeline) {
+                        return vec![];
+                    }
                     match first {
                         Some(id) => want_evidence(m, id),
                         None => {
@@ -452,7 +456,8 @@ fn on_key(m: &mut UiModel, key: Key) -> Vec<UiEffect> {
 
     let typing = m.focus == Focus::Query;
     match key {
-        Key::Char('?') => {
+        // While typing, '?' is query text (`$?`, globs); Tab away for help.
+        Key::Char('?') if !typing => {
             m.modal = Some(Modal::Help);
             vec![]
         }
@@ -618,6 +623,12 @@ fn enter(m: &mut UiModel) -> Vec<UiEffect> {
 }
 
 fn open_picker(m: &mut UiModel) -> Vec<UiEffect> {
+    // The shown page belongs to an older query until the search lands, and
+    // a pick from it would then be overwritten by the new page.
+    if m.search.pending {
+        m.notice = Some("still searching; press f again when results update".into());
+        return vec![];
+    }
     match &m.search.page {
         Some(page) if !page.hits.is_empty() => vec![UiEffect::OpenPicker(page.clone())],
         _ => {
@@ -726,8 +737,6 @@ mod tests {
             observed_at_ms: Some(1_700_000_000_000 + id * 1000),
             source: "zsh",
             text: text.into(),
-            revision_id: 1,
-            ordinal: id,
         }
     }
 
@@ -834,6 +843,36 @@ mod tests {
         let e = update(&mut m, UiAction::Start);
         assert_eq!(searches(&e), [(1, String::new())]);
         assert!(m.search.pending);
+    }
+
+    #[test]
+    fn picker_waits_for_the_pending_search() {
+        let mut m = with_results();
+        keys(&mut m, "x"); // "gitx" is now searching; the "git" page is stale
+        assert!(update(&mut m, UiAction::Key(Key::Ctrl('f'))).is_empty());
+        assert!(m.notice.as_deref().unwrap_or_default().contains("still searching"));
+        let g = m.search.generation;
+        update(&mut m, done(g, page("gitx", &[20])));
+        let e = update(&mut m, UiAction::Key(Key::Ctrl('f')));
+        assert!(matches!(&e[..], [UiEffect::OpenPicker(p)] if p.query == "gitx"));
+    }
+
+    #[test]
+    fn a_landing_search_keeps_evidence_the_user_opened() {
+        let mut m = with_results();
+        keys(&mut m, "x");
+        // Enter on the stale page while "gitx" is still searching.
+        update(&mut m, UiAction::Key(Key::Enter));
+        assert_eq!(m.focus, Focus::Evidence);
+        let g = m.search.generation;
+        let e = update(&mut m, done(g, page("gitx", &[20])));
+        assert!(!e.iter().any(|e| matches!(e, UiEffect::OpenEvidence { .. })), "{e:?}");
+        // From the query bar the first hit still opens as before.
+        m.focus = Focus::Query;
+        keys(&mut m, "y");
+        let g = m.search.generation;
+        let e = update(&mut m, done(g, page("gitxy", &[30])));
+        assert!(matches!(&e[..], [UiEffect::OpenEvidence { id: 30 }]), "{e:?}");
     }
 
     #[test]
@@ -1225,6 +1264,10 @@ mod tests {
         assert!(is_exit(&update(&mut m, UiAction::Key(Key::Esc))));
 
         let mut m = UiModel::new(false);
+        // In the query bar '?' is text; off it, '?' opens help.
+        update(&mut m, UiAction::Key(Key::Char('?')));
+        assert_eq!((m.modal, m.query.as_str()), (None, "?"));
+        update(&mut m, UiAction::Key(Key::Tab));
         update(&mut m, UiAction::Key(Key::Char('?')));
         assert_eq!(m.modal, Some(Modal::Help));
         assert!(!is_exit(&update(&mut m, UiAction::Key(Key::Esc))));

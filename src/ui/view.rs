@@ -409,7 +409,7 @@ fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     }
     let hints = match m.focus {
         Focus::Query => {
-            "type to search · ↑/↓ select · Enter open · Tab pane · ^F fzf · ^R recall · ? help · Esc quit"
+            "type to search · ↑/↓ select · Enter open · Tab pane (then ? help) · ^F fzf · ^R recall · Esc quit"
         }
         _ => {
             "j/k move · Enter open · Tab pane · / search · f fzf · r recall · ? help · Esc back · q quit"
@@ -797,8 +797,6 @@ mod tests {
             observed_at_ms: Some(0),
             source: "zsh",
             text: text.into(),
-            revision_id: 1,
-            ordinal: 0,
         };
         let page = SearchPage {
             schema: SEARCH_SCHEMA,
@@ -893,6 +891,7 @@ mod tests {
         assert!(s.contains("Start? y/n"), "{s}");
 
         drive(&mut m, &store, UiAction::Key(Key::Esc));
+        drive(&mut m, &store, UiAction::Key(Key::Tab));
         drive(&mut m, &store, UiAction::Key(Key::Char('?')));
         let s = text(&render(&m, 80, 24));
         assert!(

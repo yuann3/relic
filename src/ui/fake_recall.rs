@@ -127,8 +127,6 @@ mod tests {
             observed_at_ms: None,
             source: "zsh",
             text: "cargo".into(),
-            revision_id: 1,
-            ordinal: 0,
         };
         let page = SearchPage {
             schema: SEARCH_SCHEMA,

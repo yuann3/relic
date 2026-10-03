@@ -265,8 +265,6 @@ mod tests {
             observed_at_ms: Some(1_700_000_000_000),
             source: "zsh",
             text: text.into(),
-            revision_id: 1,
-            ordinal: id,
         }
     }
 

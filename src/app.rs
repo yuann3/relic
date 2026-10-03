@@ -53,10 +53,6 @@ pub struct PageHit {
     pub observed_at_ms: Option<i64>,
     pub source: &'static str,
     pub text: String,
-    #[serde(skip)]
-    pub revision_id: i64,
-    #[serde(skip)]
-    pub ordinal: i64,
 }
 
 impl SearchPage {
@@ -73,13 +69,18 @@ pub fn search(store: &Store, req: &SearchRequest) -> Result<SearchPage, rusqlite
         MatchMode::Words => store.search(&req.query, limit + 1)?,
         MatchMode::PrefixLast => {
             let mut words: Vec<&str> = req.query.split_whitespace().collect();
-            if words.last().is_some_and(|w| w.chars().count() < MIN_PREFIX_CHARS) {
+            // Count what the tokenizer keeps: "-m" or "é" + a combining mark
+            // is still a one-character prefix.
+            let indexed = |w: &str| w.chars().filter(|c| c.is_alphanumeric()).count();
+            if words.last().is_some_and(|w| indexed(w) < MIN_PREFIX_CHARS) {
                 deferred = words.pop().map(String::from);
             }
-            if words.is_empty() {
-                store.recent(limit + 1)?
-            } else {
-                store.search_recent_prefix(&words.join(" "), limit + 1)?
+            match (words.is_empty(), deferred.is_some()) {
+                (true, _) => store.recent(limit + 1)?,
+                // The words before a deferred one were complete when typed;
+                // starring them would make "git c" match "gitk".
+                (false, true) => store.search_recent(&words.join(" "), limit + 1)?,
+                (false, false) => store.search_recent_prefix(&words.join(" "), limit + 1)?,
             }
         }
     };
@@ -98,8 +99,6 @@ pub fn search(store: &Store, req: &SearchRequest) -> Result<SearchPage, rusqlite
                 observed_at_ms: h.observed_at_ms,
                 source: source_label(h.kind),
                 text: h.safe_text,
-                revision_id: h.revision_id,
-                ordinal: h.ordinal,
             })
             .collect(),
     })
@@ -150,6 +149,10 @@ pub fn display_char(c: char) -> char {
         // characters, and interlinear annotation anchors.
         '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' => '\u{FFFD}',
         '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' => '\u{FFFD}',
+        // Soft hyphen, Mongolian vowel separator, prepended number marks,
+        // and tag characters (invisible ASCII smuggling).
+        '\u{00AD}' | '\u{180E}' | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}' => '\u{FFFD}',
+        '\u{E0001}' | '\u{E0020}'..='\u{E007F}' => '\u{FFFD}',
         c => c,
     }
 }
@@ -239,6 +242,15 @@ mod tests {
         assert_eq!(texts, ["cargo build", "ls -la"]);
         assert!(page.truncated);
 
+        // Words before a deferred one match whole: "git" is not "gitk".
+        let store2 = store_with(&["gitk --all", "git log"]);
+        let page = search(&store2, &req("git c", 10, MatchMode::PrefixLast)).unwrap();
+        let texts: Vec<&str> = page.hits.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["git log"]);
+        // Punctuation does not count toward the prefix length.
+        let page = search(&store2, &req("git -m", 10, MatchMode::PrefixLast)).unwrap();
+        assert_eq!(page.deferred.as_deref(), Some("-m"));
+
         // Two characters filter. Words mode never defers.
         let page = search(&store, &req("git co", 10, MatchMode::PrefixLast)).unwrap();
         assert_eq!((page.hits.len(), page.deferred), (1, None));
@@ -286,7 +298,10 @@ mod tests {
         assert_eq!(display_line("a\tb\nc\rd\u{2028}e"), "a b c d e");
         assert_eq!(display_line("\x1b[31mred"), "\u{FFFD}[31mred");
         assert_eq!(display_line("x\0y\u{7f}z\u{85}"), "x\u{FFFD}y\u{FFFD}z\u{FFFD}");
-        for c in ['\u{061C}', '\u{200B}', '\u{200E}', '\u{202E}', '\u{2066}', '\u{FEFF}', '\u{FFF9}'] {
+        for c in [
+            '\u{061C}', '\u{200B}', '\u{200E}', '\u{202E}', '\u{2066}', '\u{FEFF}', '\u{FFF9}',
+            '\u{00AD}', '\u{180E}', '\u{0600}', '\u{E0041}',
+        ] {
             assert_eq!(display_line(&format!("a{c}b")), "a\u{FFFD}b", "{:?}", c);
         }
         assert_eq!(display_line("部署 café ✓"), "部署 café ✓");
