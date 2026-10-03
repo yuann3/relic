@@ -188,7 +188,20 @@ impl Store {
     /// Two-step: (1) FTS5 narrowing with `ORDER BY rank` for the internal
     /// priority-queue optimization, (2) fetch observation metadata by rowid.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
-        let escaped = escape_fts_query(query);
+        self.search_fts(&escape_fts_query(query, false), limit)
+    }
+
+    /// Like [`Store::search`], but the last word matches as a prefix, so
+    /// partially typed input ("gi") finds completed words ("git").
+    pub fn search_prefix(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, rusqlite::Error> {
+        self.search_fts(&escape_fts_query(query, true), limit)
+    }
+
+    fn search_fts(&self, escaped: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
         if escaped.is_empty() {
             return Ok(vec![]);
         }
@@ -212,7 +225,8 @@ impl Store {
 
         // Step 2: Fetch observation data for those rowids.
         let mut obs_stmt = self.conn.prepare_cached(
-            "SELECT id, observed_at_ms, kind, safe_text FROM observation WHERE id = ?1",
+            "SELECT id, observed_at_ms, kind, safe_text, revision_id, ordinal
+             FROM observation WHERE id = ?1",
         )?;
 
         let mut hits = Vec::with_capacity(ranked.len());
@@ -222,6 +236,8 @@ impl Store {
                     let kind_val: i64 = row.get(2)?;
                     Ok(SearchHit {
                         id: row.get(0)?,
+                        revision_id: row.get(4)?,
+                        ordinal: row.get(5)?,
                         observed_at_ms: row.get(1)?,
                         kind: ObservationKind::from_i64(kind_val)
                             .unwrap_or(ObservationKind::ZshCommand),
@@ -276,17 +292,19 @@ impl Store {
 }
 
 /// Escape user/model text into a safe FTS5 query.
-/// Each word becomes a quoted phrase token. No raw FTS operators pass through.
-fn escape_fts_query(query: &str) -> String {
+/// Each word becomes a quoted phrase token. No raw FTS operators pass through;
+/// the only operator Relic itself adds is `*` on the last token when
+/// `last_prefix` is set.
+fn escape_fts_query(query: &str, last_prefix: bool) -> String {
     let tokens: Vec<&str> = query.split_whitespace().collect();
-    if tokens.is_empty() {
-        return String::new();
-    }
+    let last = tokens.len().saturating_sub(1);
     tokens
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let escaped = t.replace('"', "\"\"");
-            format!("\"{escaped}\"")
+            let star = if last_prefix && i == last { "*" } else { "" };
+            format!("\"{escaped}\"{star}")
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -484,6 +502,52 @@ mod tests {
 
         let hits = store.search("nonexistent_term", 10).unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_prefix_matches_partial_last_word() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = setup_revision(&store);
+        store.insert_observations(&[
+            make_observation(rev_id, 0, "git push origin main"),
+            make_observation(rev_id, 1, "cargo build"),
+        ]).unwrap();
+
+        assert!(store.search("gi", 10).unwrap().is_empty());
+        let hits = store.search_prefix("gi", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].safe_text, "git push origin main");
+        // Earlier words still match whole.
+        assert!(store.search_prefix("gi pu", 10).unwrap().is_empty());
+        assert_eq!(store.search_prefix("git pu", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_prefix_does_not_pass_fts_syntax_through() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = setup_revision(&store);
+        store.insert_observations(&[make_observation(rev_id, 0, "echo NEAR(a b)")]).unwrap();
+
+        // A stray quote or operator in user input must not become FTS syntax.
+        assert!(store.search_prefix("\"", 10).unwrap().is_empty());
+        assert_eq!(store.search_prefix("NEAR(a", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_hit_locates_its_timeline() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = setup_revision(&store);
+        store.insert_observations(&[
+            make_observation(rev_id, 0, "cd project"),
+            make_observation(rev_id, 1, "certbot renew"),
+            make_observation(rev_id, 2, "systemctl reload nginx"),
+        ]).unwrap();
+
+        let hit = &store.search("certbot", 10).unwrap()[0];
+        assert_eq!((hit.revision_id, hit.ordinal), (rev_id, 1));
+        let around = store.get_neighbors(hit.revision_id, hit.ordinal, 1, 1).unwrap();
+        let texts: Vec<&str> = around.iter().map(|o| o.safe_text.as_str()).collect();
+        assert_eq!(texts, ["cd project", "certbot renew", "systemctl reload nginx"]);
     }
 
     #[test]

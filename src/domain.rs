@@ -59,6 +59,8 @@ pub struct StoredObservation {
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub id: i64,
+    pub revision_id: i64,
+    pub ordinal: i64,
     pub observed_at_ms: Option<i64>,
     pub kind: ObservationKind,
     pub safe_text: String,
