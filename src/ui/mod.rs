@@ -499,7 +499,9 @@ mod tests {
 
     #[test]
     fn worker_debounces_bursts_and_answers_the_latest_generation() {
-        let debounce = Duration::from_millis(75);
+        // Wide enough that 4 x 10 ms sleeps cannot overshoot it on a loaded
+        // machine (75 ms flaked: macOS timer slack stretches the sleeps).
+        let debounce = Duration::from_millis(500);
         let (mb, rx, h, _dir) = worker(debounce, 8);
         // Typed faster than the debounce: only the last one runs.
         for (g, q) in [(1, "g"), (2, "gi"), (3, "git"), (4, "c"), (5, "car")] {
