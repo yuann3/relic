@@ -169,13 +169,20 @@ fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let s = &m.search;
     let title = match &s.page {
         Some(p) => {
-            let full = if p.truncated { " (page full; narrow the query)" } else { "" };
-            // Narrow panes truncate titles, so the deferred hint replaces the
-            // ordering note rather than extending it.
-            let note = p.deferred.as_deref().map_or("newest first".into(), |w| {
-                format!("\"{}\" needs {MIN_PREFIX_CHARS}+ chars", display_line(w))
-            });
-            format!("Results {}{full} · {note}", p.hits.len())
+            // Titles truncate in narrow panes, so the deferred-word hint
+            // replaces the other notes; the status line still says
+            // "(more exist)" for a full page.
+            match p.deferred.as_deref() {
+                Some(w) => format!(
+                    "Results {} · \"{}\" needs {MIN_PREFIX_CHARS}+ chars",
+                    p.hits.len(),
+                    display_line(w)
+                ),
+                None if p.truncated => {
+                    format!("Results {} (page full; narrow the query) · newest first", p.hits.len())
+                }
+                None => format!("Results {} · newest first", p.hits.len()),
+            }
         }
         None => "Results".into(),
     };
@@ -304,10 +311,12 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     for l in o.safe_text.split('\n') {
         lines.push(Line::from(safe_spans(&display_line(l), t)));
     }
-    let p = Paragraph::new(Text::from(lines))
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((m.evidence.scroll, 0));
+    let inner = block.inner(area);
+    let p = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let rows = p.line_count(inner.width);
+    let max = u16::try_from(rows.saturating_sub(usize::from(inner.height))).unwrap_or(u16::MAX);
+    m.evidence.scroll_max.set(max);
+    let p = p.block(block).scroll((m.evidence.scroll.min(max), 0));
     frame.render_widget(p, area);
 }
 
@@ -695,10 +704,13 @@ mod tests {
         let mut m = typed(&store, "arg00", false);
         drive(&mut m, &store, UiAction::Key(Key::Enter));
         assert_eq!(m.focus, Focus::Evidence);
+        // The event loop draws before the next key, which records the limit.
+        render(&m, 100, 14);
         for _ in 0..1000 {
             drive(&mut m, &store, UiAction::Key(Key::Down));
         }
-        assert!(m.evidence.scroll < 100, "scrolled to {}", m.evidence.scroll);
+        let end = m.evidence.scroll;
+        assert!(end > 0 && end < 100, "scrolled to {end}");
         // The narrowest evidence pane (wide layout at 100 columns) and a
         // short one: one line of text wraps to many rows here.
         let s = text(&render(&m, 100, 14));

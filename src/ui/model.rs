@@ -3,6 +3,7 @@
 //! [`UiAction`], so the whole interaction model is testable without a
 //! terminal, a database, or threads.
 
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use crate::app::{EvidenceView, SearchPage};
@@ -13,12 +14,6 @@ pub const PAGE_LIMIT: usize = 200;
 /// Bounds the query so a huge paste cannot become a huge FTS expression.
 pub const QUERY_MAX_CHARS: usize = 256;
 pub const DOUBLE_INTERRUPT: Duration = Duration::from_secs(1);
-/// Rows the evidence pane draws above the text (`view::evidence`).
-const EVIDENCE_HEADER_ROWS: usize = 7;
-/// Columns inside the narrowest evidence pane the layout draws: 30% of the
-/// 100-column wide layout, less borders. Wrapping is estimated at this
-/// width so that scrolling never stops short of the text's last row.
-const EVIDENCE_MIN_COLS: usize = 28;
 
 /// Budget the confirmation promises. The fake recall stays inside it so the
 /// meter reads like the real one will.
@@ -181,6 +176,10 @@ pub struct EvidenceState {
     /// Row of `view.timeline` the detail pane shows.
     pub cursor: usize,
     pub scroll: u16,
+    /// Furthest useful scroll, recorded by the view on each draw. Only the
+    /// renderer knows how the pane's width wraps the text, so it reports
+    /// back rather than `update` estimating and stopping short of the end.
+    pub scroll_max: Cell<u16>,
     pub error: Option<String>,
 }
 
@@ -192,18 +191,6 @@ impl EvidenceState {
 
     fn clear(&mut self) {
         *self = Self::default();
-    }
-
-    /// Estimated rows the shown evidence wraps to. Scrolling stops once the
-    /// last of them reaches the top of the pane.
-    fn rows(&self) -> usize {
-        self.shown().map_or(0, |o| {
-            EVIDENCE_HEADER_ROWS
-                + o.safe_text
-                    .split('\n')
-                    .map(|l| l.chars().count().div_ceil(EVIDENCE_MIN_COLS).max(1))
-                    .sum::<usize>()
-        })
     }
 }
 
@@ -592,12 +579,11 @@ fn move_by(m: &mut UiModel, delta: isize) -> Vec<UiEffect> {
             vec![]
         }
         Focus::Evidence => {
-            let end = u16::try_from(m.evidence.rows().saturating_sub(1)).unwrap_or(u16::MAX);
             m.evidence.scroll = m
                 .evidence
                 .scroll
                 .saturating_add_signed(delta as i16)
-                .min(end);
+                .min(m.evidence.scroll_max.get());
             vec![]
         }
         Focus::Recall => vec![],
@@ -934,14 +920,14 @@ mod tests {
             },
         );
         m.focus = Focus::Evidence;
+        // The view records the limit when it draws; emulate one draw.
+        m.evidence.scroll_max.set(5);
         for _ in 0..1000 {
             update(&mut m, UiAction::Key(Key::Down));
         }
-        let end = m.evidence.scroll;
-        // Seven field lines and one line of text.
-        assert!((1..8).contains(&end), "scrolled to {end}");
+        assert_eq!(m.evidence.scroll, 5);
         update(&mut m, UiAction::Key(Key::Up));
-        assert_eq!(m.evidence.scroll, end - 1, "one key back from the end");
+        assert_eq!(m.evidence.scroll, 4, "one key back from the end");
     }
 
     #[test]

@@ -261,6 +261,8 @@ impl InputReader {
         let (lock, cv) = &*self.gate;
         let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         g.pause = true;
+        // A reader backing off on a full channel waits on this condvar.
+        cv.notify_all();
         while !g.parked {
             g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
