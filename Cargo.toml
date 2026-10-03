@@ -34,3 +34,9 @@ bench = false
 name = "fixture_db"
 path = "benches/fixture_db.rs"
 bench = false
+
+# Search-as-you-type FTS variants and their size/latency cost for #10/#11.
+[[bin]]
+name = "interactive_fts"
+path = "benches/interactive_fts.rs"
+bench = false
