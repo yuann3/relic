@@ -514,7 +514,7 @@ mod tests {
                     found: "0.20".into(),
                     minimum: "0.44",
                 },
-                "older than the supported 0.44; using indexed",
+                "older than the supported 0.44",
             ),
             (PickError::Io(io::Error::other("boom")), "fzf failed: boom"),
             (

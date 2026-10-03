@@ -193,7 +193,7 @@ fn check_version(fzf: &Path) -> Result<(), PickError> {
         Some(v) if v >= MINIMUM => Ok(()),
         _ => Err(PickError::TooOld {
             found: token
-                .map_or_else(|| "unknown".into(), |t| sanitize(t).chars().take(32).collect()),
+                .map_or_else(|| "unknown".into(), |t| app::display_line(t).chars().take(32).collect()),
             minimum: MINIMUM_STR,
         }),
     }
@@ -217,10 +217,10 @@ fn encode(hits: &[PageHit]) -> Vec<u8> {
     for h in hits {
         let start = buf.len();
         let when = h.observed_at_ms.map_or_else(|| "unknown time    ".into(), app::format_utc);
-        write!(buf, "{}\t{when}\t{}\t", h.id, sanitize(h.source)).expect("Vec write");
+        write!(buf, "{}\t{when}\t{}\t", h.id, app::display_line(h.source)).expect("Vec write");
         let mut budget = RECORD_MAX - 1 - (buf.len() - start);
         let mut utf8 = [0; 4];
-        for c in h.text.chars().map(display_char) {
+        for c in h.text.chars().map(app::display_char) {
             if c.len_utf8() > budget {
                 break;
             }
@@ -232,22 +232,6 @@ fn encode(hits: &[PageHit]) -> Vec<u8> {
     buf
 }
 
-fn sanitize(s: &str) -> String {
-    s.chars().map(display_char).collect()
-}
-
-/// Control characters (tab, newline, CR, NUL, ESC, DEL, C1) would break the
-/// framing or drive the terminal; line separators and bidi overrides would
-/// make one record display as something else.
-fn display_char(c: char) -> char {
-    match c {
-        c if c.is_control() => ' ',
-        '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' => ' ',
-        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => ' ',
-        c => c,
-    }
-}
-
 fn parse_selection(out: &[u8], page: &SearchPage) -> Result<i64, PickError> {
     let protocol = |m: &str| Err(PickError::Protocol(m.into()));
     let Some((&0, record)) = out.split_last() else {
@@ -257,7 +241,12 @@ fn parse_selection(out: &[u8], page: &SearchPage) -> Result<i64, PickError> {
         return protocol("more than one record");
     }
     let id = record.split(|&b| b == b'\t').next().unwrap_or_default();
-    let Some(id) = std::str::from_utf8(id).ok().and_then(|s| s.parse::<i64>().ok()) else {
+    // Only the exact bytes Relic wrote count: parse() alone would also accept
+    // "+12" or "012", which match no record that was sent.
+    let Some(id) = std::str::from_utf8(id)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok().filter(|n| n.to_string() == s))
+    else {
         return protocol("record does not start with a numeric id");
     };
     if !page.contains(id) {

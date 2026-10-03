@@ -67,7 +67,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
         Output::Text => {
             for h in &page.hits {
                 let when = h.observed_at_ms.map(app::format_utc).unwrap_or_else(|| "unknown time    ".into());
-                writeln!(out, "{when}  {:<4}  {}", h.source, one_line(&h.text))?;
+                writeln!(out, "{when}  {:<4}  {}", h.source, app::display_line(&h.text))?;
             }
             if page.truncated {
                 eprintln!("(more matches past {}; narrow the query or raise --limit)", page.limit);
@@ -88,7 +88,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
             for o in &view.timeline {
                 let mark = if o.id == id { ">" } else { " " };
                 let when = o.observed_at_ms.map(app::format_utc).unwrap_or_default();
-                writeln!(out, "{mark} {when}  {}", one_line(&o.safe_text))?;
+                writeln!(out, "{mark} {when}  {}", app::display_line(&o.safe_text))?;
             }
         }
     }
@@ -109,10 +109,6 @@ fn existing_db(explicit: Option<PathBuf>) -> Result<PathBuf> {
         .into());
     }
     Ok(db)
-}
-
-fn one_line(text: &str) -> String {
-    text.replace(['\n', '\r', '\t'], " ")
 }
 
 #[cfg(feature = "tui")]

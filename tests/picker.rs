@@ -63,7 +63,7 @@ fn records_are_nul_framed_sanitized_and_capped() {
     let fields = |r: &[u8]| -> Vec<String> {
         String::from_utf8(r.to_vec()).unwrap().split('\t').map(String::from).collect()
     };
-    assert_eq!(fields(records[0]), ["1", "2023-11-14 22:13", "zsh", "a b c d e [31mf g h i j"]);
+    assert_eq!(fields(records[0]), ["1", "2023-11-14 22:13", "zsh", "a b c d\u{FFFD}e\u{FFFD}[31mf\u{FFFD}g\u{FFFD}h\u{FFFD}i j"]);
     assert_eq!(fields(records[1])[1], "unknown time    ");
     assert!(records[2].len() < 2048, "record plus NUL fits 2 KiB: {}", records[2].len());
     assert!(records[2].len() > 2048 - 4, "cap wastes at most one partial char");
@@ -98,6 +98,8 @@ fn rejects_malformed_selections() {
         ("printf 'abc\\tx\\0'", "numeric id"),
         ("printf '\\377\\tx\\0'", "numeric id"),
         ("printf ' 1\\tx\\0'", "numeric id"),
+        ("printf '+1\\tx\\0'", "numeric id"),
+        ("printf '01\\tx\\0'", "numeric id"),
     ];
     for (body, want) in cases {
         let fzf = FakeFzf::new(body);

@@ -11,7 +11,7 @@ use super::model::{
     Focus, Modal, RECALL_CHILD_MAX, RECALL_ROOT_MAX, RECALL_SPEND_CAP, RECALL_WALL_MAX,
     RecallStatus, StepState, UiModel,
 };
-use crate::app::{format_utc, source_label};
+use crate::app::{display_line, format_utc, source_label};
 
 /// Below this the panes cannot show a usable row, so say so instead.
 pub const MIN_WIDTH: u16 = 40;
@@ -153,14 +153,14 @@ fn query_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let inner = block.inner(area);
     let mut spans = vec![
         Span::styled("> ", t.title),
-        Span::raw(sanitize_line(&m.query)),
+        Span::raw(display_line(&m.query)),
     ];
     if m.query.is_empty() {
         spans.push(Span::styled("type to search your history", t.dim));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     if focused && m.modal.is_none() {
-        let x = inner.x + 2 + ratatui::text::Line::raw(sanitize_line(&m.query)).width() as u16;
+        let x = inner.x + 2 + ratatui::text::Line::raw(display_line(&m.query)).width() as u16;
         frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
     }
 }
@@ -184,7 +184,7 @@ fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     };
     if page.hits.is_empty() {
         let msg = Line::styled(
-            format!("no matches for \"{}\"", sanitize_line(&page.query)),
+            format!("no matches for \"{}\"", display_line(&page.query)),
             t.dim,
         );
         frame.render_widget(Paragraph::new(msg).block(block), area);
@@ -198,7 +198,7 @@ fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
                 Span::styled(when(h.observed_at_ms), t.dim),
                 Span::raw(format!("  {:<5} ", h.source)),
             ];
-            spans.extend(safe_spans(&sanitize_line(&h.text), t));
+            spans.extend(safe_spans(&display_line(&h.text), t));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -237,12 +237,11 @@ fn timeline(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
                 Span::raw("    ")
             };
             // Month-day is enough beside neighbors; the detail pane has the year.
-            let short = when(o.observed_at_ms)
-                .get(5..)
-                .unwrap_or_default()
-                .to_string();
+            let short = o
+                .observed_at_ms
+                .map_or_else(|| "unknown    ".into(), |ms| format_utc(ms)[5..].to_string());
             let mut spans = vec![mark, Span::styled(format!("{short} "), t.dim)];
-            spans.extend(safe_spans(&sanitize_line(&o.safe_text), t));
+            spans.extend(safe_spans(&display_line(&o.safe_text), t));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -296,7 +295,7 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         Line::styled("exact text, redacted at import:", t.title),
     ];
     for l in o.safe_text.split('\n') {
-        lines.push(Line::from(safe_spans(&sanitize_line(l), t)));
+        lines.push(Line::from(safe_spans(&display_line(l), t)));
     }
     let p = Paragraph::new(Text::from(lines))
         .block(block)
@@ -345,10 +344,10 @@ fn recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             let mut spans = vec![
                 Span::styled(w, st),
                 Span::raw(" "),
-                Span::raw(sanitize_line(&s.label)),
+                Span::raw(display_line(&s.label)),
             ];
             if let Some(out) = &s.outcome {
-                spans.push(Span::styled(format!(" → {}", sanitize_line(out)), t.dim));
+                spans.push(Span::styled(format!(" → {}", display_line(out)), t.dim));
             }
             lines.push(Line::from(spans));
         }
@@ -358,7 +357,7 @@ fn recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
                 format!("finding (cites {}):", cites.join(", ")),
                 t.title,
             ));
-            lines.push(Line::from(safe_spans(&sanitize_line(&f.claim), t)));
+            lines.push(Line::from(safe_spans(&display_line(&f.claim), t)));
             lines.push(Line::styled("Enter here opens the cited evidence", t.dim));
         }
     }
@@ -390,7 +389,7 @@ fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let mut first = vec![search, Span::raw(" · "), recall];
     if let Some(n) = &m.notice {
         first.push(Span::raw(" · "));
-        first.push(Span::styled(sanitize_line(n), t.busy));
+        first.push(Span::styled(display_line(n), t.busy));
     }
     let hints = match m.focus {
         Focus::Query => {
@@ -471,18 +470,6 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 fn when(ms: Option<i64>) -> String {
     ms.map(format_utc)
         .unwrap_or_else(|| "unknown time    ".into())
-}
-
-/// History text is hostile input: a stored escape sequence must reach the
-/// terminal as a visible placeholder, never as a control byte.
-fn sanitize_line(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            '\t' | '\n' | '\r' => ' ',
-            c if c.is_control() => '\u{FFFD}',
-            c => c,
-        })
-        .collect()
 }
 
 /// Splits out redaction markers so they read differently from the command
@@ -609,6 +596,20 @@ mod tests {
     /// Cell at display column `x` of row `y`.
     fn cell(b: &Buffer, x: u16, y: u16) -> &ratatui::buffer::Cell {
         &b[(x, y)]
+    }
+
+    #[test]
+    fn timeline_labels_untimed_history_as_unknown() {
+        // Plain bash history has no timestamps.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bash_history");
+        std::fs::write(&path, "cd /etc/nginx\ncertbot renew\nls\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        import_file(&mut store, &path, SourceKind::Bash, &Redactor::new()).unwrap();
+
+        let s = text(&render(&typed(&store, "certb", false), 120, 40));
+        assert!(s.contains("hit unknown     certbot renew"), "{s}");
+        assert!(!s.contains("hit wn time"), "{s}");
     }
 
     #[test]

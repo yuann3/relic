@@ -114,6 +114,26 @@ pub fn source_label(kind: ObservationKind) -> &'static str {
     }
 }
 
+/// History text is hostile input. Render it as one line that cannot drive the
+/// terminal, break NUL/tab framing, or visually reorder itself: line-breaking
+/// whitespace becomes a space; every other control and invisible format
+/// character becomes a visible U+FFFD.
+pub fn display_line(text: &str) -> String {
+    text.chars().map(display_char).collect()
+}
+
+pub fn display_char(c: char) -> char {
+    match c {
+        '\t' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
+        c if c.is_control() => '\u{FFFD}',
+        // Bidi marks/overrides/isolates (Trojan Source), zero-width
+        // characters, and interlinear annotation anchors.
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' => '\u{FFFD}',
+        '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' => '\u{FFFD}',
+        c => c,
+    }
+}
+
 /// `YYYY-MM-DD HH:MM` in UTC. Local time needs a tz database, which the
 /// prototype does not carry.
 pub fn format_utc(ms: i64) -> String {
@@ -208,6 +228,17 @@ mod tests {
         assert_eq!(view.observation.safe_text, "certbot renew");
         let texts: Vec<&str> = view.timeline.iter().map(|o| o.safe_text.as_str()).collect();
         assert_eq!(texts, ["cd /etc/nginx", "certbot renew", "systemctl reload nginx"]);
+    }
+
+    #[test]
+    fn display_line_neutralizes_controls_and_invisible_reordering() {
+        assert_eq!(display_line("a\tb\nc\rd\u{2028}e"), "a b c d e");
+        assert_eq!(display_line("\x1b[31mred"), "\u{FFFD}[31mred");
+        assert_eq!(display_line("x\0y\u{7f}z\u{85}"), "x\u{FFFD}y\u{FFFD}z\u{FFFD}");
+        for c in ['\u{061C}', '\u{200B}', '\u{200E}', '\u{202E}', '\u{2066}', '\u{FEFF}', '\u{FFF9}'] {
+            assert_eq!(display_line(&format!("a{c}b")), "a\u{FFFD}b", "{:?}", c);
+        }
+        assert_eq!(display_line("部署 café ✓"), "部署 café ✓");
     }
 
     #[test]
