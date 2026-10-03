@@ -3,14 +3,14 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
+    KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::{cursor, execute, terminal};
 
@@ -47,10 +47,23 @@ pub fn panicked() -> bool {
     PANICKED.load(Ordering::SeqCst)
 }
 
+/// What the panic hook records, without a real panic; one-way, like the hook.
+#[cfg(test)]
+pub fn mark_panicked() {
+    PANICKED.store(true, Ordering::SeqCst);
+}
+
 /// Handle on the full-screen terminal state. Only one exists at a time.
 pub struct TerminalGuard(());
 
 impl TerminalGuard {
+    /// A guard that has entered nothing, for driving the event loop on a
+    /// test backend.
+    #[cfg(test)]
+    pub fn detached() -> Self {
+        Self(())
+    }
+
     pub fn enter() -> io::Result<Self> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err(io::Error::other("relic ui needs an interactive terminal"));
@@ -67,10 +80,25 @@ impl TerminalGuard {
     /// (Re-)enter the full-screen state after `restore`, e.g. after fzf.
     /// Each flag is set only once its step took effect, so a failure part
     /// way leaves exactly the completed steps for `restore` to undo.
+    ///
+    /// A program that owned the tty and was killed (the picker SIGKILLs an
+    /// fzf that overflows its output) leaves its modes behind, so this
+    /// starts from the user's termios and turns mouse reporting off.
+    /// crossterm records whatever mode it finds as the one to restore at
+    /// exit; without the reset the shell would get fzf's raw, no-echo tty.
     pub fn resume(&mut self) -> io::Result<()> {
         #[cfg(unix)]
-        save_termios();
+        {
+            save_termios();
+            if !RAW.load(Ordering::SeqCst)
+                && let Some(t) = ORIGINAL_TERMIOS.get()
+            {
+                // SAFETY: restores a termios captured by tcgetattr on this fd.
+                unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t) };
+            }
+        }
         let mut out = io::stdout();
+        execute!(out, DisableMouseCapture)?;
         terminal::enable_raw_mode()?;
         RAW.store(true, Ordering::SeqCst);
         fault_point("raw");
@@ -182,6 +210,8 @@ fn emergency_restore() {
 /// both the pause handshake and quit latency; idle cost is one syscall per
 /// period, not a render.
 const POLL: Duration = Duration::from_millis(100);
+/// Retry period for a send into a full UI channel.
+const SEND_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Default)]
 struct Gate {
@@ -199,11 +229,26 @@ pub struct InputReader {
 
 impl InputReader {
     pub fn spawn(tx: SyncSender<UiAction>) -> Self {
+        Self::spawn_with(tx, || {
+            if event::poll(POLL)? {
+                event::read().map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// `next` is one bounded wait for terminal input: `Ok(None)` when the
+    /// wait ended with nothing to read.
+    pub fn spawn_with(
+        tx: SyncSender<UiAction>,
+        mut next: impl FnMut() -> io::Result<Option<Event>> + Send + 'static,
+    ) -> Self {
         let gate = Arc::new((Mutex::new(Gate::default()), Condvar::new()));
         let g = Arc::clone(&gate);
         let handle = std::thread::Builder::new()
             .name("relic-input".into())
-            .spawn(move || read_loop(&g, &tx))
+            .spawn(move || read_loop(&g, &tx, &mut next))
             .expect("spawn input thread");
         Self {
             gate,
@@ -239,56 +284,70 @@ impl Drop for InputReader {
     }
 }
 
-fn read_loop(gate: &(Mutex<Gate>, Condvar), tx: &SyncSender<UiAction>) {
-    let (lock, cv) = gate;
-    let park = |stop_too: bool| {
-        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
-        g.parked = true;
-        cv.notify_all();
-        if stop_too {
-            g.stop = true;
-        }
-    };
-    loop {
-        {
-            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
-            while g.pause && !g.stop {
-                g.parked = true;
-                cv.notify_all();
-                g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-            }
-            g.parked = false;
-            if g.stop {
-                g.parked = true;
-                cv.notify_all();
-                return;
-            }
-        }
-        let ready = match event::poll(POLL) {
-            Ok(r) => r,
+fn read_loop(
+    gate: &(Mutex<Gate>, Condvar),
+    tx: &SyncSender<UiAction>,
+    next: &mut impl FnMut() -> io::Result<Option<Event>>,
+) {
+    while wait_while_paused(gate) {
+        let action = match next() {
+            Ok(None) => continue,
+            Ok(Some(ev)) => match translate(ev, Instant::now()) {
+                Some(a) => a,
+                None => continue,
+            },
             Err(_) => {
-                park(true);
-                let _ = tx.send(UiAction::InputClosed);
-                return;
+                send(gate, tx, UiAction::InputClosed);
+                break;
             }
         };
-        if !ready {
-            continue;
+        if !send(gate, tx, action) {
+            break;
         }
-        match event::read() {
-            Ok(ev) => {
-                if let Some(a) = translate(ev, Instant::now())
-                    && tx.send(a).is_err()
-                {
-                    park(true);
-                    return;
-                }
+    }
+    // However the loop ended, a pause in progress must return and later
+    // ones must not wait.
+    let (lock, cv) = gate;
+    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    g.parked = true;
+    g.stop = true;
+    cv.notify_all();
+}
+
+/// Parks while paused. False once stopped.
+fn wait_while_paused((lock, cv): &(Mutex<Gate>, Condvar)) -> bool {
+    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while g.pause && !g.stop {
+        g.parked = true;
+        cv.notify_all();
+        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    g.parked = false;
+    !g.stop
+}
+
+/// Delivers `a`, waiting while the channel is full. A blocking `send` would
+/// deadlock: the only thread that drains the channel may be the one waiting
+/// in `pause` or joining this thread on drop, so every wait goes back
+/// through the gate. False once stopped or the receiver is gone.
+fn send(gate: &(Mutex<Gate>, Condvar), tx: &SyncSender<UiAction>, mut a: UiAction) -> bool {
+    loop {
+        match tx.try_send(a) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(back)) => a = back,
+        }
+        {
+            let (lock, cv) = gate;
+            let g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            // pause() and drop notify, so a request is seen at once; the
+            // timeout only paces retries while the main thread catches up.
+            if !g.pause && !g.stop {
+                drop(cv.wait_timeout(g, SEND_RETRY));
             }
-            Err(_) => {
-                park(true);
-                let _ = tx.send(UiAction::InputClosed);
-                return;
-            }
+        }
+        if !wait_while_paused(gate) {
+            return false;
         }
     }
 }
@@ -336,6 +395,62 @@ pub fn translate(ev: Event, now: Instant) -> Option<UiAction> {
 mod tests {
     use super::*;
     use crossterm::event::KeyEventState;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc::{self, TryRecvError};
+
+    #[test]
+    fn pause_and_stop_return_while_the_ui_channel_is_full() {
+        const CAP: usize = 4;
+        let (tx, rx) = mpsc::sync_channel(CAP);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let n = Arc::clone(&reads);
+        // A terminal that always has another key ready: the reader fills
+        // the channel and then holds one more key it cannot deliver.
+        let reader = InputReader::spawn_with(tx, move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(key(KeyCode::Char('x'), KeyModifiers::NONE)))
+        });
+        let stalled = |reads: &AtomicUsize| {
+            // Reads stop once the reader holds a key it cannot deliver.
+            let mut last = usize::MAX;
+            while reads.load(Ordering::SeqCst) != last {
+                last = reads.load(Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        stalled(&reads);
+        assert_eq!(reads.load(Ordering::SeqCst), CAP + 1);
+
+        let reader = crate::ui::within("pause", move || {
+            reader.pause();
+            reader
+        });
+        let read_when_parked = reads.load(Ordering::SeqCst);
+        for _ in 0..CAP {
+            rx.try_recv().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "a parked reader must not deliver"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            read_when_parked,
+            "a parked reader must not read the terminal"
+        );
+
+        reader.resume();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the held key is delivered after resume"
+        );
+        stalled(&reads);
+        // The channel is full again and nobody drains it while the reader
+        // is dropped, as on exit.
+        crate::ui::within("drop", move || drop(reader));
+        drop(rx);
+    }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent {
