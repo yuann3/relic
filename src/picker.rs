@@ -276,6 +276,7 @@ mod tests {
             query: "q".into(),
             limit: 10,
             truncated: false,
+            deferred: None,
             hits,
         }
     }

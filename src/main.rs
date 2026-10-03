@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use relic::app::{self, MatchMode, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
+use relic::picker::PickError;
 use relic::store::Store;
 
 fn main() -> ExitCode {
@@ -64,15 +65,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
             serde_json::to_writer(&mut out, &page)?;
             writeln!(out)?;
         }
-        Output::Text => {
-            for h in &page.hits {
-                let when = h.observed_at_ms.map(app::format_utc).unwrap_or_else(|| "unknown time    ".into());
-                writeln!(out, "{when}  {:<4}  {}", h.source, app::display_line(&h.text))?;
-            }
-            if page.truncated {
-                eprintln!("(more matches past {}; narrow the query or raise --limit)", page.limit);
-            }
-        }
+        Output::Text => print_page(&mut out, &page)?,
         Output::Fzf => {
             if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
                 return Err("--fzf needs an interactive terminal".into());
@@ -81,14 +74,21 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
                 eprintln!("no matches");
                 return Ok(ExitCode::FAILURE);
             }
-            let Some(id) = relic::picker::pick(&page)? else {
-                return Ok(ExitCode::from(130));
+            let id = match relic::picker::pick(&page) {
+                Ok(Some(id)) => id,
+                Ok(None) => return Ok(ExitCode::from(130)),
+                // The picker is optional: indexed results are still complete.
+                Err(e @ (PickError::Unavailable | PickError::TooOld { .. })) => {
+                    eprintln!("relic: {e}");
+                    print_page(&mut out, &page)?;
+                    return Ok(ExitCode::SUCCESS);
+                }
+                Err(e) => return Err(e.into()),
             };
             let view = app::open_evidence(&store, id, 3)?.ok_or("selected evidence vanished")?;
             for o in &view.timeline {
                 let mark = if o.id == id { ">" } else { " " };
-                let when = o.observed_at_ms.map(app::format_utc).unwrap_or_default();
-                writeln!(out, "{mark} {when}  {}", app::display_line(&o.safe_text))?;
+                writeln!(out, "{mark} {}  {}", when(o.observed_at_ms), app::display_line(&o.safe_text))?;
             }
         }
     }
@@ -96,6 +96,20 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_page(out: &mut impl Write, page: &app::SearchPage) -> Result<()> {
+    for h in &page.hits {
+        writeln!(out, "{}  {:<4}  {}", when(h.observed_at_ms), h.source, app::display_line(&h.text))?;
+    }
+    if page.truncated {
+        eprintln!("(more matches past {}; narrow the query or raise --limit)", page.limit);
+    }
+    Ok(())
+}
+
+fn when(ms: Option<i64>) -> String {
+    ms.map_or_else(|| "unknown time    ".into(), app::format_utc)
 }
 
 /// Search and the UI must not create an empty database as a side effect.

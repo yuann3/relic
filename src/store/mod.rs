@@ -188,49 +188,79 @@ impl Store {
     /// Two-step: (1) FTS5 narrowing with `ORDER BY rank` for the internal
     /// priority-queue optimization, (2) fetch observation metadata by rowid.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
-        self.search_fts(&escape_fts_query(query, false), limit)
+        self.search_fts(&escape_fts_query(query, false), limit, true)
     }
 
-    /// Like [`Store::search`], but the last word matches as a prefix, so
-    /// partially typed input ("gi") finds completed words ("git").
-    pub fn search_prefix(
+    /// Newest-first matches where the last word is a prefix, so partially
+    /// typed input ("gi") finds completed words ("git"). Rank must score every
+    /// match before returning any, while rowid order lets FTS5 stop after
+    /// `limit` rows: the difference between 260 ms and under 8 ms per
+    /// keystroke at 1M (docs/research/interactive-fts-measurements.md).
+    /// Hits carry score 0.0. Rowid order is import order, not observed time.
+    pub fn search_recent_prefix(
         &self,
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>, rusqlite::Error> {
-        self.search_fts(&escape_fts_query(query, true), limit)
+        self.search_fts(&escape_fts_query(query, true), limit, false)
     }
 
-    fn search_fts(&self, escaped: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
+    /// The newest observations, unfiltered.
+    pub fn recent(&self, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, 0.0 FROM observation ORDER BY id DESC LIMIT ?1",
+        )?;
+        let ids = stmt
+            .query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        self.hits_for(&ids)
+    }
+
+    fn search_fts(
+        &self,
+        escaped: &str,
+        limit: usize,
+        by_rank: bool,
+    ) -> Result<Vec<SearchHit>, rusqlite::Error> {
         if escaped.is_empty() {
             return Ok(vec![]);
         }
 
         // Step 1: Get top-N rowids from FTS5 with rank optimization.
-        let mut fts_stmt = self.conn.prepare_cached(
+        let sql = if by_rank {
             "SELECT rowid, rank FROM observation_fts
              WHERE observation_fts MATCH ?1
              ORDER BY rank
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        } else {
+            "SELECT rowid, 0.0 FROM observation_fts
+             WHERE observation_fts MATCH ?1
+             ORDER BY rowid DESC
+             LIMIT ?2"
+        };
+        let mut fts_stmt = self.conn.prepare_cached(sql)?;
         let ranked: Vec<(i64, f64)> = fts_stmt
             .query_map(rusqlite::params![escaped, limit as i64], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        self.hits_for(&ranked)
+    }
+
+    /// Step 2: fetch observation data for ranked rowids, keeping their order.
+    fn hits_for(&self, ranked: &[(i64, f64)]) -> Result<Vec<SearchHit>, rusqlite::Error> {
         if ranked.is_empty() {
             return Ok(vec![]);
         }
 
-        // Step 2: Fetch observation data for those rowids.
         let mut obs_stmt = self.conn.prepare_cached(
             "SELECT id, observed_at_ms, kind, safe_text, revision_id, ordinal
              FROM observation WHERE id = ?1",
         )?;
 
         let mut hits = Vec::with_capacity(ranked.len());
-        for (rowid, score) in &ranked {
+        for (rowid, score) in ranked {
             if let Ok(row) = obs_stmt
                 .query_row([rowid], |row| {
                     let kind_val: i64 = row.get(2)?;
@@ -505,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn search_prefix_matches_partial_last_word() {
+    fn recent_prefix_matches_partial_last_word() {
         let mut store = Store::open_memory().unwrap();
         let rev_id = setup_revision(&store);
         store.insert_observations(&[
@@ -514,23 +544,44 @@ mod tests {
         ]).unwrap();
 
         assert!(store.search("gi", 10).unwrap().is_empty());
-        let hits = store.search_prefix("gi", 10).unwrap();
+        let hits = store.search_recent_prefix("gi", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].safe_text, "git push origin main");
         // Earlier words still match whole.
-        assert!(store.search_prefix("gi pu", 10).unwrap().is_empty());
-        assert_eq!(store.search_prefix("git pu", 10).unwrap().len(), 1);
+        assert!(store.search_recent_prefix("gi pu", 10).unwrap().is_empty());
+        assert_eq!(store.search_recent_prefix("git pu", 10).unwrap().len(), 1);
     }
 
     #[test]
-    fn search_prefix_does_not_pass_fts_syntax_through() {
+    fn recent_prefix_does_not_pass_fts_syntax_through() {
         let mut store = Store::open_memory().unwrap();
         let rev_id = setup_revision(&store);
         store.insert_observations(&[make_observation(rev_id, 0, "echo NEAR(a b)")]).unwrap();
 
         // A stray quote or operator in user input must not become FTS syntax.
-        assert!(store.search_prefix("\"", 10).unwrap().is_empty());
-        assert_eq!(store.search_prefix("NEAR(a", 10).unwrap().len(), 1);
+        assert!(store.search_recent_prefix("\"", 10).unwrap().is_empty());
+        assert_eq!(store.search_recent_prefix("NEAR(a", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recent_prefix_orders_newest_first() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = setup_revision(&store);
+        // BM25 would put the shortest row first; recency must not.
+        store.insert_observations(&[
+            make_observation(rev_id, 0, "git"),
+            make_observation(rev_id, 1, "git commit -m one two three four"),
+            make_observation(rev_id, 2, "ls"),
+            make_observation(rev_id, 3, "git push origin main --force"),
+        ]).unwrap();
+
+        let texts = |hits: Vec<SearchHit>| hits.into_iter().map(|h| h.safe_text).collect::<Vec<_>>();
+        assert_eq!(
+            texts(store.search_recent_prefix("gi", 10).unwrap()),
+            ["git push origin main --force", "git commit -m one two three four", "git"]
+        );
+        assert_eq!(texts(store.search("git", 1).unwrap()), ["git"]);
+        assert_eq!(texts(store.recent(2).unwrap()), ["git push origin main --force", "ls"]);
     }
 
     #[test]

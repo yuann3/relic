@@ -12,11 +12,17 @@ pub const SEARCH_SCHEMA: &str = "relic.search/v1";
 /// handed to a picker as a stand-in for the index.
 pub const MAX_PAGE: usize = 5_000;
 
+/// A shorter trailing word is not sent to FTS: one-character prefixes merge
+/// the doclists of every term they start and cost ~20 ms at 1M, while
+/// two characters stay under 8 ms (docs/research/interactive-fts-measurements.md).
+pub const MIN_PREFIX_CHARS: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchMode {
     /// Every word must match whole. Used by scripts and recall.
     Words,
-    /// The last word matches as a prefix. Used while the user is typing.
+    /// Newest first; the last word matches as a prefix once it has
+    /// [`MIN_PREFIX_CHARS`]. Used while the user is typing.
     PrefixLast,
 }
 
@@ -36,6 +42,8 @@ pub struct SearchPage {
     pub limit: usize,
     /// More matches exist beyond `limit`.
     pub truncated: bool,
+    /// A trailing word too short to filter by yet; the page ignores it.
+    pub deferred: Option<String>,
     pub hits: Vec<PageHit>,
 }
 
@@ -60,9 +68,20 @@ impl SearchPage {
 pub fn search(store: &Store, req: &SearchRequest) -> Result<SearchPage, rusqlite::Error> {
     let limit = req.limit.clamp(1, MAX_PAGE);
     // Ask for one extra row so the page can say whether it was cut off.
+    let mut deferred = None;
     let mut hits = match req.mode {
         MatchMode::Words => store.search(&req.query, limit + 1)?,
-        MatchMode::PrefixLast => store.search_prefix(&req.query, limit + 1)?,
+        MatchMode::PrefixLast => {
+            let mut words: Vec<&str> = req.query.split_whitespace().collect();
+            if words.last().is_some_and(|w| w.chars().count() < MIN_PREFIX_CHARS) {
+                deferred = words.pop().map(String::from);
+            }
+            if words.is_empty() {
+                store.recent(limit + 1)?
+            } else {
+                store.search_recent_prefix(&words.join(" "), limit + 1)?
+            }
+        }
     };
     let truncated = hits.len() > limit;
     hits.truncate(limit);
@@ -71,6 +90,7 @@ pub fn search(store: &Store, req: &SearchRequest) -> Result<SearchPage, rusqlite
         query: req.query.clone(),
         limit,
         truncated,
+        deferred,
         hits: hits
             .into_iter()
             .map(|h| PageHit {
@@ -193,6 +213,37 @@ mod tests {
         let page = search(&store, &req("kube", 10, MatchMode::PrefixLast)).unwrap();
         assert_eq!(page.hits[0].text, "kubectl get pods");
         assert_eq!(page.hits[0].source, "zsh");
+    }
+
+    #[test]
+    fn prefix_mode_is_newest_first() {
+        let store = store_with(&["git", "git commit -m a long message here", "git push"]);
+        let page = search(&store, &req("gi", 10, MatchMode::PrefixLast)).unwrap();
+        let texts: Vec<&str> = page.hits.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["git push", "git commit -m a long message here", "git"]);
+    }
+
+    #[test]
+    fn short_trailing_word_is_deferred_not_searched() {
+        let store = store_with(&["git commit", "git push", "ls -la", "cargo build"]);
+
+        // "git c": filter by "git" only, newest first, and say "c" is pending.
+        let page = search(&store, &req("git c", 10, MatchMode::PrefixLast)).unwrap();
+        let texts: Vec<&str> = page.hits.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["git push", "git commit"]);
+        assert_eq!(page.deferred.as_deref(), Some("c"));
+
+        // A lone short word shows the newest commands unfiltered.
+        let page = search(&store, &req("l", 2, MatchMode::PrefixLast)).unwrap();
+        let texts: Vec<&str> = page.hits.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["cargo build", "ls -la"]);
+        assert!(page.truncated);
+
+        // Two characters filter. Words mode never defers.
+        let page = search(&store, &req("git co", 10, MatchMode::PrefixLast)).unwrap();
+        assert_eq!((page.hits.len(), page.deferred), (1, None));
+        let page = search(&store, &req("git c", 10, MatchMode::Words)).unwrap();
+        assert_eq!((page.hits.len(), page.deferred), (0, None));
     }
 
     #[test]

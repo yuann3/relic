@@ -728,20 +728,22 @@ mod tests {
         fts_rowids(conn, &fts_sql(Order::RowidDesc, false), &fts_params(&escape(query, prefix), 100, None))
     }
 
-    /// The bench's baseline query must return exactly what Store returns, in
-    /// the same order, or its numbers describe some other search.
+    /// The bench's queries must return exactly what Store returns, in the
+    /// same order, or its numbers describe some other search.
     #[test]
-    fn baseline_query_matches_store_search_prefix() {
+    fn bench_queries_match_store() {
         let dir = tempfile::tempdir().unwrap();
         let db = fixture_db(dir.path());
         let store = Store::open(&db).unwrap();
         let conn = open_read(&db);
+        let ids = |hits: Vec<relic::domain::SearchHit>| hits.iter().map(|h| h.id).collect::<Vec<_>>();
         for query in ["g", "gi", "gi pu", "git c", "git pu", "src/main.rs", "\""] {
-            let expected: Vec<i64> =
-                store.search_prefix(query, 100).unwrap().iter().map(|h| h.id).collect();
-            let got = fts_rowids(&conn, &fts_sql(Order::Rank, false), &fts_params(&escape(query, true), 100, None))
+            let recent = ids(store.search_recent_prefix(query, 100).unwrap());
+            assert_eq!(rowid_desc(&conn, query, true).unwrap_or_default(), recent, "{query:?}");
+            let ranked = ids(store.search(query, 100).unwrap());
+            let got = fts_rowids(&conn, &fts_sql(Order::Rank, false), &fts_params(&escape(query, false), 100, None))
                 .unwrap_or_default();
-            assert_eq!(got, expected, "query {query:?}");
+            assert_eq!(got, ranked, "{query:?}");
         }
     }
 

@@ -11,7 +11,7 @@ use super::model::{
     Focus, Modal, RECALL_CHILD_MAX, RECALL_ROOT_MAX, RECALL_SPEND_CAP, RECALL_WALL_MAX,
     RecallStatus, StepState, UiModel,
 };
-use crate::app::{display_line, format_utc, source_label};
+use crate::app::{MIN_PREFIX_CHARS, display_line, format_utc, source_label};
 
 /// Below this the panes cannot show a usable row, so say so instead.
 pub const MIN_WIDTH: u16 = 40;
@@ -168,8 +168,15 @@ fn query_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
 fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let s = &m.search;
     let title = match &s.page {
-        Some(p) if p.truncated => format!("Results {} (page full; narrow the query)", p.hits.len()),
-        Some(p) => format!("Results {}", p.hits.len()),
+        Some(p) => {
+            let full = if p.truncated { " (page full; narrow the query)" } else { "" };
+            // Narrow panes truncate titles, so the deferred hint replaces the
+            // ordering note rather than extending it.
+            let note = p.deferred.as_deref().map_or("newest first".into(), |w| {
+                format!("\"{}\" needs {MIN_PREFIX_CHARS}+ chars", display_line(w))
+            });
+            format!("Results {}{full} · {note}", p.hits.len())
+        }
         None => "Results".into(),
     };
     let block = pane(t, title, matches!(m.focus, Focus::Query | Focus::Results));
@@ -613,6 +620,15 @@ mod tests {
     }
 
     #[test]
+    fn results_say_when_a_short_word_is_not_filtering_yet() {
+        let store = store_with(NGINX);
+        let s = text(&render(&typed(&store, "certbot r", false), 120, 40));
+        assert!(s.contains("Results 1 · \"r\" needs 2+ chars"), "{s}");
+        let s = text(&render(&typed(&store, "certbot re", false), 120, 40));
+        assert!(s.contains("[ Results 1 · newest first ]"), "{s}");
+    }
+
+    #[test]
     fn wide_layout_shows_every_pane() {
         let store = store_with(NGINX);
         let m = typed(&store, "certb", false);
@@ -759,6 +775,7 @@ mod tests {
             query: "x".into(),
             limit: 200,
             truncated: false,
+            deferred: None,
             hits: vec![hit],
         };
         let generation = m.search.generation;

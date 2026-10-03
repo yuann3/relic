@@ -29,9 +29,11 @@ use crate::store::Store;
 use model::{PAGE_LIMIT, PickOutcome, UiAction, UiEffect, UiModel, update};
 use term::{InputReader, TerminalGuard};
 
-/// Quiet period before a keystroke becomes a query (prototype variable; the
-/// research range is 50-100 ms).
-const DEBOUNCE: Duration = Duration::from_millis(75);
+/// Quiet period before a keystroke becomes a query. Zero: with newest-first
+/// FTS every keystroke costs under 8 ms, the newest-wins mailbox already
+/// coalesces bursts, and a 75 ms timed wait measured ~115 ms on macOS
+/// because of timer slack.
+const DEBOUNCE: Duration = Duration::ZERO;
 /// Redraw rate while an operation runs, so the wall-clock meter moves.
 /// Idle draws only on input.
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
@@ -113,7 +115,7 @@ impl Runtime {
         rx: &Receiver<UiAction>,
         mut m: UiModel,
     ) -> Result<()> {
-        let mut queue = VecDeque::new();
+        let mut queue = VecDeque::from([UiAction::Start]);
         let mut next_tick = Instant::now() + PROGRESS_TICK;
         let mut first_frame = true;
         loop {
@@ -467,7 +469,8 @@ mod tests {
 
     #[test]
     fn worker_debounces_bursts_and_answers_the_latest_generation() {
-        let (mb, rx, h, _dir) = worker(DEBOUNCE);
+        let debounce = Duration::from_millis(75);
+        let (mb, rx, h, _dir) = worker(debounce);
         // Typed faster than the debounce: only the last one runs.
         for (g, q) in [(1, "g"), (2, "gi"), (3, "git"), (4, "c"), (5, "car")] {
             mb.put(job(g, q, Instant::now()));
@@ -477,7 +480,7 @@ mod tests {
         assert_eq!(generation, 5);
         assert_eq!(page.hits[0].text, "cargo build");
         assert!(
-            rx.recv_timeout(DEBOUNCE * 3).is_err(),
+            rx.recv_timeout(debounce * 3).is_err(),
             "superseded generations must not run"
         );
         mb.close();

@@ -67,6 +67,7 @@ pub fn page(ids: &[i64]) -> SearchPage {
         query: "q".into(),
         limit: ids.len(),
         truncated: false,
+        deferred: None,
         hits: ids
             .iter()
             .map(|&id| PageHit {

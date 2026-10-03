@@ -75,6 +75,8 @@ pub enum Modal {
 
 #[derive(Debug)]
 pub enum UiAction {
+    /// Sent once before the first frame: show the newest commands.
+    Start,
     Key(Key),
     /// Ctrl-C, stamped by the input thread so double-press timing stays pure.
     Interrupt(Instant),
@@ -294,6 +296,7 @@ impl UiModel {
 
 pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
     match action {
+        UiAction::Start => query_changed(m),
         UiAction::Key(key) => {
             m.dirty = true;
             on_key(m, key)
@@ -528,14 +531,7 @@ fn on_interrupt(m: &mut UiModel, at: Instant) -> Vec<UiEffect> {
 fn query_changed(m: &mut UiModel) -> Vec<UiEffect> {
     m.search.generation += 1;
     m.notice = None;
-    if m.query.trim().is_empty() {
-        m.search.page = None;
-        m.search.pending = false;
-        m.search.error = None;
-        m.search.selected = 0;
-        m.evidence.clear();
-        return vec![];
-    }
+    // An empty query is still a search: it pages the newest commands.
     m.search.pending = true;
     vec![UiEffect::Search {
         generation: m.search.generation,
@@ -726,6 +722,7 @@ mod tests {
             query: query.into(),
             limit: PAGE_LIMIT,
             truncated: false,
+            deferred: None,
             hits: ids
                 .iter()
                 .map(|&id| hit(id, &format!("{query} cmd {id}")))
@@ -817,18 +814,25 @@ mod tests {
     }
 
     #[test]
+    fn start_pages_the_newest_commands() {
+        let mut m = UiModel::new(false);
+        let e = update(&mut m, UiAction::Start);
+        assert_eq!(searches(&e), [(1, String::new())]);
+        assert!(m.search.pending);
+    }
+
+    #[test]
     fn backspace_and_ctrl_u_edit_the_query() {
         let mut m = UiModel::new(false);
         keys(&mut m, "git");
         let e = update(&mut m, UiAction::Key(Key::Backspace));
         assert_eq!(searches(&e), [(4, "gi".to_string())]);
 
-        // Clearing searches nothing but still bumps the generation so the
-        // in-flight "gi" result cannot land on an empty query.
+        // Clearing asks for the newest commands under a new generation, so
+        // the in-flight "gi" result cannot land on the empty query.
         let e = update(&mut m, UiAction::Key(Key::Ctrl('u')));
-        assert!(searches(&e).is_empty());
+        assert_eq!(searches(&e), [(5, String::new())]);
         assert_eq!(m.query, "");
-        assert_eq!(m.search.generation, 5);
         update(&mut m, done(4, page("gi", &[1])));
         assert!(m.search.page.is_none());
 

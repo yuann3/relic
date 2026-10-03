@@ -135,6 +135,7 @@ mod tests {
             query: "c".into(),
             limit: 200,
             truncated: false,
+            deferred: None,
             hits: vec![hit],
         };
         let generation = m.search.generation;
