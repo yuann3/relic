@@ -134,8 +134,10 @@ fn redact_long_hex_or_base64(input: &str) -> String {
                 result.push_str(token);
             }
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            // Token chars are ASCII, so `i` is always on a char boundary here.
+            let c = input[i..].chars().next().expect("i < len");
+            result.push(c);
+            i += c.len_utf8();
         }
     }
 
@@ -165,6 +167,13 @@ fn looks_like_secret_token(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_ascii_text_survives_unchanged() {
+        let r = Redactor::new();
+        assert_eq!(r.redact("echo 部署 café ✓"), "echo 部署 café ✓");
+        assert_eq!(r.redact("git commit -m 'résumé'"), "git commit -m 'résumé'");
+    }
 
     #[test]
     fn redact_env_var_assignment() {
