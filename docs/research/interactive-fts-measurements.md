@@ -1,27 +1,92 @@
 # Interactive FTS measurements for search-as-you-type
 
-**Status:** measured, recommendation pending the #11 architecture lock
+**Status:** measured. The option A latency claim was superseded on 2026-10-03 by the hot-token study; the recommendation is pending the #11 architecture lock.
 **Decision scope:** FTS5 schema options, result ordering, minimum query length, and recency pre-narrowing for the TUI's per-keystroke search; consequences for the #8 latency and size gates
 **Research date:** 2026-10-03
-**Evidence:** `benches/interactive_fts.rs` (run it yourself, below); raw output in the appendix
+**Evidence:** `benches/interactive_fts.rs` (run it yourself, below); raw output in appendices A (original run) and B (hot-token run)
 
 ## Decision
+
+**Revised 2026-10-03 after the hot-token study (below).** The original decision is kept under [Superseded decision](#superseded-decision-original-10-text). Its latency claim for option A, "every keystroke under 8 ms (worst 7.45 ms, `cargo re*`)", is **wrong**. The #10 query set had no prefixes of high-frequency tokens. With them in the set, option A's worst keystroke is **21.0 ms** (`git tas*`). Three of 98 keystrokes the TUI sends exceed 20 ms, and nine exceed 10 ms.
+
+Keep **`ORDER BY rowid DESC`** for interactive search. Nothing below changes that. BM25 `rank` still costs about 0.5 µs per match on every query.
+
+### Cost model under `rowid DESC LIMIT n`
+
+| Query shape | What FTS5 does | Cost at 1M (p95) |
+|---|---|---|
+| Whole word, any frequency | Walks the doclist newest-first and stops after n rows | 0.03–0.06 ms (`"task"`, 93% of rows: 0.04 ms) |
+| Prefix whose **exact** length has a prefix index | Reads one stored prefix term, then stops early as for a whole word | 0.04–0.06 ms (`"ta"*` with `prefix='2'`: 0.05 ms, down from 19.4 ms) |
+| Prefix with no prefix index of exactly its length | **Merges the full doclist of every term under the prefix into one list before returning the first row.** `LIMIT` cannot cut the merge short, and neither can a `rowid >=` bound. | About **13 ns per posting** for a single term, 19–30 ns per posting when several large terms merge, plus about 5–6 µs per term. Prefix length does not matter: `"tas"*` and `"task"*` both cost 12.6 ms, against 0.04 ms for the whole word `"task"`. |
+| Two tokens that rarely share a row (sparse AND) | Cannot stop early. Every row of the rarer token seeks into the other's doclist. | `"git" "task"` (0 matches): **6.8 ms on every schema**. This floor adds to any merge: `"git" "tas"*` costs 12.6 + 6.8 ≈ 21 ms. |
+
+So an unindexed prefix costs in proportion to **the postings under the prefix (the expanded terms' total doclist size)**, not the prefix length or the page size. A token that appears in every row of a 1M history costs about 13 ms as an unindexed prefix, before any AND. That cost grows linearly with history size. A prefix index helps only at the exact lengths it lists: with `prefix='2 3 4'`, `"taski"*` (5 chars, over a 93% token) still costs 12.5 ms.
+
+### Size and worst keystroke per configuration
+
+Fixture: 1M records, 53.3 MiB source. The keystroke set is 98 queries the TUI sends: the 22-query #10 set without its 1-char prefixes, plus every 2-char to full-length prefix of the 8 most frequent tokens, alone and after `git` / `cargo`, plus the whole-word forms. Measurements are p95 at page 200 (`LIMIT 201`), from a 50-run cell. "taskid corpus" is the same fixture with `# task-N` renamed `# taskid-N`. It stands in for a dominant token longer than 4 characters, such as `docker`, `kubectl` or `python3` in a real history.
+
+| Configuration | DB size / source | Worst sent keystroke, fixture | That query | Sent keystrokes > 20 ms | Worst, taskid corpus |
+|---|---|---|---|---|---|
+| A: baseline schema (shipped) | 3.04x | **20.95 ms** | `"git" "tas"*` | 3 of 98 | 24.5 ms |
+| `prefix='2'` | 3.41x (+0.37x) | 20.83 ms | `"git" "tas"*` | 2 of 98 | 27.1 ms¹ (`git taski*`) |
+| `prefix='2 3'` | 3.76x (+0.72x) | 21.06 ms | `"git" "task"*` | 1 of 98 | not built |
+| `prefix='2 3 4'` | 4.02x (+0.98x) | **6.82 ms** | `"git" "task"` (sparse-AND floor) | 0 | **21.2 ms** (`git taski*`) |
+| `prefix='1 2 3 4'` | 4.38x (+1.34x) | 6.84 ms | `"git" "tas"*` | 0 | not built |
+| Baseline schema + OR-of-terms rewrite for `*` tokens of 2+ chars (term list in memory) | 3.04x + term list | 7.21 ms | `"git" "tas"*` | 0 | 12.8 ms¹ (2nd worst 6.6) |
+| **`prefix='2'` + OR-of-terms rewrite for `*` tokens of 3+ chars** | **3.41x** + term list | **6.69 ms** | `"git" "task"` (sparse-AND floor) | **0** | **6.6 ms** |
+
+¹ Single cells under load average 7–10. Under taskid `prefix='2'`, the neighbouring `git taskid*` cell measures 20.85 ms. Under the taskid hybrid, the second-worst keystroke (`git taskid*`, the same single-term OR) measures 6.64 ms, and `git tas*` through the same OR measures 6.8 ms on the fixture.
+
+On this fixture `prefix='2'` and `prefix='2 3'` sit right at the 20 ms line, 20.8–21.1 ms. The margin is inside the noise and means nothing. What decides them is the cost model: a token in about 93% of rows, behind a lead word it never co-occurs with, costs about 21 ms at 1M, and that cost doubles with a 2M history. **`prefix='2 3 4'` is the cheapest pure-schema configuration that passes here** (+0.98x), and it passes only because the fixture's dominant token has 4 characters. The taskid corpus shows it failing for a longer one.
+
+### Query rewrites without an index
+
+Each rewrite was measured on the baseline schema against the plain prefix query. The full table is under [Query rewrites](#query-rewrites-on-the-baseline-schema).
+
+- **Whole word only** (send `"task"` instead of `"task"*`) takes 0.01–0.07 ms, but it **changes results**. It drops every longer completion: `ta` and `tas` return 0 of the 201 prefix rows, and a newer `tasks` row is lost behind older `task` rows. Not acceptable silently. Usable only as an interim frame that the real result replaces.
+- **Whole word OR prefix** (`"task" OR "task"*`) gives the same rows and the same cost or worse (`git task*`: 27–35 ms across the two runs). The prefix merge still runs.
+- **Exact-first + rowid bound.** A full page of whole-word hits gives a rowid floor, and the prefix query then runs with `rowid >= floor`. It gives the same rows, and no saving: the merge ignores the rowid bound (`ta*` 19.7 ms, `git task*` 27.5 ms).
+- **Per-keystroke fts5vocab range scan + OR of the expanded whole terms** gives the same rows and is 20–60% cheaper. It stays proportional to postings, because fts5vocab counts each term by reading its doclist: `t*` takes 15.3 ms, `git task*` 16.3 ms. Not bounded.
+- **OR of expanded whole terms taken from an in-memory term list** gives the **same rows**. Every term is a whole-word iterator, so `rowid DESC` stops early again. Cost follows the **number of expanded terms**, about 6 µs per term (`1*`: 1,111 terms, 6.5 ms; `12*`: 111 terms, 0.6 ms), plus any sparse-AND floor. It never costs much more than the plain prefix query, and for dominant terms it costs about 300x less (`tas*`: 12.6 → 0.04 ms). This is the only rewrite that keeps prefix semantics and bounded cost. It needs a term list: loading the full fts5vocab list takes 86 ms at 1M (10,098 terms). It reads every posting, so it runs off the UI thread. Prefix semantics hold only while that list is current, so a stale list is a correctness bug, not a slowdown (see below).
+
+### Recommendation for #11
+
+1. **Keep `rowid DESC` and the 2-char gate** (`MIN_PREFIX_CHARS = 2`). Do not claim that the gate bounds cost. It removes only 1-char prefixes.
+2. **Add `prefix='2'` to `observation_fts`** (+0.37x, 3.04x → 3.41x; 2 s rebuild at 1M). 2-char prefixes have the widest expansions in both terms and postings. With the index they take 0.05 ms, plus any sparse-AND floor.
+3. **Rewrite a 3+ char last token as an OR of its expanded whole terms**, from an in-memory term list:
+   - Load the list once through `fts5vocab(..., 'row')` (86 ms at 1M), off the UI thread.
+   - Reload it when `PRAGMA data_version` changes. Until a reload finishes, send the plain prefix query, because a stale list silently misses new terms.
+   - Above a cap of about 1,500 expanded terms (about 9 ms, which leaves room for a sparse-AND floor), send the plain prefix query. At that width the plain query costs about the same, about 6 µs per term.
+   - Keep the plain prefix query when the tokenizer splits the last word into a phrase (`task-1*`): FTS5 phrases cannot contain OR.
+   - The rewrite needs the query's last word folded the way `unicode61 remove_diacritics 2` folds it, so it should use the same tokenizer rules or the plain query.
+   
+   Measured worst sent keystroke: 6.7 ms on the fixture and 6.6 ms on the taskid corpus. That is the sparse-AND floor.
+4. **If #11 rejects a term list:** `prefix='2 3 4'` (4.02x) meets the gate on this fixture, but a dominant token of 5+ characters brings back the unbounded case (21 ms on the taskid corpus). That is another +0.61x on a size gate that already fails.
+5. **If #11 rejects both:** option A as shipped misses `<20 ms` p95 at 1M (21 ms), and the miss grows linearly with history size.
+6. **The sparse-AND floor is a separate, unbounded cost.** No prefix scheme touches it. It scales with the rarer token's postings when the two tokens never share a row: `git task` takes 6.8 ms with 33k `git` rows. At about 0.2 µs per row of the rarer token, two 30%-frequency tokens that never co-occur would take roughly 60 ms at 1M. That figure is extrapolated, not measured. #11 should budget it, for example by interrupting a query that runs past its time budget through SQLite's progress handler and keeping the previous page. It was not measured beyond the cases here.
+
+Before locking, run `interactive_fts --hot` on an anonymized real history. It prints the top tokens, the term counts under each prefix and every measurement above, so the term-count cap and the per-term cost can be checked against real long tails.
+
+## Superseded decision (original #10 text)
+
+> **Superseded.** Kept as written for the record. Its latency claims for option A ("worst 7.45 ms", "the only expensive case left is a short prefix") are wrong for prefixes of high-frequency tokens; see [Decision](#decision) and [Hot-token prefixes](#hot-token-prefixes-follow-up-measurement). The rank findings and size numbers still stand.
 
 The TUI should **order interactive results by recency (`ORDER BY rowid DESC`)**, not by BM25 `rank`. Ordering is what decides latency, and the schema option barely matters next to it:
 
 - With `ORDER BY rank`, cost grows linearly with the number of matches, about **0.5 µs per matching row**: 33k matches take 16 ms, 108k take 52 ms, 475k take 260 ms. Prefix indexes, `detail=` options and short-query gates do not change this. FTS5 has to score every match before it can return the top 200. The 0.5 µs/match model holds for single-term queries only: rank meets `<20 ms` for a single whole word or long prefix under about 35k matches (3.5% of the corpus), but multi-token queries whose last token is a short prefix miss it even when selective (`git c*`, 13k matches / 1.3%, 47 ms; `cargo re*`, 18k / 1.8%, 30 ms).
-- With `ORDER BY rowid DESC LIMIT n`, FTS5 walks the doclist newest-first and **stops after n rows**. A whole-word query for `cargo` (108k matches) drops from 52 ms to **0.03 ms**. The only expensive case left is a short prefix (`c*`, `ca*`), because FTS5 first merges the doclists of every term with that prefix.
+- With `ORDER BY rowid DESC LIMIT n`, FTS5 walks the doclist newest-first and **stops after n rows**. A whole-word query for `cargo` (108k matches) drops from 52 ms to **0.03 ms**. ~~The only expensive case left is a short prefix (`c*`, `ca*`)~~ **(superseded: any prefix without a prefix index of exactly its length is expensive when the terms under it have large doclists; `"task"*` costs 12.6 ms)**, because FTS5 first merges the doclists of every term with that prefix.
 
 Two ways to meet `<20 ms` on every keystroke:
 
 | Option | Schema change | Worst FTS p95, page 200, every keystroke | DB size cost |
 |---|---|---|---|
-| **A (recommended for v0.1):** baseline schema, `rowid DESC`, a 1-char last token is not sent to FTS. The TUI keeps the previous page or shows the unfiltered recent page, which is a primary-key scan and was not measured. | none | **7.45 ms** (`cargo re*`) | **0** |
-| **B:** add `prefix='1'` to `observation_fts`, `rowid DESC`, no length gate | one FTS option + rebuild (2 s at 1M) | **7.14 ms** (all 22 queries, 1-char included) | **+19.1 MiB (+0.36x source)** |
+| **A (recommended for v0.1):** baseline schema, `rowid DESC`, a 1-char last token is not sent to FTS. The TUI keeps the previous page or shows the unfiltered recent page, which is a primary-key scan and was not measured. | none | ~~**7.45 ms** (`cargo re*`)~~ **superseded: 20.95 ms (`git tas*`) once hot-token prefixes are included** | **0** |
+| **B:** add `prefix='1'` to `observation_fts`, `rowid DESC`, no length gate | one FTS option + rebuild (2 s at 1M) | ~~**7.14 ms**~~ (all 22 queries, 1-char included); **superseded: `prefix='1'` does not touch 2+ char prefixes, so B has the same ~21 ms worst case as A** | **+19.1 MiB (+0.36x source)** |
 
-`prefix='1 2 3'` brings every query under 1.5 ms, but it costs +57 MiB (+1.07x). That is far more speed than a 20 ms budget needs, so it is not worth paying. Adding the per-row metadata fetch to either option costs 0.25 ms (N+1 lookups) or 0.06 ms (JOIN) per 200-row page. This is negligible, so the worst keystroke stays under 8 ms end to end, before channel and render time.
+`prefix='1 2 3'` brings every query under 1.5 ms, but it costs +57 MiB (+1.07x). That is far more speed than a 20 ms budget needs, so it is not worth paying. Adding the per-row metadata fetch to either option costs 0.25 ms (N+1 lookups) or 0.06 ms (JOIN) per 200-row page. This is negligible, so ~~the worst keystroke stays under 8 ms end to end~~ (superseded: about 21 ms at 1M) before channel and render time.
 
-Option A is the default because the size gate already fails (see below) and the zero-cost version is fast enough. Option B is the knob to turn if 1-char filtering proves necessary in use.
+Option A is the default because the size gate already fails (see below) and ~~the zero-cost version is fast enough~~ (superseded: it is not, see [Decision](#decision)). Option B is the knob to turn if 1-char filtering proves necessary in use.
 
 BM25 `rank` stays useful for explicit, non-interactive searches, such as `relic search` and RLM recall. There it should run over a bounded recency window (V5) or accept the cost. It should not be the per-keystroke default.
 
@@ -39,7 +104,10 @@ BM25 `rank` stays useful for explicit, non-interactive searches, such as `relic 
   cargo run --release --bin fixture_db -- target/fixtures/1m.db 1000000
   cargo run --release --bin interactive_fts -- target/fixtures/1m.db target/fts-variants 50
   ```
-  This takes about 40 min, nearly all of it slow rank cells.
+  This takes about 40 min, nearly all of it slow rank cells. The hot-token study alone (rowid DESC only, about 10 min):
+  ```console
+  cargo run --release --bin interactive_fts -- target/fixtures/1m.db target/fts-variants 50 --hot
+  ```
 
 ## Size per variant
 
@@ -87,9 +155,9 @@ All per-query p50 / p95 / max values for both pages are in the appendix. This ta
 
 **V0 baseline (`ORDER BY rank`, what `Store::search_prefix` does today).** Cost scales with match count, not with query length. `gi*`, `git*`, `ku*` and `docker` (about 33k matches each) sit at 16-19 ms, at the edge of the gate. `cargo`, `car*`, `doc*` and `do*` (about 108k) take 52-58 ms. `ca*` (189k) takes 95-145 ms at p50, and the 1-char prefixes (200k-475k) take 100-270 ms. This reproduces #8's 42-74 ms finding and extends it. Page size (200 against 50) makes no difference.
 
-**V1 (minimum length).** A gate does not rescue `rank`. At 2 chars `ca*` still costs 256 ms p95, and at 3 chars `car*` still costs 76 ms. The gate only helps together with `rowid DESC`, where it removes the merge cost of 1-char prefixes. The UX cost: with a 2-char gate, typing `g`, `c`, `d` and the `c` in `git c` produces no new FTS query, and the TUI keeps or shows the recency page. With a 3-char gate, `gi`, `ca`, `git co` and `cargo re` are skipped as well. The 3-char gate buys nothing under `rowid DESC`, because 2-char prefixes already cost at most 7.5 ms.
+**V1 (minimum length).** A gate does not rescue `rank`. At 2 chars `ca*` still costs 256 ms p95, and at 3 chars `car*` still costs 76 ms. The gate only helps together with `rowid DESC`, where it removes the merge cost of 1-char prefixes. The UX cost: with a 2-char gate, typing `g`, `c`, `d` and the `c` in `git c` produces no new FTS query, and the TUI keeps or shows the recency page. With a 3-char gate, `gi`, `ca`, `git co` and `cargo re` are skipped as well. ~~The 3-char gate buys nothing under `rowid DESC`, because 2-char prefixes already cost at most 7.5 ms.~~ **Superseded:** that held for this query set only. A 2-char prefix of a dominant token costs 19.4 ms (`ta*`), and gating at any length leaves 3+ char prefixes of it at 12.5 ms or more; see [Hot-token prefixes](#hot-token-prefixes-follow-up-measurement).
 
-**V2 (`ORDER BY rowid DESC LIMIT n`).** The early exit is real. The query plan shows the vtab consuming the order (`INDEX 192:M1`, no temp B-tree). Single whole words take 0.02-0.04 ms whatever their frequency, and page 50 and page 200 cost the same. Prefix tokens without a prefix index pay to merge every doclist under the prefix before the walk can start, and that cost grows with how many terms and rows sit under it: `cargo*` 1.5 ms, `ca*` 5 ms, `c*` 18-20 ms, against 0.03 ms for the exact word `cargo`. The token AND `cargo re*` (7.5 ms) is the slowest query that passes a 2-char gate. Sparse ANDs stay cheap (0.9-1.7 ms), because FTS5 seeks through doclists with its doclist index instead of scanning them.
+**V2 (`ORDER BY rowid DESC LIMIT n`).** The early exit is real. The query plan shows the vtab consuming the order (`INDEX 192:M1`, no temp B-tree). Single whole words take 0.02-0.04 ms whatever their frequency, and page 50 and page 200 cost the same. Prefix tokens without a prefix index pay to merge every doclist under the prefix before the walk can start, and that cost grows with how many terms and rows sit under it: `cargo*` 1.5 ms, `ca*` 5 ms, `c*` 18-20 ms, against 0.03 ms for the exact word `cargo`. The token AND `cargo re*` (7.5 ms) is the slowest query in this set that passes a 2-char gate (**superseded** as a worst case: `git tas*` costs 21 ms). Sparse ANDs stay cheap (0.9-1.7 ms) here, because FTS5 seeks through doclists with its doclist index instead of scanning them. (Not in general: a sparse AND against a dominant token, `git task`, costs 6.8 ms on every schema; see the hot-token study.)
 
 **V3 (prefix index).** A prefix index turns `x*` into one stored term, so `rowid DESC` early-exits for prefixes too. `prefix='1'` fixes exactly the 1-char cases (`c*` goes from 20 ms to 0.06 ms, `git c*` from 18 ms to 0.14 ms) for +0.36x. `prefix='2 3'` fixes 2-3 char prefixes but leaves `c*` at 16 ms, for +0.72x. `prefix='1 2 3'` takes every query under 1.5 ms for +1.07x. Under `rank`, prefix indexes help single-term prefixes only a few percent (`g*` goes from 103 to 96 ms), because scoring still visits every match. They help only where the merge dominated a selective AND: `git c*` goes from 47 to 16 ms with `prefix='1'`.
 
@@ -113,10 +181,129 @@ All per-query p50 / p95 / max values for both pages are in the appendix. This ta
 
 **The metadata fetch does not matter.** 200 per-row lookups add about 0.23 ms, and a single JOIN adds about 0.06 ms. SQLite's planner pushes `ORDER BY ... LIMIT` into the FTS vtab even in the naive `fts JOIN observation` form, so the JOIN does not fetch metadata for every match. Store's two-step N+1 is fine to keep. A JOIN is a small, optional cleanup.
 
+## Hot-token prefixes (follow-up measurement)
+
+A reviewer found that option A's "<8 ms per keystroke" did not hold for prefixes of high-frequency tokens. This section measures that case directly. It supersedes the latency claims for option A.
+
+### Method
+
+- **Command:** `interactive_fts target/fixtures/1m.db target/fts-variants 50 --hot`, on the same machine and fixture as above. Every cell is `ORDER BY rowid DESC LIMIT 201`, with one warm-up and 50 timed runs. The cells report p95, and every variant's rows were compared with the baseline's: all identical.
+- **Machine state:** other agent sessions were running. Load average was 7.3 before and 10.2 after, on 16 cores. A first run of the same command, before the hybrid rows and the taskid `prefix='2'` variant were added (load 4.9 before, 14.6 after), gave the same picture: most fixture cells land within ±1 ms of this run, and every conclusion holds in both. A few p95 cells moved more under load, up to 7.5 ms (`git task*` word-OR-prefix: 27.3 ms against 34.8 ms). Outliers that touch a conclusion are footnoted.
+- **Top tokens:** read through a temp `fts5vocab(main, observation_fts, 'row')` table on a copy of the database. The fixture's `# task-NNNN` comments put `task` in 93.3% of rows:
+
+  | # | Token | Chars | Rows | Share |
+  |---|---|---|---|---|
+  | 1 | `task` | 4 | 933,329 | 93.3% |
+  | 2 | `rs` | 2 | 231,514 | 23.2% |
+  | 3 | `src` | 3 | 230,588 | 23.1% |
+  | 4 | `log` | 3 | 155,681 | 15.6% |
+  | 5 | `toml` | 4 | 153,679 | 15.4% |
+  | 6 | `app` | 3 | 153,332 | 15.3% |
+  | 7 | `config` | 6 | 153,275 | 15.3% |
+  | 8 | `cargo` | 5 | 108,126 | 10.8% |
+  | 9 | `go` | 2 | 107,419 | 10.7% |
+  | 10 | `integration` | 11 | 77,413 | 7.7% |
+
+- **Keystrokes:** for each of the top 8 tokens, every prefix from 2 characters to the full token (`ta* tas* task*`, `co* con* conf* confi* config*`), the whole word, and the same behind `git` and `cargo`. Behind `git` the pair is a sparse AND, because `git` rows never carry `# task-N`. Behind `cargo` it is dense, because every `cargo` row does. The 22-query #10 set is added on top, giving 102 keystrokes, 98 of which the TUI sends under its 2-char gate.
+- **Schemas:** baseline, `prefix='2'`, `'2 3'`, `'2 3 4'` and `'1 2 3 4'`. The **taskid corpus** is the fixture with `# task-N` renamed `# taskid-N` and FTS rebuilt, built at baseline, `prefix='2'` and `prefix='2 3 4'`.
+
+### Size
+
+| Variant | DB MiB | Ratio to 53.3 MiB source | FTS MiB |
+|---|---|---|---|
+| baseline | 162.0 | 3.04x | 31.7 |
+| `prefix='2'` | 181.9 | 3.41x | 51.6 |
+| `prefix='2 3'` | 200.3 | 3.76x | 70.0 |
+| `prefix='2 3 4'` | 214.4 | 4.02x | 84.1 |
+| `prefix='1 2 3 4'` | 233.5 | 4.38x | 103.2 |
+
+Each indexed prefix length costs about 18–20 MiB (0.35x) on this corpus.
+
+### Dominant-token keystrokes (p95 ms, page 200)
+
+| Query | Postings under last token | baseline | `prefix='2'` | `prefix='2 3'` | `prefix='2 3 4'` | `prefix='1 2 3 4'` |
+|---|---|---|---|---|---|---|
+| `"ta"*` | 1,027,297 (4 terms) | 19.38 | **0.05** | 0.06 | 0.04 | 0.05 |
+| `"tas"*` | 933,329 | 12.52 | 12.51 | **0.05** | 0.06 | 0.04 |
+| `"task"*` | 933,329 | 13.10 | 12.52 | 12.57 | **0.06** | 0.05 |
+| `"task"` (word) | 933,329 | 0.04 | 0.06 | 0.04 | 0.05 | 0.05 |
+| `"git" "ta"*` | 1,027,297 | 20.27 | 0.82 | 0.83 | 0.81 | 0.83 |
+| `"git" "tas"*` | 933,329 | **20.95** | **20.83** | 6.84 | 6.76 | 6.84 |
+| `"git" "task"*` | 933,329 | 20.81 | 20.68 | **21.06** | 6.77 | 6.77 |
+| `"git" "task"` (word) | 933,329 | 6.77 | 6.68 | 6.97 | 6.82 | 6.79 |
+| `"cargo" "ta"*` | 1,027,297 | 19.48 | 0.09 | 0.11 | 0.09 | 0.10 |
+| `"cargo" "tas"*` | 933,329 | 12.51 | 12.40 | 0.10 | 0.11 | 0.09 |
+| `"cargo" "task"*` | 933,329 | 12.56 | 12.51 | 12.60 | 0.12 | 0.10 |
+| `"confi"*` | 153,275 | 2.03 | 2.03 | 2.04 | 2.11 | 2.01 |
+| `"c"*` (1-char, not sent) | 560,579 (14 terms) | 16.49 | 15.17 | 15.16 | 15.15 | 0.04 |
+
+- **Early exit on an indexed length is real.** `"ta"*` drops from 19.4 ms to 0.05 ms with `prefix='2'`, the same cost as a whole word. The next keystroke, `"tas"*`, goes straight back to 12.5 ms, because `prefix='2'` does not cover 3 characters. FTS5 picks a prefix index only when its length equals the token's length exactly.
+- **The sparse-AND floor.** `"git" "task"` returns 0 rows and costs 6.8 ms on every schema. No index changes it. When the prefix is unindexed it adds to the merge (≈ 12.5 + 6.8 ≈ 21 ms).
+
+### A 5+ character dominant token (taskid corpus, p95 ms)
+
+| Query | taskid baseline | taskid `prefix='2'` | taskid `prefix='2 3 4'` |
+|---|---|---|---|
+| `"task"*` | 12.66 | 12.53 | 0.06 |
+| `"taski"*` | 12.55 | 12.47 | **13.25** |
+| `"taskid"*` | 12.80 | 12.43 | **12.74** |
+| `"git" "taski"*` | 21.57 | 27.05¹ | **21.23** |
+| `"git" "taskid"*` | 21.29 | 20.85 | **21.21** |
+| `"taskid"` (word) | 0.05 | 0.06 | 0.05 |
+
+¹ An outlier under load. The neighbouring `git taskid*` cell measures 20.85 ms.
+
+When only lengths up to 4 are indexed, a 5- or 6-character prefix of a dominant token pays the full merge, exactly as on the baseline schema. `prefix='2 3 4'` therefore does not bound cost in general. It bounds cost only for tokens of 4 characters or fewer.
+
+### Cost model fit (baseline, single-token prefix, p50)
+
+| Query | Terms | Postings | p50 ms | ns per posting |
+|---|---|---|---|---|
+| `"12"*` | 111 | 10,314 | 0.48 | 46 |
+| `"1"*` | 1,111 | 103,587 | 6.34 | 61 |
+| `"carg"*` | 1 | 108,126 | 1.43 | 13 |
+| `"config"*` | 1 | 153,275 | 2.01 | 13 |
+| `"rs"*` | 1 | 231,514 | 3.04 | 13 |
+| `"task"*` | 1 | 933,329 | 12.33 | 13 |
+| `"ta"*` | 4 | 1,027,297 | 19.22 | 19 |
+| `"c"*` | 14 | 560,579 | 17.03 | 30 |
+| `"t"*` | 8 | 1,412,133 | 35.98 | 25 |
+
+A single large term costs a steady **13 ns per posting**. Merging several large terms costs more per posting (19–30 ns). Many small terms add about 5–6 µs per term (`1*`). The bench prints the full table, with every hot prefix.
+
+### Query rewrites on the baseline schema
+
+p95 ms. "Rows" means the result is identical to the plain prefix query.
+
+| Query | Terms | Plain | Whole word only (rows kept) | Word OR prefix | Exact-first + rowid bound | vocab scan + OR | OR of terms (list in memory) |
+|---|---|---|---|---|---|---|---|
+| `"ta"*` | 4 | 19.76 | 0.01 (0 of 201) | 19.88 | 19.72 | 11.32 | **0.09** |
+| `"tas"*` | 1 | 12.55 | 0.01 (0 of 201) | 12.63 | 12.52 | 9.46 | **0.04** |
+| `"task"*` | 1 | 12.59 | 0.04 (201 of 201) | 12.61 | 12.54 | 9.43 | **0.04** |
+| `"git" "tas"*` | 1 | 20.83 | 0.02 (0 of 0) | 20.96 | 20.73 | 16.26 | **6.82** |
+| `"git" "task"*` | 1 | 20.82 | 6.85 (0 of 0) | 34.79 | 27.49 | 16.25 | **7.22** |
+| `"cargo" "ta"*` | 4 | 19.76 | 0.02 (0 of 201) | 19.84 | 19.79 | 11.00 | **0.13** |
+| `"t"*` | 8 | 37.15 | 0.01 (0 of 201) | 36.97 | 35.61 | 15.25 | **0.18** |
+| `"1"*` | 1,111 | 6.38 | 0.02 (0 of 201) | 6.42 | 6.41 | 8.04 | 6.49 |
+| `"12"*` | 111 | 0.50 | 0.01 (3 of 201) | 0.49 | 0.53 | 0.75 | 0.61 |
+
+Every rewrite except "whole word only" returned exactly the plain prefix rows for every probe (62 probes in the appendix). Whole word only changes results.
+
+### Hybrid configurations (all sent keystrokes, p95 ms)
+
+| Schema | OR rewrite applied to `*` tokens of | Fixture worst | Taskid worst | Most terms in one OR | Rows differ |
+|---|---|---|---|---|---|
+| baseline | ≥ 2 chars | 7.21 (`git tas*`) | 12.84¹ (next 6.64) | 6 | 0 |
+| `prefix='2'` | ≥ 3 chars | **6.69** (`git task`) | **6.55** (`git tas*`) | 2 | 0 |
+
+¹ An outlier under load. `git tas*` measures 6.8 ms through the same OR on the fixture.
+
+The full term list (10,098 terms) loads through fts5vocab in 86 ms p50 at 1M.
+
 ## What this implies for the #8 gates
 
-- **FTS query over 1M, warm p95 `<20 ms`:** **met** for the interactive path with option A or B, at every measured keystroke. The worst case is 7.5 ms, 2.7x headroom before channel and render. **Not met** by any schema if results are BM25-ranked over all matches. #11 must pick: (1) recency order for interactive and default search, with rank as an opt-in mode that is either bounded by a window or allowed to be slow; or (2) keep rank and relax the gate to "p95 `<20 ms` for single whole-word or long-prefix queries under about 35k matches". Even that narrower gate excludes ordinary keystrokes: multi-token queries ending in a 1–2 char prefix miss it at 1–2% selectivity (`git c*` 47 ms, `cargo re*` 30 ms), so option (2) cannot serve search-as-you-type. Option (1) is recommended. Shell history search (Ctrl-R, fzf, atuin) is recency-first anyway, and BM25 over 40-byte commands says little about relevance.
-- **DB size `<2x` source:** **not met by any FTS variant, and not because of FTS.** The cheapest measured schema, `detail=none`, which breaks path search, is 2.78x. The base table plus its indexes is 2.44x before any FTS index. Even with no FTS and no secondary indexes, `observation` alone is 1.64x. Levers outside this slice: drop the redundant `observation_revision` index (−0.23x, to about 2.81x); shrink per-row hashes and locators (24 of the roughly 92 bytes per row); question whether `observation_time` (0.34x) is needed. #11 should renegotiate the gate to about **3x** for full-detail FTS. If option B is chosen, it should budget `prefix='1'` at +0.36x on top. A denominator note: #8 measured against raw history-file bytes, including zsh's `: ts:dur;` prefix. Against the sanitized text alone (39.2 MB), every ratio is about 1.4x higher.
+- **FTS query over 1M, warm p95 `<20 ms`:** ~~**met** for the interactive path with option A or B, at every measured keystroke. The worst case is 7.5 ms, 2.7x headroom before channel and render.~~ **Superseded: not met by option A or B** once prefixes of high-frequency tokens are measured (21 ms, `git tas*`). It is met with 3x headroom by `prefix='2'` plus the OR-of-terms rewrite (6.7 ms), or by `prefix='2 3 4'` on this fixture only (6.8 ms); see [Decision](#decision). **Not met** by any schema if results are BM25-ranked over all matches. #11 must pick: (1) recency order for interactive and default search, with rank as an opt-in mode that is either bounded by a window or allowed to be slow; or (2) keep rank and relax the gate to "p95 `<20 ms` for single whole-word or long-prefix queries under about 35k matches". Even that narrower gate excludes ordinary keystrokes: multi-token queries ending in a 1–2 char prefix miss it at 1–2% selectivity (`git c*` 47 ms, `cargo re*` 30 ms), so option (2) cannot serve search-as-you-type. Option (1) is recommended. Shell history search (Ctrl-R, fzf, atuin) is recency-first anyway, and BM25 over 40-byte commands says little about relevance.
+- **DB size `<2x` source:** **not met by any FTS variant, and not because of FTS.** The cheapest measured schema, `detail=none`, which breaks path search, is 2.78x. The base table plus its indexes is 2.44x before any FTS index. Even with no FTS and no secondary indexes, `observation` alone is 1.64x. Levers outside this slice: drop the redundant `observation_revision` index (−0.23x, to about 2.81x); shrink per-row hashes and locators (24 of the roughly 92 bytes per row); question whether `observation_time` (0.34x) is needed. #11 should renegotiate the gate to about **3x** for full-detail FTS. If option B is chosen, it should budget `prefix='1'` at +0.36x on top. **Superseded:** the revised recommendation budgets `prefix='2'` at +0.37x (3.41x) instead, or `prefix='2 3 4'` at +0.98x (4.02x) if no term list is kept. A denominator note: #8 measured against raw history-file bytes, including zsh's `: ts:dur;` prefix. Against the sanitized text alone (39.2 MB), every ratio is about 1.4x higher.
 
 ## Open questions for #11
 
@@ -127,7 +314,11 @@ All per-query p50 / p95 / max values for both pages are in the appendix. This ta
 5. **Real data.** The fixture has about 35 distinct leading tokens and one command per second. Real histories have longer tails (more distinct terms per prefix, so slower prefix merges without a prefix index) and sparser timestamps. Re-measure options A and B on an anonymized real 1M history before locking.
 6. **Cold cache.** Everything here is warm OS cache. The #8 cold gate (`<100 ms` p95) was not re-measured for these variants.
 
-## Appendix: raw output
+7. **Sparse-AND budget.** Two tokens that never share a row cannot stop early. The cost scales with the rarer one's postings (`git task`: 6.8 ms over 33k `git` rows), and no prefix scheme changes it. Decide whether to time-box queries through the progress handler.
+8. **Term-list freshness.** The OR-of-terms rewrite is exact only while the in-memory term list matches the index. Decide the reload trigger (`PRAGMA data_version`) and confirm that the plain prefix fallback during a reload is acceptable.
+9. **Real term distribution.** Measure, on a real history, how many terms 3+ char prefixes expand to (per-term cost is about 6 µs) and how large the top tokens' doclists are (13 ns per posting unindexed). `interactive_fts --hot` prints both.
+
+## Appendix A: raw output of the original #10 run
 
 <details>
 <summary>Full output of <code>interactive_fts target/fixtures/1m.db target/fts-variants 50</code></summary>
@@ -705,5 +896,335 @@ recency window (V5): rowid > 900000 = newest 100000 rows, 27.8 h of fixture time
 
 
 load after: { 2.96 3.26 3.43 }
+
+</details>
+
+## Appendix B: raw output of the hot-token run
+
+<details>
+<summary>Full output of <code>interactive_fts target/fixtures/1m.db target/fts-variants 50 --hot</code></summary>
+
+=== interactive FTS measurements (--hot) ===
+host: Mac16,5 | Apple M4 Max | 16 | 137438953472
+os: 27.0.1
+load before: { 7.28 8.01 7.00 }
+sqlite (bundled): 3.49.1
+timed runs per cell: 50 (+1 discarded warm-up); cells are p50 / p95 / max ms
+records: 1000000, source history: 55906677 bytes (53.3 MiB), unvacuumed fixture db: 177213440 bytes
+
+
+# Hot-token prefixes: rowid DESC, page 200 (limit 201), p95 ms
+
+## Size per hot-study schema (after rebuild + VACUUM)
+
+| variant | corpus | DB MiB | ratio to source | fts MiB |
+|---|---|---|---|---|
+| baseline | fixture | 162.0 | 3.04x | 31.7 |
+| prefix='2' | fixture | 181.9 | 3.41x | 51.6 |
+| prefix='2 3' | fixture | 200.3 | 3.76x | 70.0 |
+| prefix='2 3 4' | fixture | 214.4 | 4.02x | 84.1 |
+| prefix='1 2 3 4' | fixture | 233.5 | 4.38x | 103.2 |
+| taskid baseline | taskid | 163.8 | 3.07x | 31.7 |
+| taskid prefix='2' | taskid | 183.7 | 3.45x | 51.6 |
+| taskid prefix='2 3 4' | taskid | 216.2 | 4.06x | 84.1 |
+
+## fixture
+
+Full term list through fts5vocab (what an in-memory term cache would load): 10098 terms, 85.53 / 87.67 / 87.67 ms (p50 / p95 / max, 10 runs)
+
+### Top 10 tokens by document frequency (fts5vocab 'row', 10098 distinct terms)
+
+| # | token | chars | rows containing it | share of rows |
+|---|---|---|---|---|
+| 1 | `task` | 4 | 933329 | 93.3% |
+| 2 | `rs` | 2 | 231514 | 23.2% |
+| 3 | `src` | 3 | 230588 | 23.1% |
+| 4 | `log` | 3 | 155681 | 15.6% |
+| 5 | `toml` | 4 | 153679 | 15.4% |
+| 6 | `app` | 3 | 153332 | 15.3% |
+| 7 | `config` | 6 | 153275 | 15.3% |
+| 8 | `cargo` | 5 | 108126 | 10.8% |
+| 9 | `go` | 2 | 107419 | 10.7% |
+| 10 | `integration` | 11 | 77413 | 7.7% |
+
+### Every keystroke (p95 ms; `!` marks rows that differ from baseline)
+
+| query | class | `*` chars | terms under last token | postings under last token | matches | baseline | prefix='2' | prefix='2 3' | prefix='2 3 4' | prefix='1 2 3 4' |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `"g"*` | 1-char | 1 | 4 | 207359 | 199756 | 5.02 | 5.06 | 5.10 | 5.07 | 0.05 |
+| `"c"*` | 1-char | 1 | 14 | 560579 | 475508 | 16.49 | 15.17 | 15.16 | 15.15 | 0.04 |
+| `"d"*` | 1-char | 1 | 5 | 247227 | 231251 | 6.10 | 5.91 | 5.97 | 5.97 | 0.03 |
+| `"gi"*` | 2-char | 2 | 1 | 33236 | 33236 | 0.47 | 0.06 | 0.03 | 0.03 | 0.05 |
+| `"ca"*` | 2-char | 2 | 3 | 199590 | 188532 | 4.75 | 0.06 | 0.04 | 0.05 | 0.04 |
+| `"do"*` | 2-char | 2 | 2 | 110189 | 107715 | 2.27 | 0.06 | 0.05 | 0.04 | 0.04 |
+| `"ku"*` | 2-char | 2 | 1 | 33417 | 33417 | 0.48 | 0.06 | 0.04 | 0.03 | 0.04 |
+| `"git"*` | 3-char | 3 | 1 | 33236 | 33236 | 0.47 | 0.47 | 0.05 | 0.04 | 0.04 |
+| `"car"*` | 3-char | 3 | 1 | 108126 | 108126 | 1.45 | 1.46 | 0.05 | 0.04 | 0.05 |
+| `"doc"*` | 3-char | 3 | 2 | 110189 | 107715 | 2.24 | 2.27 | 0.05 | 0.04 | 0.05 |
+| `"cargo"*` | word* | 5 | 1 | 108126 | 108126 | 1.47 | 1.49 | 1.46 | 1.46 | 1.47 |
+| `"docker"*` | word* | 6 | 1 | 33352 | 33352 | 0.47 | 0.50 | 0.47 | 0.47 | 0.47 |
+| `"git"` | word | word | 1 | 33236 | 33236 | 0.03 | 0.04 | 0.05 | 0.03 | 0.04 |
+| `"cargo"` | word | word | 1 | 108126 | 108126 | 0.02 | 0.03 | 0.04 | 0.04 | 0.04 |
+| `"docker"` | word | word | 1 | 33352 | 33352 | 0.03 | 0.06 | 0.04 | 0.04 | 0.04 |
+| `"git" "c"*` | two-word | 1 | 14 | 560579 | 13272 | 16.83 | 15.50 | 15.31 | 15.26 | 0.14 |
+| `"git" "co"*` | two-word | 2 | 3 | 188483 | 6622 | 3.78 | 0.17 | 0.15 | 0.15 | 0.15 |
+| `"git" "com"*` | two-word | 3 | 1 | 1842 | 1842 | 0.12 | 0.12 | 0.10 | 0.10 | 0.10 |
+| `"cargo" "bu"*` | two-word | 2 | 0 | 0 | 0 | 0.02 | 0.03 | 0.04 | 0.04 | 0.04 |
+| `"cargo" "re"*` | two-word | 2 | 6 | 274105 | 17736 | 6.90 | 0.16 | 0.15 | 0.14 | 0.15 |
+| `"cargo" "com"*` | sparse AND | 3 | 1 | 1842 | 148 | 0.78 | 0.79 | 0.83 | 0.77 | 0.80 |
+| `"docker" "git"*` | sparse AND | 3 | 1 | 33236 | 0 | 1.56 | 1.55 | 1.19 | 1.19 | 1.21 |
+| `"ta"*` | hot prefix | 2 | 4 | 1027297 | 935172 | 19.38 | 0.05 | 0.06 | 0.04 | 0.05 |
+| `"tas"*` | hot prefix | 3 | 1 | 933329 | 933329 | 12.52 | 12.51 | 0.05 | 0.06 | 0.04 |
+| `"task"*` | hot prefix | 4 | 1 | 933329 | 933329 | 13.10 | 12.52 | 12.57 | 0.06 | 0.05 |
+| `"task"` | hot word | word | 1 | 933329 | 933329 | 0.04 | 0.06 | 0.04 | 0.04 | 0.05 |
+| `"git" "ta"*` | lead + hot prefix | 2 | 4 | 1027297 | 1843 | 20.27 | 0.82 | 0.83 | 0.81 | 0.83 |
+| `"git" "tas"*` | lead + hot prefix | 3 | 1 | 933329 | 0 | 20.95 | 20.83 | 6.84 | 6.76 | 6.84 |
+| `"git" "task"*` | lead + hot prefix | 4 | 1 | 933329 | 0 | 20.81 | 20.68 | 21.06 | 6.77 | 6.77 |
+| `"git" "task"` | lead + hot word | word | 1 | 933329 | 0 | 6.77 | 6.68 | 6.97 | 6.82 | 6.79 |
+| `"cargo" "ta"*` | lead + hot prefix | 2 | 4 | 1027297 | 103166 | 19.48 | 0.09 | 0.11 | 0.09 | 0.10 |
+| `"cargo" "tas"*` | lead + hot prefix | 3 | 1 | 933329 | 103046 | 12.51 | 12.40 | 0.10 | 0.11 | 0.09 |
+| `"cargo" "task"*` | lead + hot prefix | 4 | 1 | 933329 | 103046 | 12.56 | 12.51 | 12.60 | 0.12 | 0.10 |
+| `"cargo" "task"` | lead + hot word | word | 1 | 933329 | 103046 | 0.07 | 0.10 | 0.09 | 0.09 | 0.10 |
+| `"rs"*` | hot prefix | 2 | 1 | 231514 | 231514 | 3.14 | 0.07 | 0.04 | 0.04 | 0.04 |
+| `"rs"` | hot word | word | 1 | 231514 | 231514 | 0.03 | 0.05 | 0.05 | 0.04 | 0.05 |
+| `"git" "rs"*` | lead + hot prefix | 2 | 1 | 231514 | 7741 | 3.16 | 0.20 | 0.17 | 0.13 | 0.16 |
+| `"git" "rs"` | lead + hot word | word | 1 | 231514 | 7741 | 0.12 | 0.17 | 0.16 | 0.14 | 0.16 |
+| `"cargo" "rs"*` | lead + hot prefix | 2 | 1 | 231514 | 7750 | 3.17 | 0.23 | 0.21 | 0.19 | 0.20 |
+| `"cargo" "rs"` | lead + hot word | word | 1 | 231514 | 7750 | 0.17 | 0.21 | 0.20 | 0.20 | 0.21 |
+| `"sr"*` | hot prefix | 2 | 1 | 230588 | 230588 | 3.03 | 0.06 | 0.05 | 0.04 | 0.05 |
+| `"src"*` | hot prefix | 3 | 1 | 230588 | 230588 | 3.04 | 3.23 | 0.06 | 0.04 | 0.05 |
+| `"src"` | hot word | word | 1 | 230588 | 230588 | 0.03 | 0.06 | 0.04 | 0.04 | 0.03 |
+| `"git" "sr"*` | lead + hot prefix | 2 | 1 | 230588 | 7600 | 3.16 | 0.18 | 0.17 | 0.14 | 0.15 |
+| `"git" "src"*` | lead + hot prefix | 3 | 1 | 230588 | 7600 | 3.09 | 3.16 | 0.18 | 0.14 | 0.17 |
+| `"git" "src"` | lead + hot word | word | 1 | 230588 | 7600 | 0.11 | 0.17 | 0.14 | 0.14 | 0.16 |
+| `"cargo" "sr"*` | lead + hot prefix | 2 | 1 | 230588 | 7711 | 3.17 | 0.22 | 0.22 | 0.20 | 0.21 |
+| `"cargo" "src"*` | lead + hot prefix | 3 | 1 | 230588 | 7711 | 3.14 | 3.17 | 0.22 | 0.20 | 0.21 |
+| `"cargo" "src"` | lead + hot word | word | 1 | 230588 | 7711 | 0.17 | 0.22 | 0.19 | 0.20 | 0.20 |
+| `"lo"*` | hot prefix | 2 | 1 | 155681 | 155681 | 2.60 | 0.06 | 0.05 | 0.04 | 0.04 |
+| `"log"*` | hot prefix | 3 | 1 | 155681 | 155681 | 2.61 | 2.62 | 0.04 | 0.04 | 0.05 |
+| `"log"` | hot word | word | 1 | 155681 | 155681 | 0.03 | 0.04 | 0.04 | 0.04 | 0.05 |
+| `"git" "lo"*` | lead + hot prefix | 2 | 1 | 155681 | 6761 | 2.70 | 0.17 | 0.16 | 0.13 | 0.14 |
+| `"git" "log"*` | lead + hot prefix | 3 | 1 | 155681 | 6761 | 2.77 | 2.73 | 0.16 | 0.13 | 0.15 |
+| `"git" "log"` | lead + hot word | word | 1 | 155681 | 6761 | 0.11 | 0.13 | 0.15 | 0.13 | 0.14 |
+| `"cargo" "lo"*` | lead + hot prefix | 2 | 1 | 155681 | 5368 | 2.78 | 0.25 | 0.24 | 0.22 | 0.23 |
+| `"cargo" "log"*` | lead + hot prefix | 3 | 1 | 155681 | 5368 | 2.77 | 2.79 | 0.25 | 0.23 | 0.24 |
+| `"cargo" "log"` | lead + hot word | word | 1 | 155681 | 5368 | 0.21 | 0.22 | 0.25 | 0.22 | 0.24 |
+| `"to"*` | hot prefix | 2 | 1 | 153679 | 153679 | 2.14 | 0.05 | 0.05 | 0.04 | 0.04 |
+| `"tom"*` | hot prefix | 3 | 1 | 153679 | 153679 | 2.06 | 2.06 | 0.06 | 0.05 | 0.04 |
+| `"toml"*` | hot prefix | 4 | 1 | 153679 | 153679 | 2.05 | 2.05 | 2.06 | 0.05 | 0.05 |
+| `"toml"` | hot word | word | 1 | 153679 | 153679 | 0.03 | 0.06 | 0.04 | 0.04 | 0.05 |
+| `"git" "to"*` | lead + hot prefix | 2 | 1 | 153679 | 5121 | 2.14 | 0.19 | 0.17 | 0.15 | 0.16 |
+| `"git" "tom"*` | lead + hot prefix | 3 | 1 | 153679 | 5121 | 2.16 | 2.15 | 0.18 | 0.15 | 0.16 |
+| `"git" "toml"*` | lead + hot prefix | 4 | 1 | 153679 | 5121 | 2.16 | 2.16 | 2.14 | 0.17 | 0.16 |
+| `"git" "toml"` | lead + hot word | word | 1 | 153679 | 5121 | 0.14 | 0.18 | 0.17 | 0.15 | 0.17 |
+| `"cargo" "to"*` | lead + hot prefix | 2 | 1 | 153679 | 79780 | 2.09 | 0.10 | 0.09 | 0.08 | 0.08 |
+| `"cargo" "tom"*` | lead + hot prefix | 3 | 1 | 153679 | 79780 | 2.08 | 2.09 | 0.10 | 0.09 | 0.08 |
+| `"cargo" "toml"*` | lead + hot prefix | 4 | 1 | 153679 | 79780 | 2.07 | 2.06 | 2.08 | 0.09 | 0.08 |
+| `"cargo" "toml"` | lead + hot word | word | 1 | 153679 | 79780 | 0.06 | 0.08 | 0.08 | 0.08 | 0.08 |
+| `"ap"*` | hot prefix | 2 | 2 | 230097 | 230097 | 4.74 | 0.05 | 0.04 | 0.04 | 0.06 |
+| `"app"*` | hot prefix | 3 | 1 | 153332 | 153332 | 2.03 | 2.06 | 0.05 | 0.03 | 0.04 |
+| `"app"` | hot word | word | 1 | 153332 | 153332 | 0.04 | 0.04 | 0.04 | 0.04 | 0.04 |
+| `"git" "ap"*` | lead + hot prefix | 2 | 2 | 230097 | 7708 | 4.73 | 0.17 | 0.14 | 0.13 | 0.16 |
+| `"git" "app"*` | lead + hot prefix | 3 | 1 | 153332 | 5067 | 2.13 | 2.13 | 0.17 | 0.15 | 0.16 |
+| `"git" "app"` | lead + hot word | word | 1 | 153332 | 5067 | 0.13 | 0.15 | 0.17 | 0.15 | 0.17 |
+| `"cargo" "ap"*` | lead + hot prefix | 2 | 2 | 230097 | 7769 | 4.86 | 0.21 | 0.20 | 0.20 | 0.22 |
+| `"cargo" "app"*` | lead + hot prefix | 3 | 1 | 153332 | 5147 | 2.19 | 2.23 | 0.25 | 0.22 | 0.23 |
+| `"cargo" "app"` | lead + hot word | word | 1 | 153332 | 5147 | 0.21 | 0.22 | 0.23 | 0.23 | 0.24 |
+| `"co"*` | hot prefix | 2 | 3 | 188483 | 183019 | 3.68 | 0.06 | 0.04 | 0.04 | 0.04 |
+| `"con"*` | hot prefix | 3 | 1 | 153275 | 153275 | 2.09 | 2.03 | 0.04 | 0.03 | 0.04 |
+| `"conf"*` | hot prefix | 4 | 1 | 153275 | 153275 | 2.03 | 2.03 | 2.04 | 0.04 | 0.04 |
+| `"confi"*` | hot prefix | 5 | 1 | 153275 | 153275 | 2.03 | 2.03 | 2.04 | 2.11 | 2.01 |
+| `"config"*` | hot prefix | 6 | 1 | 153275 | 153275 | 2.03 | 2.02 | 2.06 | 2.03 | 2.03 |
+| `"config"` | hot word | word | 1 | 153275 | 153275 | 0.03 | 0.04 | 0.05 | 0.04 | 0.05 |
+| `"git" "con"*` | lead + hot prefix | 3 | 1 | 153275 | 5049 | 2.11 | 2.13 | 0.17 | 0.15 | 0.16 |
+| `"git" "conf"*` | lead + hot prefix | 4 | 1 | 153275 | 5049 | 2.13 | 2.15 | 2.14 | 0.15 | 0.16 |
+| `"git" "confi"*` | lead + hot prefix | 5 | 1 | 153275 | 5049 | 2.15 | 2.15 | 2.15 | 2.10 | 2.15 |
+| `"git" "config"*` | lead + hot prefix | 6 | 1 | 153275 | 5049 | 2.14 | 2.14 | 2.24 | 2.09 | 2.13 |
+| `"git" "config"` | lead + hot word | word | 1 | 153275 | 5049 | 0.12 | 0.14 | 0.18 | 0.14 | 0.17 |
+| `"cargo" "co"*` | lead + hot prefix | 2 | 3 | 188483 | 7750 | 3.81 | 0.21 | 0.19 | 0.19 | 0.19 |
+| `"cargo" "con"*` | lead + hot prefix | 3 | 1 | 153275 | 5049 | 2.23 | 2.19 | 0.24 | 0.22 | 0.23 |
+| `"cargo" "conf"*` | lead + hot prefix | 4 | 1 | 153275 | 5049 | 2.25 | 2.19 | 2.18 | 0.23 | 0.23 |
+| `"cargo" "confi"*` | lead + hot prefix | 5 | 1 | 153275 | 5049 | 2.19 | 2.20 | 2.21 | 2.23 | 2.20 |
+| `"cargo" "config"*` | lead + hot prefix | 6 | 1 | 153275 | 5049 | 2.27 | 2.19 | 2.21 | 2.21 | 2.17 |
+| `"cargo" "config"` | lead + hot word | word | 1 | 153275 | 5049 | 0.21 | 0.21 | 0.24 | 0.23 | 0.25 |
+| `"carg"*` | hot prefix | 4 | 1 | 108126 | 108126 | 1.46 | 1.46 | 1.46 | 0.05 | 0.05 |
+| `"git" "ca"*` | lead + hot prefix | 2 | 3 | 199590 | 2585 | 4.96 | 0.29 | 0.24 | 0.27 | 0.29 |
+| `"git" "car"*` | lead + hot prefix | 3 | 1 | 108126 | 2585 | 1.61 | 1.68 | 0.23 | 0.20 | 0.23 |
+| `"git" "carg"*` | lead + hot prefix | 4 | 1 | 108126 | 2585 | 1.63 | 1.64 | 1.63 | 0.21 | 0.22 |
+| `"git" "cargo"*` | lead + hot prefix | 5 | 1 | 108126 | 2585 | 1.60 | 1.64 | 1.63 | 1.62 | 1.60 |
+| `"git" "cargo"` | lead + hot word | word | 1 | 108126 | 2585 | 0.19 | 0.22 | 0.22 | 0.20 | 0.22 |
+
+### Summary: worst keystroke per schema
+
+| variant | ratio to source | worst p95, keystrokes the TUI sends (last token >= 2 chars or whole) | that query | worst p95, 1-char included | sent keystrokes > 20 ms | sent keystrokes > 10 ms | rows differ |
+|---|---|---|---|---|---|---|---|
+| baseline | 3.04x | 20.95 | `"git" "tas"*` | 20.95 | 3 of 98 | 9 | 0 |
+| prefix='2' | 3.41x | 20.83 | `"git" "tas"*` | 20.83 | 2 of 98 | 6 | 0 |
+| prefix='2 3' | 3.76x | 21.06 | `"git" "task"*` | 21.06 | 1 of 98 | 3 | 0 |
+| prefix='2 3 4' | 4.02x | 6.82 | `"git" "task"` | 15.26 | 0 of 98 | 0 | 0 |
+| prefix='1 2 3 4' | 4.38x | 6.84 | `"git" "tas"*` | 6.84 | 0 of 98 | 0 | 0 |
+
+### Hybrid: prefix index for short prefixes, OR of expanded terms above it (p95 ms)
+
+| schema | OR rewrite for `*` tokens of | worst p95, keystrokes the TUI sends | that query | 2nd worst | most terms in one OR | sent keystrokes > 20 ms | rows differ from plain |
+|---|---|---|---|---|---|---|---|
+| baseline | >= 2 chars | 7.21 | `"git" "tas"*` | 6.83 (`"git" "task"*`) | 6 | 0 | 0 |
+| prefix='2' | >= 3 chars | 6.69 | `"git" "task"` | 6.69 (`"git" "tas"*`) | 2 | 0 | 0 |
+
+### Query rewrites on the baseline schema (p95 ms)
+
+Columns: plain prefix (what Store sends); whole word only (changes results); word OR prefix; exact-first (whole-word page bounds a `rowid >=` range on the prefix query; same rows); per-keystroke fts5vocab term scan; OR of the expanded whole terms given a term list; scan + OR together (same rows).
+
+| query | terms | postings | plain | whole word only | rows kept | word OR prefix | exact-first | rows same | vocab scan | OR of terms | scan + OR | rows same |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `"ta"*` | 4 | 1027297 | 19.76 | 0.01 | 0 of 201 | 19.88 | 19.72 | yes | 11.09 | 0.09 | 11.32 | yes |
+| `"tas"*` | 1 | 933329 | 12.55 | 0.01 | 0 of 201 | 12.63 | 12.52 | yes | 9.43 | 0.04 | 9.46 | yes |
+| `"task"*` | 1 | 933329 | 12.59 | 0.04 | 201 of 201 | 12.61 | 12.54 | yes | 9.41 | 0.04 | 9.43 | yes |
+| `"git" "ta"*` | 4 | 1027297 | 20.38 | 0.03 | 0 of 201 | 20.53 | 20.47 | yes | 11.51 | 1.05 | 11.53 | yes |
+| `"git" "tas"*` | 1 | 933329 | 20.83 | 0.02 | 0 of 0 | 20.96 | 20.73 | yes | 9.38 | 6.82 | 16.26 | yes |
+| `"git" "task"*` | 1 | 933329 | 20.82 | 6.85 | 0 of 0 | 34.79 | 27.49 | yes | 9.44 | 7.22 | 16.25 | yes |
+| `"cargo" "ta"*` | 4 | 1027297 | 19.76 | 0.02 | 0 of 201 | 19.84 | 19.79 | yes | 11.36 | 0.13 | 11.00 | yes |
+| `"cargo" "tas"*` | 1 | 933329 | 12.80 | 0.02 | 0 of 201 | 12.70 | 12.51 | yes | 9.37 | 0.07 | 9.50 | yes |
+| `"cargo" "task"*` | 1 | 933329 | 12.56 | 0.07 | 201 of 201 | 12.62 | 12.40 | yes | 9.38 | 0.07 | 9.45 | yes |
+| `"rs"*` | 1 | 231514 | 3.03 | 0.03 | 201 of 201 | 3.06 | 3.05 | yes | 2.40 | 0.03 | 2.54 | yes |
+| `"git" "rs"*` | 1 | 231514 | 3.16 | 0.12 | 201 of 201 | 3.22 | 3.26 | yes | 2.42 | 0.12 | 2.62 | yes |
+| `"cargo" "rs"*` | 1 | 231514 | 3.16 | 0.18 | 201 of 201 | 3.28 | 3.39 | yes | 2.52 | 0.18 | 2.63 | yes |
+| `"sr"*` | 1 | 230588 | 3.03 | 0.01 | 0 of 201 | 3.01 | 3.01 | yes | 2.57 | 0.03 | 2.59 | yes |
+| `"src"*` | 1 | 230588 | 3.03 | 0.03 | 201 of 201 | 3.05 | 3.05 | yes | 2.50 | 0.03 | 2.54 | yes |
+| `"git" "sr"*` | 1 | 230588 | 3.40 | 0.02 | 0 of 201 | 3.13 | 3.12 | yes | 2.45 | 0.11 | 2.68 | yes |
+| `"git" "src"*` | 1 | 230588 | 3.11 | 0.11 | 201 of 201 | 3.17 | 3.22 | yes | 2.56 | 0.11 | 2.61 | yes |
+| `"cargo" "sr"*` | 1 | 230588 | 3.18 | 0.02 | 0 of 201 | 3.16 | 3.17 | yes | 2.56 | 0.18 | 2.73 | yes |
+| `"cargo" "src"*` | 1 | 230588 | 3.16 | 0.17 | 201 of 201 | 3.24 | 3.30 | yes | 2.55 | 0.18 | 2.73 | yes |
+| `"lo"*` | 1 | 155681 | 2.64 | 0.01 | 0 of 201 | 2.62 | 2.61 | yes | 1.73 | 0.03 | 1.77 | yes |
+| `"log"*` | 1 | 155681 | 2.64 | 0.03 | 201 of 201 | 2.66 | 2.66 | yes | 1.74 | 0.03 | 1.85 | yes |
+| `"git" "lo"*` | 1 | 155681 | 2.71 | 0.02 | 0 of 201 | 2.72 | 2.73 | yes | 1.66 | 0.11 | 1.78 | yes |
+| `"git" "log"*` | 1 | 155681 | 2.71 | 0.11 | 201 of 201 | 2.78 | 2.81 | yes | 1.72 | 0.11 | 1.83 | yes |
+| `"cargo" "lo"*` | 1 | 155681 | 2.79 | 0.02 | 0 of 201 | 2.79 | 2.80 | yes | 1.70 | 0.21 | 1.91 | yes |
+| `"cargo" "log"*` | 1 | 155681 | 2.82 | 0.21 | 201 of 201 | 2.91 | 3.01 | yes | 1.66 | 0.21 | 1.87 | yes |
+| `"to"*` | 1 | 153679 | 2.02 | 0.01 | 0 of 201 | 2.03 | 2.01 | yes | 1.53 | 0.03 | 1.62 | yes |
+| `"tom"*` | 1 | 153679 | 2.04 | 0.01 | 0 of 201 | 2.05 | 2.12 | yes | 1.52 | 0.03 | 1.56 | yes |
+| `"toml"*` | 1 | 153679 | 2.03 | 0.03 | 201 of 201 | 2.05 | 2.05 | yes | 1.55 | 0.03 | 1.51 | yes |
+| `"git" "to"*` | 1 | 153679 | 2.14 | 0.02 | 0 of 201 | 2.14 | 2.20 | yes | 1.54 | 0.14 | 1.66 | yes |
+| `"git" "tom"*` | 1 | 153679 | 2.14 | 0.02 | 0 of 201 | 2.14 | 2.08 | yes | 1.55 | 0.15 | 1.70 | yes |
+| `"git" "toml"*` | 1 | 153679 | 2.14 | 0.15 | 201 of 201 | 2.24 | 2.23 | yes | 1.55 | 0.14 | 1.66 | yes |
+| `"cargo" "to"*` | 1 | 153679 | 2.05 | 0.02 | 0 of 201 | 2.06 | 2.03 | yes | 1.52 | 0.05 | 1.61 | yes |
+| `"cargo" "tom"*` | 1 | 153679 | 2.04 | 0.02 | 0 of 201 | 2.07 | 2.06 | yes | 1.52 | 0.06 | 1.57 | yes |
+| `"cargo" "toml"*` | 1 | 153679 | 2.06 | 0.05 | 201 of 201 | 2.10 | 2.06 | yes | 1.53 | 0.06 | 1.57 | yes |
+| `"ap"*` | 2 | 230097 | 4.79 | 0.01 | 0 of 201 | 4.71 | 4.74 | yes | 2.72 | 0.05 | 2.61 | yes |
+| `"app"*` | 1 | 153332 | 2.00 | 0.03 | 201 of 201 | 2.10 | 2.05 | yes | 1.67 | 0.04 | 1.73 | yes |
+| `"git" "ap"*` | 2 | 230097 | 4.78 | 0.02 | 0 of 201 | 4.80 | 4.82 | yes | 2.55 | 0.16 | 2.71 | yes |
+| `"git" "app"*` | 1 | 153332 | 2.11 | 0.13 | 201 of 201 | 2.18 | 2.23 | yes | 1.67 | 0.13 | 1.90 | yes |
+| `"cargo" "ap"*` | 2 | 230097 | 4.93 | 0.02 | 0 of 201 | 4.86 | 4.85 | yes | 2.50 | 0.22 | 2.77 | yes |
+| `"cargo" "app"*` | 1 | 153332 | 2.19 | 0.22 | 201 of 201 | 2.31 | 2.41 | yes | 1.68 | 0.22 | 1.88 | yes |
+| `"co"*` | 3 | 188483 | 3.70 | 0.01 | 0 of 201 | 3.71 | 3.68 | yes | 2.11 | 0.07 | 2.21 | yes |
+| `"con"*` | 1 | 153275 | 2.00 | 0.01 | 0 of 201 | 2.01 | 2.01 | yes | 1.64 | 0.03 | 1.66 | yes |
+| `"conf"*` | 1 | 153275 | 2.00 | 0.01 | 0 of 201 | 2.02 | 2.01 | yes | 1.58 | 0.03 | 1.60 | yes |
+| `"confi"*` | 1 | 153275 | 2.02 | 0.01 | 0 of 201 | 2.04 | 2.06 | yes | 1.62 | 0.03 | 1.66 | yes |
+| `"config"*` | 1 | 153275 | 2.04 | 0.03 | 201 of 201 | 2.06 | 2.05 | yes | 1.56 | 0.03 | 1.61 | yes |
+| `"git" "con"*` | 1 | 153275 | 2.13 | 0.02 | 0 of 201 | 2.13 | 2.12 | yes | 1.63 | 0.12 | 1.68 | yes |
+| `"git" "conf"*` | 1 | 153275 | 2.13 | 0.02 | 0 of 201 | 2.14 | 2.11 | yes | 1.59 | 0.12 | 1.70 | yes |
+| `"git" "confi"*` | 1 | 153275 | 2.15 | 0.03 | 0 of 201 | 2.15 | 2.11 | yes | 1.63 | 0.12 | 1.76 | yes |
+| `"git" "config"*` | 1 | 153275 | 2.13 | 0.12 | 201 of 201 | 2.21 | 2.40 | yes | 1.69 | 0.13 | 1.75 | yes |
+| `"cargo" "co"*` | 3 | 188483 | 3.82 | 0.02 | 0 of 201 | 3.87 | 3.78 | yes | 2.13 | 0.22 | 2.35 | yes |
+| `"cargo" "con"*` | 1 | 153275 | 2.20 | 0.02 | 0 of 201 | 2.20 | 2.20 | yes | 1.56 | 0.21 | 1.84 | yes |
+| `"cargo" "conf"*` | 1 | 153275 | 2.18 | 0.02 | 0 of 201 | 2.20 | 2.20 | yes | 1.64 | 0.21 | 1.87 | yes |
+| `"cargo" "confi"*` | 1 | 153275 | 2.27 | 0.03 | 0 of 201 | 2.26 | 2.19 | yes | 1.60 | 0.20 | 1.83 | yes |
+| `"cargo" "config"*` | 1 | 153275 | 2.21 | 0.21 | 201 of 201 | 2.34 | 2.35 | yes | 1.56 | 0.21 | 2.00 | yes |
+| `"carg"*` | 1 | 108126 | 1.52 | 0.01 | 0 of 201 | 1.49 | 1.52 | yes | 1.13 | 0.03 | 1.13 | yes |
+| `"git" "ca"*` | 3 | 199590 | 4.96 | 0.03 | 0 of 201 | 10.93 | 4.97 | yes | 2.41 | 0.36 | 2.51 | yes |
+| `"git" "car"*` | 1 | 108126 | 1.66 | 0.03 | 0 of 201 | 1.67 | 1.62 | yes | 1.13 | 0.19 | 1.30 | yes |
+| `"git" "carg"*` | 1 | 108126 | 1.62 | 0.02 | 0 of 201 | 1.63 | 1.66 | yes | 1.14 | 0.19 | 1.34 | yes |
+| `"git" "cargo"*` | 1 | 108126 | 1.87 | 0.25 | 201 of 201 | 1.79 | 1.78 | yes | 1.10 | 0.19 | 1.30 | yes |
+| `"c"*` | 14 | 560579 | 17.44 | 0.01 | 0 of 201 | 17.50 | 17.19 | yes | 6.34 | 0.29 | 6.63 | yes |
+| `"t"*` | 8 | 1412133 | 37.15 | 0.01 | 0 of 201 | 36.97 | 35.61 | yes | 15.19 | 0.18 | 15.25 | yes |
+| `"1"*` | 1111 | 103587 | 6.38 | 0.02 | 0 of 201 | 6.42 | 6.41 | yes | 1.60 | 6.49 | 8.04 | yes |
+| `"12"*` | 111 | 10314 | 0.50 | 0.01 | 3 of 201 | 0.49 | 0.53 | yes | 0.16 | 0.61 | 0.75 | yes |
+
+### Cost model: single-token prefix on the baseline schema
+
+| query | terms | postings | p50 ms | p95 ms | ns per posting (p50) |
+|---|---|---|---|---|---|
+| `"12"*` | 111 | 10314 | 0.48 | 0.50 | 46.4 |
+| `"1"*` | 1111 | 103587 | 6.34 | 6.38 | 61.2 |
+| `"carg"*` | 1 | 108126 | 1.47 | 1.52 | 13.5 |
+| `"con"*` | 1 | 153275 | 1.96 | 2.00 | 12.8 |
+| `"conf"*` | 1 | 153275 | 1.97 | 2.00 | 12.8 |
+| `"confi"*` | 1 | 153275 | 1.98 | 2.02 | 12.9 |
+| `"config"*` | 1 | 153275 | 2.00 | 2.04 | 13.1 |
+| `"app"*` | 1 | 153332 | 1.98 | 2.00 | 12.9 |
+| `"to"*` | 1 | 153679 | 1.98 | 2.02 | 12.9 |
+| `"tom"*` | 1 | 153679 | 2.01 | 2.04 | 13.1 |
+| `"toml"*` | 1 | 153679 | 2.01 | 2.03 | 13.1 |
+| `"lo"*` | 1 | 155681 | 2.61 | 2.64 | 16.7 |
+| `"log"*` | 1 | 155681 | 2.62 | 2.64 | 16.8 |
+| `"co"*` | 3 | 188483 | 3.63 | 3.70 | 19.3 |
+| `"ap"*` | 2 | 230097 | 4.64 | 4.79 | 20.2 |
+| `"sr"*` | 1 | 230588 | 2.98 | 3.03 | 12.9 |
+| `"src"*` | 1 | 230588 | 2.99 | 3.03 | 13.0 |
+| `"rs"*` | 1 | 231514 | 2.96 | 3.03 | 12.8 |
+| `"c"*` | 14 | 560579 | 17.03 | 17.44 | 30.4 |
+| `"tas"*` | 1 | 933329 | 12.29 | 12.55 | 13.2 |
+| `"task"*` | 1 | 933329 | 12.33 | 12.59 | 13.2 |
+| `"ta"*` | 4 | 1027297 | 19.22 | 19.76 | 18.7 |
+| `"t"*` | 8 | 1412133 | 35.98 | 37.15 | 25.5 |
+
+## taskid corpus (fixture with `# task-N` renamed `# taskid-N`)
+
+Full term list through fts5vocab (what an in-memory term cache would load): 10098 terms, 86.11 / 86.96 / 86.96 ms (p50 / p95 / max, 10 runs)
+
+### Top 10 tokens by document frequency (fts5vocab 'row', 10098 distinct terms)
+
+| # | token | chars | rows containing it | share of rows |
+|---|---|---|---|---|
+| 1 | `taskid` | 6 | 933329 | 93.3% |
+| 2 | `rs` | 2 | 231514 | 23.2% |
+| 3 | `src` | 3 | 230588 | 23.1% |
+| 4 | `log` | 3 | 155681 | 15.6% |
+| 5 | `toml` | 4 | 153679 | 15.4% |
+| 6 | `app` | 3 | 153332 | 15.3% |
+| 7 | `config` | 6 | 153275 | 15.3% |
+| 8 | `cargo` | 5 | 108126 | 10.8% |
+| 9 | `go` | 2 | 107419 | 10.7% |
+| 10 | `integration` | 11 | 77413 | 7.7% |
+
+### Every keystroke (p95 ms; `!` marks rows that differ from taskid baseline)
+
+| query | class | `*` chars | terms under last token | postings under last token | matches | taskid baseline | taskid prefix='2' | taskid prefix='2 3 4' |
+|---|---|---|---|---|---|---|---|---|
+| `"ta"*` | hot prefix | 2 | 4 | 1027297 | 935172 | 19.75 | 0.05 | 0.04 |
+| `"tas"*` | hot prefix | 3 | 1 | 933329 | 933329 | 12.54 | 12.43 | 0.05 |
+| `"task"*` | hot prefix | 4 | 1 | 933329 | 933329 | 12.66 | 12.53 | 0.06 |
+| `"taski"*` | hot prefix | 5 | 1 | 933329 | 933329 | 12.55 | 12.47 | 13.25 |
+| `"taskid"*` | hot prefix | 6 | 1 | 933329 | 933329 | 12.80 | 12.43 | 12.74 |
+| `"taskid"` | hot word | word | 1 | 933329 | 933329 | 0.05 | 0.06 | 0.05 |
+| `"git" "ta"*` | lead + hot prefix | 2 | 4 | 1027297 | 1843 | 20.94 | 0.82 | 0.83 |
+| `"git" "tas"*` | lead + hot prefix | 3 | 1 | 933329 | 0 | 24.48 | 20.70 | 6.98 |
+| `"git" "task"*` | lead + hot prefix | 4 | 1 | 933329 | 0 | 21.52 | 20.85 | 7.14 |
+| `"git" "taski"*` | lead + hot prefix | 5 | 1 | 933329 | 0 | 21.57 | 27.05 | 21.23 |
+| `"git" "taskid"*` | lead + hot prefix | 6 | 1 | 933329 | 0 | 21.29 | 20.85 | 21.21 |
+| `"git" "taskid"` | lead + hot word | word | 1 | 933329 | 0 | 6.98 | 6.48 | 6.90 |
+| `"cargo" "ta"*` | lead + hot prefix | 2 | 4 | 1027297 | 103166 | 20.19 | 0.09 | 0.10 |
+| `"cargo" "tas"*` | lead + hot prefix | 3 | 1 | 933329 | 103046 | 13.00 | 12.43 | 0.11 |
+| `"cargo" "task"*` | lead + hot prefix | 4 | 1 | 933329 | 103046 | 12.99 | 12.37 | 0.12 |
+| `"cargo" "taski"*` | lead + hot prefix | 5 | 1 | 933329 | 103046 | 12.70 | 12.83 | 12.78 |
+| `"cargo" "taskid"*` | lead + hot prefix | 6 | 1 | 933329 | 103046 | 12.51 | 12.91 | 12.37 |
+| `"cargo" "taskid"` | lead + hot word | word | 1 | 933329 | 103046 | 0.10 | 0.09 | 0.09 |
+
+### Summary: worst keystroke per schema
+
+| variant | ratio to source | worst p95, keystrokes the TUI sends (last token >= 2 chars or whole) | that query | worst p95, 1-char included | sent keystrokes > 20 ms | sent keystrokes > 10 ms | rows differ |
+|---|---|---|---|---|---|---|---|
+| taskid baseline | 3.07x | 24.48 | `"git" "tas"*` | 24.48 | 6 of 18 | 15 | 0 |
+| taskid prefix='2' | 3.45x | 27.05 | `"git" "taski"*` | 27.05 | 4 of 18 | 12 | 0 |
+| taskid prefix='2 3 4' | 4.06x | 21.23 | `"git" "taski"*` | 21.23 | 2 of 18 | 6 | 0 |
+
+### Hybrid: prefix index for short prefixes, OR of expanded terms above it (p95 ms)
+
+| schema | OR rewrite for `*` tokens of | worst p95, keystrokes the TUI sends | that query | 2nd worst | most terms in one OR | sent keystrokes > 20 ms | rows differ from plain |
+|---|---|---|---|---|---|---|---|
+| taskid baseline | >= 2 chars | 12.84 | `"git" "tas"*` | 6.64 (`"git" "taskid"*`) | 4 | 0 | 0 |
+| taskid prefix='2' | >= 3 chars | 6.55 | `"git" "tas"*` | 6.55 (`"git" "taskid"*`) | 1 | 0 | 0 |
+
+load after: { 10.17 8.42 7.35 }
 
 </details>
