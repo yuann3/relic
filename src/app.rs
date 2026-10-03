@@ -12,9 +12,11 @@ pub const SEARCH_SCHEMA: &str = "relic.search/v1";
 /// handed to a picker as a stand-in for the index.
 pub const MAX_PAGE: usize = 5_000;
 
-/// A shorter trailing word is not sent to FTS: one-character prefixes merge
-/// the doclists of every term they start and cost ~20 ms at 1M, while
-/// two characters stay under 8 ms (docs/research/interactive-fts-measurements.md).
+/// A shorter trailing word is not sent to FTS. This removes only one-character
+/// prefixes and does not bound cost: a prefix with no index of exactly its
+/// length merges every posting under it before LIMIT applies (~13 ns per
+/// posting, so `tas*` costs 12.6 ms on the 1M fixture, where `task` is in 93%
+/// of rows). See docs/research/interactive-fts-measurements.md.
 pub const MIN_PREFIX_CHARS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

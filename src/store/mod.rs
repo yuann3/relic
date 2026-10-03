@@ -194,8 +194,9 @@ impl Store {
     /// Newest-first matches where the last word is a prefix, so partially
     /// typed input ("gi") finds completed words ("git"). Rank must score every
     /// match before returning any, while rowid order lets FTS5 stop after
-    /// `limit` rows: the difference between 260 ms and under 8 ms per
-    /// keystroke at 1M (docs/research/interactive-fts-measurements.md).
+    /// `limit` rows for whole words (260 ms vs 0.04 ms at 1M). An unindexed
+    /// prefix still merges all its postings first; see
+    /// docs/research/interactive-fts-measurements.md.
     /// Hits carry score 0.0. Rowid order is import order, not observed time.
     pub fn search_recent_prefix(
         &self,
