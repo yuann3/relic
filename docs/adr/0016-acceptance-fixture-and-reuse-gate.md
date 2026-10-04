@@ -1,0 +1,70 @@
+# 0016. Git reflog recovery is the acceptance fixture, and reuse is gated on fewer model calls and egress bytes
+
+Status: Accepted · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture](https://github.com/yuann3/relic/issues/11)
+
+## Context
+
+- The destination requires that "a held-out second task selects the exact skill before broad archaeology with improved calls/tokens/time and no loss of verified success" ([Define the Relic v0.1 destination](https://github.com/yuann3/relic/issues/2)). The map lists the acceptance fixture and the held-out sibling scenario under "Not yet specified" ([Relic v0.1: ship the evidence-backed terminal experience compiler](https://github.com/yuann3/relic/issues/1)).
+- The RLM acceptance plan calls for 12 seeded investigations:
+  - 8 answerable cases whose decisive evidence needs conditional traversal across at least two source or relation kinds and is absent from the initial FTS top 20.
+  - 4 insufficient or contradictory cases.
+
+  If the bounded RLM does not beat FTS-only, fixed top-20 plus one model call, and a fixed hand-coded pipeline, it does not ship under the RLM label (docs/research/rlm-model-boundary.md:535-537). None of these cases has been built ([Prove bounded RLM recall with exact citations](https://github.com/yuann3/relic/issues/9)).
+- The fixture needs an offline, CI-safe verifier. The Jev prototype's certbot example would plausibly need network access and root (inferred, not measured; [[P1] Prove Jev across all three integration surfaces](https://github.com/yuann3/relic/issues/18)).
+- `BudgetLedger` counts calls, ops, rows, handles, materialised bytes and egress bytes (src/rlm/budget.rs:4-60). Bytes are the hard limit. Tokens are "additional accounting"; when a provider omits usage, the reservation stays consumed (docs/research/rlm-model-boundary.md:238, :279).
+- Adding an operator requires evidence from a held-out fixture (docs/research/rlm-model-boundary.md:513). The kernel executes five operators ([0009](0009-rlm-kernel.md)).
+- CI runs against mock servers. Release evidence comes from real endpoints, with exact versions (docs/research/rlm-model-boundary.md:549).
+- Fixture style: seeded, deterministic corpora (src/fixture.rs). Shell hooks and Git land in S3. The Claude Code adapter lands after the validation/skill tracer, so until then the fixture's Claude-trace leg is synthetic.
+
+## Decision
+
+Fixture:
+
+- Task: "recover a lost commit or deleted branch via reflog". The evidence spans zsh history, shell-hook exit statuses, a Claude Code trace and Git.
+- The corpus is deterministic and synthetic, in the style of src/fixture.rs.
+- Verifier: `git rev-parse --verify <ref>`, run in a temp repo.
+- Held-out sibling: recover a dropped stash in a different repo. The sibling is unseen at compile time.
+- The fixture also supplies one answerable case among the 12 seeded investigations, and a contradictory variant that serves as an insufficient-evidence case.
+
+CI reuse gate:
+
+- Run 1 has no skill active. Run 2 is the sibling task with the skill active.
+- A deterministic host step before recall matches the question against active catalog metadata ([0013](0013-skill-catalog-direction.md)). The step sits outside the operator kernel, so [0009](0009-rlm-kernel.md) is not reopened.
+- Run 2 passes when all of the following hold:
+  - The step selects the exact expected skill id before any search or expand op.
+  - Run 2 makes strictly fewer model calls than run 1.
+  - Run 2 sends fewer egress bytes than run 1.
+  - The same verifier still passes ([0012](0012-validation-boundary.md); only success confirmed by a verifier counts).
+- Tokens are reported where the provider reports usage. Wall time is reported but not gated, because responses are recorded.
+
+Release evidence (not gating):
+
+- One real Claude Code session on the sibling task. Its imported trace must show the Skill invocation before the first search-type tool call. The session is recorded with exact versions, the same way as the `relic model check` smoke tests.
+
+## Amends
+
+- The destination's "improved calls/tokens/time" ([Define the Relic v0.1 destination](https://github.com/yuann3/relic/issues/2)) becomes a gate on model calls and egress bytes only. Tokens and wall time are reported, not gated.
+- The map's "Not yet specified" entry for the acceptance fixture and held-out sibling is now specified by this ADR.
+
+## Consequences
+
+- S3 (shell hooks, then Git) supplies the exit statuses and the Git leg. S4's validate → compile → activate → rollback prototype runs on this fixture.
+- S5 owns the rest: the Claude Code adapter (which replaces the synthetic Claude-trace leg), the Prime adapter, the full fixture, the 12 seeded investigations, the reuse gate and the release dogfood session.
+- The reuse gate runs in CI against recorded model responses. It needs no live model.
+- The catalog must expose enough metadata for the host step to match the question deterministically.
+
+## Rejected alternatives
+
+- Toolchain repair (fix a broken cargo build, verify with `cargo check`): the verifier is slow and its timing noisy.
+- Service operations (certbot, docker compose): the verifier needs network access, root or a daemon, so it fails the offline and CI requirements.
+- Making an agent-side Claude Code session the gate: it is non-deterministic, needs a live paid agent and the unbuilt adapter, and depends on an undocumented transcript format. It stays as release evidence.
+- Measuring only inside Relic, with no agent run: that proves reuse inside Relic but not that an external agent picks the skill.
+- Skill lookup as a new RLM operator: it reopens the kernel, and adding an operator requires held-out fixture evidence.
+- Gating tokens: providers may omit usage.
+- Gating wall time: with recorded responses it measures only local work.
+
+## Open facts
+
+- Whether imported Claude Code transcripts record a Skill invocation in a way that is parseable and stable across versions. The release evidence depends on it (S5).
+- Whether the answerable seeded cases' conditional traversal across two source or relation kinds is reachable with five operators now that Relate is cut ([0009](0009-rlm-kernel.md)) (S5).
+- Whether the bounded RLM beats FTS-only, top 20 plus one model call, and the fixed pipeline on the 12 seeded investigations. This decides the RLM label (S5).
