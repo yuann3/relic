@@ -735,6 +735,7 @@ mod tests {
         PageHit {
             id,
             observed_at_ms: Some(1_700_000_000_000 + id * 1000),
+            observed_before_ms: None,
             source: "zsh",
             text: text.into(),
         }
@@ -776,6 +777,7 @@ mod tests {
             timeline: (center - 1..=center + 1)
                 .map(|i| obs(i, &format!("row {i}")))
                 .collect(),
+            bounds: Default::default(),
         }
     }
 

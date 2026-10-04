@@ -125,6 +125,7 @@ mod tests {
         let hit = PageHit {
             id: 42,
             observed_at_ms: None,
+            observed_before_ms: None,
             source: "zsh",
             text: "cargo".into(),
         };

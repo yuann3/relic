@@ -73,6 +73,7 @@ pub fn page(ids: &[i64]) -> SearchPage {
             .map(|&id| PageHit {
                 id,
                 observed_at_ms: Some(1_700_000_000_000),
+                observed_before_ms: None,
                 source: "zsh",
                 text: format!("cmd {id}"),
             })

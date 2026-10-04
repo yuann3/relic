@@ -261,29 +261,54 @@ impl Store {
         }
 
         let mut obs_stmt = self.conn.prepare_cached(
-            "SELECT id, observed_at_ms, kind, safe_text FROM observation WHERE id = ?1",
+            "SELECT id, observed_at_ms, kind, safe_text, revision_id, ordinal
+             FROM observation WHERE id = ?1",
         )?;
 
         let mut hits = Vec::with_capacity(ranked.len());
         for (rowid, score) in ranked {
-            if let Ok(row) = obs_stmt
+            if let Ok((mut hit, revision_id, ordinal)) = obs_stmt
                 .query_row([rowid], |row| {
                     let kind_val: i64 = row.get(2)?;
-                    Ok(SearchHit {
+                    let hit = SearchHit {
                         id: row.get(0)?,
                         observed_at_ms: row.get(1)?,
+                        observed_before_ms: None,
                         kind: ObservationKind::from_i64(kind_val)
                             .unwrap_or(ObservationKind::ZshCommand),
                         safe_text: row.get(3)?,
                         score: *score,
-                    })
+                    };
+                    Ok((hit, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?))
                 })
             {
-                hits.push(row);
+                if hit.observed_at_ms.is_none() {
+                    hit.observed_before_ms = self.observed_no_later_than(revision_id, ordinal)?;
+                }
+                hits.push(hit);
             }
         }
 
         Ok(hits)
+    }
+
+    /// For an untimed observation, the time of the next timestamped one in the
+    /// same revision. History files append in order, so the untimed command
+    /// ran no later than that; zsh only stamps lines once EXTENDED_HISTORY or
+    /// SHARE_HISTORY is on, leaving older lines untimed. None when nothing
+    /// later is timed.
+    pub fn observed_no_later_than(
+        &self,
+        revision_id: i64,
+        ordinal: i64,
+    ) -> Result<Option<i64>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT observed_at_ms FROM observation
+             WHERE revision_id = ?1 AND ordinal > ?2 AND observed_at_ms IS NOT NULL
+             ORDER BY ordinal LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![revision_id, ordinal])?;
+        rows.next()?.map(|r| r.get(0)).transpose()
     }
 
     /// Get neighboring observations within the same revision, by ordinal range.
@@ -585,6 +610,44 @@ mod tests {
         );
         assert_eq!(texts(store.search("git", 1).unwrap()), ["git"]);
         assert_eq!(texts(store.recent(2).unwrap()), ["git push origin main --force", "ls"]);
+    }
+
+    #[test]
+    fn untimed_hits_are_bounded_by_the_next_timed_command() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = setup_revision(&store);
+        let untimed = |o, t| Observation { observed_at_ms: None, ..make_observation(rev_id, o, t) };
+        store.insert_observations(&[
+            untimed(0, "ssh old-host"),
+            untimed(1, "brew install gh"),
+            make_observation(rev_id, 2, "cd Developer"),
+            make_observation(rev_id, 3, "ssh new-host"),
+            untimed(4, "ssh trailing"),
+        ]).unwrap();
+
+        let hits = store.search("ssh", 10).unwrap();
+        let by_text = |t: &str| hits.iter().find(|h| h.safe_text == t).unwrap();
+        let first_timed = 1_700_000_000_002;
+        assert_eq!(by_text("ssh old-host").observed_before_ms, Some(first_timed));
+        // A timed hit carries its own time, not a bound.
+        assert_eq!(by_text("ssh new-host").observed_at_ms, Some(1_700_000_000_003));
+        assert_eq!(by_text("ssh new-host").observed_before_ms, None);
+        // Nothing timed follows the last line: no bound to infer.
+        assert_eq!(by_text("ssh trailing").observed_before_ms, None);
+    }
+
+    #[test]
+    fn bound_lookup_uses_the_partial_index() {
+        let store = Store::open_memory().unwrap();
+        let plan: String = store.conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT observed_at_ms FROM observation
+             WHERE revision_id = 1 AND ordinal > 5 AND observed_at_ms IS NOT NULL
+             ORDER BY ordinal LIMIT 1",
+            [],
+            |r| r.get(3),
+        ).unwrap();
+        // A scan over a fully untimed bash history would cost O(rows) per hit.
+        assert!(plan.contains("observation_timed"), "{plan}");
     }
 
     #[test]

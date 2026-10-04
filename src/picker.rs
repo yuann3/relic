@@ -216,7 +216,8 @@ fn encode(hits: &[PageHit]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(hits.len() * 96);
     for h in hits {
         let start = buf.len();
-        let when = h.observed_at_ms.map_or_else(|| "unknown time    ".into(), app::format_utc);
+        let when = h.when().label();
+        let when = when.trim();
         write!(buf, "{}\t{when}\t{}\t", h.id, app::display_line(h.source)).expect("Vec write");
         let mut budget = RECORD_MAX - 1 - (buf.len() - start);
         let mut utf8 = [0; 4];
@@ -263,6 +264,7 @@ mod tests {
         PageHit {
             id,
             observed_at_ms: Some(1_700_000_000_000),
+            observed_before_ms: None,
             source: "zsh",
             text: text.into(),
         }

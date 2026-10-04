@@ -103,7 +103,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
             let view = app::open_evidence(&store, id, 3)?.ok_or("selected evidence vanished")?;
             for o in &view.timeline {
                 let mark = if o.id == id { ">" } else { " " };
-                writeln!(out, "{mark} {}  {}", when(o.observed_at_ms), app::display_line(&o.safe_text))?;
+                writeln!(out, "{mark} {} {}", view.when(o).label(), app::display_line(&o.safe_text))?;
             }
         }
     }
@@ -115,7 +115,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
 
 fn print_page(out: &mut impl Write, page: &app::SearchPage) -> Result<()> {
     for h in &page.hits {
-        writeln!(out, "{}  {:<4}  {}", when(h.observed_at_ms), h.source, app::display_line(&h.text))?;
+        writeln!(out, "{} {:<4}  {}", h.when().label(), h.source, app::display_line(&h.text))?;
     }
     page_notes(page);
     Ok(())
@@ -133,10 +133,6 @@ fn page_notes(page: &app::SearchPage) {
     if page.truncated {
         eprintln!("(more matches past {}; narrow the query or raise --limit)", page.limit);
     }
-}
-
-fn when(ms: Option<i64>) -> String {
-    ms.map_or_else(|| "unknown time    ".into(), app::format_utc)
 }
 
 /// Search and the UI must not create an empty database as a side effect.

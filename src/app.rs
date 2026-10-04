@@ -1,6 +1,8 @@
 //! Use cases shared by the CLI and the TUI. Presentation adapters call these;
 //! they never touch the store directly.
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 
 use crate::domain::{ObservationKind, StoredObservation};
@@ -53,8 +55,16 @@ pub struct SearchPage {
 pub struct PageHit {
     pub id: i64,
     pub observed_at_ms: Option<i64>,
+    /// Untimed hits only: inferred upper bound from history order.
+    pub observed_before_ms: Option<i64>,
     pub source: &'static str,
     pub text: String,
+}
+
+impl PageHit {
+    pub fn when(&self) -> When {
+        When::from_parts(self.observed_at_ms, self.observed_before_ms)
+    }
 }
 
 impl SearchPage {
@@ -99,6 +109,7 @@ pub fn search(store: &Store, req: &SearchRequest) -> Result<SearchPage, rusqlite
             .map(|h| PageHit {
                 id: h.id,
                 observed_at_ms: h.observed_at_ms,
+                observed_before_ms: h.observed_before_ms,
                 source: source_label(h.kind),
                 text: h.safe_text,
             })
@@ -111,6 +122,14 @@ pub fn search(store: &Store, req: &SearchRequest) -> Result<SearchPage, rusqlite
 pub struct EvidenceView {
     pub observation: StoredObservation,
     pub timeline: Vec<StoredObservation>,
+    /// Inferred upper bounds for the untimed rows above, by observation id.
+    pub bounds: HashMap<i64, i64>,
+}
+
+impl EvidenceView {
+    pub fn when(&self, o: &StoredObservation) -> When {
+        When::from_parts(o.observed_at_ms, self.bounds.get(&o.id).copied())
+    }
 }
 
 pub fn open_evidence(
@@ -123,7 +142,15 @@ pub fn open_evidence(
     };
     let timeline =
         store.get_neighbors(observation.revision_id, observation.ordinal, context, context)?;
-    Ok(Some(EvidenceView { observation, timeline }))
+    let mut bounds = HashMap::new();
+    for o in timeline.iter().chain([&observation]) {
+        if o.observed_at_ms.is_none()
+            && let Some(ms) = store.observed_no_later_than(o.revision_id, o.ordinal)?
+        {
+            bounds.insert(o.id, ms);
+        }
+    }
+    Ok(Some(EvidenceView { observation, timeline, bounds }))
 }
 
 pub fn source_label(kind: ObservationKind) -> &'static str {
@@ -156,6 +183,57 @@ pub fn display_char(c: char) -> char {
         '\u{00AD}' | '\u{180E}' | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}' => '\u{FFFD}',
         '\u{E0001}' | '\u{E0020}'..='\u{E007F}' => '\u{FFFD}',
         c => c,
+    }
+}
+
+/// When a command ran, as far as the source can say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    At(i64),
+    /// The source has no time for it, but a later timestamped command in the
+    /// same file bounds it.
+    NoLaterThan(i64),
+    Unknown,
+}
+
+impl When {
+    fn from_parts(at: Option<i64>, before: Option<i64>) -> Self {
+        match (at, before) {
+            (Some(ms), _) => Self::At(ms),
+            (None, Some(ms)) => Self::NoLaterThan(ms),
+            (None, None) => Self::Unknown,
+        }
+    }
+
+    /// Fixed 17 columns for result lists. The first column marks an
+    /// inferred bound, so exact and bounded dates line up.
+    pub fn label(self) -> String {
+        match self {
+            Self::At(ms) => format!(" {}", format_utc(ms)),
+            Self::NoLaterThan(ms) => format!("≤{}", format_utc(ms)),
+            Self::Unknown => " unknown time    ".into(),
+        }
+    }
+
+    /// Fixed 12 columns, month-day only, for the timeline beside the year.
+    pub fn short(self) -> String {
+        match self {
+            Self::At(ms) => format!(" {}", &format_utc(ms)[5..]),
+            Self::NoLaterThan(ms) => format!("≤{}", &format_utc(ms)[5..]),
+            Self::Unknown => " unknown    ".into(),
+        }
+    }
+
+    /// Spelled out, saying which part is inferred.
+    pub fn detail(self) -> String {
+        match self {
+            Self::At(ms) => format!("{} UTC", format_utc(ms)),
+            Self::NoLaterThan(ms) => format!(
+                "not recorded; no later than {} UTC (inferred from history order)",
+                format_utc(ms)
+            ),
+            Self::Unknown => "not recorded".into(),
+        }
     }
 }
 
@@ -307,6 +385,59 @@ mod tests {
             assert_eq!(display_line(&format!("a{c}b")), "a\u{FFFD}b", "{:?}", c);
         }
         assert_eq!(display_line("部署 café ✓"), "部署 café ✓");
+    }
+
+    /// The shape of a real history where share_history was turned on late:
+    /// plain lines first, timestamped lines after.
+    fn mixed_store() -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zsh_history");
+        std::fs::write(
+            &path,
+            "ssh volty.exe.dev\nccd --resume\n: 1791017948:0;cd Developer\n: 1791018000:0;ls\n",
+        )
+        .unwrap();
+        let mut store = Store::open_memory().unwrap();
+        import_file(&mut store, &path, SourceKind::Zsh, &Redactor::new()).unwrap();
+        store
+    }
+
+    #[test]
+    fn untimed_history_gets_an_inferred_bound_everywhere() {
+        let store = mixed_store();
+        let first_timed = 1_791_017_948_000;
+
+        let page = search(&store, &req("ccd", 10, MatchMode::Words)).unwrap();
+        let hit = &page.hits[0];
+        assert_eq!(hit.when(), When::NoLaterThan(first_timed));
+        let v: serde_json::Value = serde_json::to_value(&page).unwrap();
+        assert_eq!(v["hits"][0]["observed_at_ms"], serde_json::Value::Null);
+        assert_eq!(v["hits"][0]["observed_before_ms"], first_timed);
+
+        let view = open_evidence(&store, hit.id, 5).unwrap().unwrap();
+        let whens: Vec<When> = view.timeline.iter().map(|o| view.when(o)).collect();
+        assert_eq!(
+            whens,
+            [
+                When::NoLaterThan(first_timed),
+                When::NoLaterThan(first_timed),
+                When::At(first_timed),
+                When::At(1_791_018_000_000),
+            ]
+        );
+        assert_eq!(view.when(&view.observation), When::NoLaterThan(first_timed));
+    }
+
+    #[test]
+    fn time_labels_keep_their_columns() {
+        let ms = 1_791_017_948_000;
+        for w in [When::At(ms), When::NoLaterThan(ms), When::Unknown] {
+            assert_eq!(w.label().chars().count(), 17, "{w:?}");
+            assert_eq!(w.short().chars().count(), 12, "{w:?}");
+        }
+        assert_eq!(When::NoLaterThan(ms).label(), "≤2026-10-03 08:59");
+        assert_eq!(When::NoLaterThan(ms).short(), "≤10-03 08:59");
+        assert!(When::NoLaterThan(ms).detail().contains("inferred"));
     }
 
     #[test]

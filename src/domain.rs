@@ -60,6 +60,8 @@ pub struct StoredObservation {
 pub struct SearchHit {
     pub id: i64,
     pub observed_at_ms: Option<i64>,
+    /// For an untimed hit: see [`crate::store::Store::observed_no_later_than`].
+    pub observed_before_ms: Option<i64>,
     pub kind: ObservationKind,
     pub safe_text: String,
     pub score: f64,

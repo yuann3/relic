@@ -81,6 +81,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS observation_fts USING fts5(
 CREATE INDEX IF NOT EXISTS observation_time
     ON observation(observed_at_ms, id);
 
-CREATE INDEX IF NOT EXISTS observation_revision
-    ON observation(revision_id, ordinal);
+-- Finds the next timestamped command after an untimed one. Partial, so it
+-- costs nothing for untimed sources; it replaces an index on
+-- (revision_id, ordinal) that duplicated the UNIQUE constraint's.
+CREATE INDEX IF NOT EXISTS observation_timed
+    ON observation(revision_id, ordinal) WHERE observed_at_ms IS NOT NULL;
 ";

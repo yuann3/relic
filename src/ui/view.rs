@@ -11,7 +11,7 @@ use super::model::{
     Focus, Modal, RECALL_CHILD_MAX, RECALL_ROOT_MAX, RECALL_SPEND_CAP, RECALL_WALL_MAX,
     RecallStatus, StepState, UiModel,
 };
-use crate::app::{MIN_PREFIX_CHARS, display_line, format_utc, source_label};
+use crate::app::{MIN_PREFIX_CHARS, When, display_line, source_label};
 
 /// Below this the panes cannot show a usable row, so say so instead.
 pub const MIN_WIDTH: u16 = 40;
@@ -209,8 +209,8 @@ fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         .iter()
         .map(|h| {
             let mut spans = vec![
-                Span::styled(when(h.observed_at_ms), t.dim),
-                Span::raw(format!("  {:<5} ", h.source)),
+                Span::styled(h.when().label(), t.dim),
+                Span::raw(format!(" {:<5} ", h.source)),
             ];
             spans.extend(safe_spans(&display_line(&h.text), t));
             ListItem::new(Line::from(spans))
@@ -251,10 +251,7 @@ fn timeline(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
                 Span::raw("    ")
             };
             // Month-day is enough beside neighbors; the detail pane has the year.
-            let short = o
-                .observed_at_ms
-                .map_or_else(|| "unknown    ".into(), |ms| format_utc(ms)[5..].to_string());
-            let mut spans = vec![mark, Span::styled(format!("{short} "), t.dim)];
+            let mut spans = vec![mark, Span::styled(v.when(o).short(), t.dim), Span::raw(" ")];
             spans.extend(safe_spans(&display_line(&o.safe_text), t));
             ListItem::new(Line::from(spans))
         })
@@ -277,6 +274,11 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         frame.render_widget(Paragraph::new(msg).block(block), area);
         return;
     };
+    let when = m
+        .evidence
+        .view
+        .as_ref()
+        .map_or(When::Unknown, |v| v.when(o));
     let field = |name: &str, value: String| {
         Line::from(vec![
             Span::styled(format!("{name}: "), t.title),
@@ -293,13 +295,7 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let mut lines = vec![
         field("id", format!("#{}", o.id)),
         field("source", source_label(o.kind).to_string()),
-        field(
-            "time",
-            match o.observed_at_ms {
-                Some(ms) => format!("{} UTC", format_utc(ms)),
-                None => "unknown".into(),
-            },
-        ),
+        field("time", when.detail()),
         field(
             "revision",
             format!("{} · ordinal {}", o.revision_id, o.ordinal),
@@ -483,10 +479,6 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
-fn when(ms: Option<i64>) -> String {
-    ms.map(format_utc)
-        .unwrap_or_else(|| "unknown time    ".into())
-}
 
 /// Splits out redaction markers so they read differently from the command
 /// around them while still showing (and copying as) the literal marker.
@@ -615,6 +607,24 @@ mod tests {
     }
 
     #[test]
+    fn untimed_rows_show_the_inferred_bound() {
+        // Plain lines written before share_history began stamping them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zsh_history");
+        std::fs::write(&path, "ccd --resume\nbrew install gh\n: 1791017948:0;cd Developer\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        import_file(&mut store, &path, SourceKind::Zsh, &Redactor::new()).unwrap();
+
+        let s = text(&render(&typed(&store, "ccd", false), 160, 40));
+        assert!(s.contains("> ≤2026-10-03 08:59 zsh   ccd --resume"), "{s}");
+        // Bounded and exact dates share a column; the marker sits left of it.
+        assert!(s.contains("hit ≤10-03 08:59 ccd --resume"), "{s}");
+        assert!(s.contains("     10-03 08:59 cd Developer"), "{s}");
+        assert!(s.contains("no later than 2026-10-03") && s.contains("(inferred from history order)"), "{s}");
+        assert!(!s.contains("unknown time"), "{s}");
+    }
+
+    #[test]
     fn timeline_labels_untimed_history_as_unknown() {
         // Plain bash history has no timestamps.
         let dir = tempfile::tempdir().unwrap();
@@ -624,7 +634,7 @@ mod tests {
         import_file(&mut store, &path, SourceKind::Bash, &Redactor::new()).unwrap();
 
         let s = text(&render(&typed(&store, "certb", false), 120, 40));
-        assert!(s.contains("hit unknown     certbot renew"), "{s}");
+        assert!(s.contains("hit  unknown     certbot renew"), "{s}");
         assert!(!s.contains("hit wn time"), "{s}");
     }
 
@@ -646,11 +656,11 @@ mod tests {
             "Query · local index · offline",
             "> certb",
             "Results 1",
-            "2023-11-14 22:13  zsh   certbot renew",
+            "2023-11-14 22:13 zsh   certbot renew",
             "Timeline · zsh",
             "cd /etc/nginx",
-            "hit 11-14 22:13 certbot renew",
-            "11-14 22:13 systemctl reload",
+            "hit  11-14 22:13 certbot renew",
+            "11-14 22:13 systemctl relo",
             "provenance: not recorded",
             "revision: 1 · ordinal 1",
             "exact text, redacted at import:",
@@ -795,6 +805,7 @@ mod tests {
         let hit = PageHit {
             id: 5,
             observed_at_ms: Some(0),
+            observed_before_ms: None,
             source: "zsh",
             text: text.into(),
         };
@@ -831,6 +842,7 @@ mod tests {
         let view = EvidenceView {
             observation: o.clone(),
             timeline: vec![o],
+            bounds: Default::default(),
         };
         update(
             &mut m,
