@@ -188,53 +188,127 @@ impl Store {
     /// Two-step: (1) FTS5 narrowing with `ORDER BY rank` for the internal
     /// priority-queue optimization, (2) fetch observation metadata by rowid.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
-        let escaped = escape_fts_query(query);
+        self.search_fts(&escape_fts_query(query, false), limit, true)
+    }
+
+    /// Newest-first matches where the last word is a prefix, so partially
+    /// typed input ("gi") finds completed words ("git"). Rank must score every
+    /// match before returning any, while rowid order lets FTS5 stop after
+    /// `limit` rows for whole words (260 ms vs 0.04 ms at 1M). An unindexed
+    /// prefix still merges all its postings first; see
+    /// docs/research/interactive-fts-measurements.md.
+    /// Hits carry score 0.0. Rowid order is import order, not observed time.
+    pub fn search_recent_prefix(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, rusqlite::Error> {
+        self.search_fts(&escape_fts_query(query, true), limit, false)
+    }
+
+    /// Newest-first matches where every word matches whole.
+    pub fn search_recent(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
+        self.search_fts(&escape_fts_query(query, false), limit, false)
+    }
+
+    /// The newest observations, unfiltered.
+    pub fn recent(&self, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, 0.0 FROM observation ORDER BY id DESC LIMIT ?1",
+        )?;
+        let ids = stmt
+            .query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        self.hits_for(&ids)
+    }
+
+    fn search_fts(
+        &self,
+        escaped: &str,
+        limit: usize,
+        by_rank: bool,
+    ) -> Result<Vec<SearchHit>, rusqlite::Error> {
         if escaped.is_empty() {
             return Ok(vec![]);
         }
 
-        // Step 1: Get top-N rowids from FTS5 with rank optimization.
-        let mut fts_stmt = self.conn.prepare_cached(
+        // Step 1: top-N rowids from FTS5, by rank or newest first.
+        let sql = if by_rank {
             "SELECT rowid, rank FROM observation_fts
              WHERE observation_fts MATCH ?1
              ORDER BY rank
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        } else {
+            "SELECT rowid, 0.0 FROM observation_fts
+             WHERE observation_fts MATCH ?1
+             ORDER BY rowid DESC
+             LIMIT ?2"
+        };
+        let mut fts_stmt = self.conn.prepare_cached(sql)?;
         let ranked: Vec<(i64, f64)> = fts_stmt
             .query_map(rusqlite::params![escaped, limit as i64], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        self.hits_for(&ranked)
+    }
+
+    /// Step 2: fetch observation data for ranked rowids, keeping their order.
+    fn hits_for(&self, ranked: &[(i64, f64)]) -> Result<Vec<SearchHit>, rusqlite::Error> {
         if ranked.is_empty() {
             return Ok(vec![]);
         }
 
-        // Step 2: Fetch observation data for those rowids.
         let mut obs_stmt = self.conn.prepare_cached(
-            "SELECT id, observed_at_ms, kind, safe_text FROM observation WHERE id = ?1",
+            "SELECT id, observed_at_ms, kind, safe_text, revision_id, ordinal
+             FROM observation WHERE id = ?1",
         )?;
 
         let mut hits = Vec::with_capacity(ranked.len());
-        for (rowid, score) in &ranked {
-            if let Ok(row) = obs_stmt
+        for (rowid, score) in ranked {
+            if let Ok((mut hit, revision_id, ordinal)) = obs_stmt
                 .query_row([rowid], |row| {
                     let kind_val: i64 = row.get(2)?;
-                    Ok(SearchHit {
+                    let hit = SearchHit {
                         id: row.get(0)?,
                         observed_at_ms: row.get(1)?,
+                        observed_before_ms: None,
                         kind: ObservationKind::from_i64(kind_val)
                             .unwrap_or(ObservationKind::ZshCommand),
                         safe_text: row.get(3)?,
                         score: *score,
-                    })
+                    };
+                    Ok((hit, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?))
                 })
             {
-                hits.push(row);
+                if hit.observed_at_ms.is_none() {
+                    hit.observed_before_ms = self.observed_no_later_than(revision_id, ordinal)?;
+                }
+                hits.push(hit);
             }
         }
 
         Ok(hits)
+    }
+
+    /// For an untimed observation, the time of the next timestamped one in the
+    /// same revision. History files append in order, so the untimed command
+    /// ran no later than that; zsh only stamps lines once EXTENDED_HISTORY or
+    /// SHARE_HISTORY is on, leaving older lines untimed. None when nothing
+    /// later is timed.
+    pub fn observed_no_later_than(
+        &self,
+        revision_id: i64,
+        ordinal: i64,
+    ) -> Result<Option<i64>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT observed_at_ms FROM observation
+             WHERE revision_id = ?1 AND ordinal > ?2 AND observed_at_ms IS NOT NULL
+             ORDER BY ordinal LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![revision_id, ordinal])?;
+        rows.next()?.map(|r| r.get(0)).transpose()
     }
 
     /// Get neighboring observations within the same revision, by ordinal range.
@@ -276,17 +350,19 @@ impl Store {
 }
 
 /// Escape user/model text into a safe FTS5 query.
-/// Each word becomes a quoted phrase token. No raw FTS operators pass through.
-fn escape_fts_query(query: &str) -> String {
+/// Each word becomes a quoted phrase token. No raw FTS operators pass through;
+/// the only operator Relic itself adds is `*` on the last token when
+/// `last_prefix` is set.
+fn escape_fts_query(query: &str, last_prefix: bool) -> String {
     let tokens: Vec<&str> = query.split_whitespace().collect();
-    if tokens.is_empty() {
-        return String::new();
-    }
+    let last = tokens.len().saturating_sub(1);
     tokens
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let escaped = t.replace('"', "\"\"");
-            format!("\"{escaped}\"")
+            let star = if last_prefix && i == last { "*" } else { "" };
+            format!("\"{escaped}\"{star}")
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -484,6 +560,94 @@ mod tests {
 
         let hits = store.search("nonexistent_term", 10).unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn recent_prefix_matches_partial_last_word() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = setup_revision(&store);
+        store.insert_observations(&[
+            make_observation(rev_id, 0, "git push origin main"),
+            make_observation(rev_id, 1, "cargo build"),
+        ]).unwrap();
+
+        assert!(store.search("gi", 10).unwrap().is_empty());
+        let hits = store.search_recent_prefix("gi", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].safe_text, "git push origin main");
+        // Earlier words still match whole.
+        assert!(store.search_recent_prefix("gi pu", 10).unwrap().is_empty());
+        assert_eq!(store.search_recent_prefix("git pu", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recent_prefix_does_not_pass_fts_syntax_through() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = setup_revision(&store);
+        store.insert_observations(&[make_observation(rev_id, 0, "echo NEAR(a b)")]).unwrap();
+
+        // A stray quote or operator in user input must not become FTS syntax.
+        assert!(store.search_recent_prefix("\"", 10).unwrap().is_empty());
+        assert_eq!(store.search_recent_prefix("NEAR(a", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recent_prefix_orders_newest_first() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = setup_revision(&store);
+        // BM25 would put the shortest row first; recency must not.
+        store.insert_observations(&[
+            make_observation(rev_id, 0, "git"),
+            make_observation(rev_id, 1, "git commit -m one two three four"),
+            make_observation(rev_id, 2, "ls"),
+            make_observation(rev_id, 3, "git push origin main --force"),
+        ]).unwrap();
+
+        let texts = |hits: Vec<SearchHit>| hits.into_iter().map(|h| h.safe_text).collect::<Vec<_>>();
+        assert_eq!(
+            texts(store.search_recent_prefix("gi", 10).unwrap()),
+            ["git push origin main --force", "git commit -m one two three four", "git"]
+        );
+        assert_eq!(texts(store.search("git", 1).unwrap()), ["git"]);
+        assert_eq!(texts(store.recent(2).unwrap()), ["git push origin main --force", "ls"]);
+    }
+
+    #[test]
+    fn untimed_hits_are_bounded_by_the_next_timed_command() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = setup_revision(&store);
+        let untimed = |o, t| Observation { observed_at_ms: None, ..make_observation(rev_id, o, t) };
+        store.insert_observations(&[
+            untimed(0, "ssh old-host"),
+            untimed(1, "brew install gh"),
+            make_observation(rev_id, 2, "cd Developer"),
+            make_observation(rev_id, 3, "ssh new-host"),
+            untimed(4, "ssh trailing"),
+        ]).unwrap();
+
+        let hits = store.search("ssh", 10).unwrap();
+        let by_text = |t: &str| hits.iter().find(|h| h.safe_text == t).unwrap();
+        let first_timed = 1_700_000_000_002;
+        assert_eq!(by_text("ssh old-host").observed_before_ms, Some(first_timed));
+        // A timed hit carries its own time, not a bound.
+        assert_eq!(by_text("ssh new-host").observed_at_ms, Some(1_700_000_000_003));
+        assert_eq!(by_text("ssh new-host").observed_before_ms, None);
+        // Nothing timed follows the last line: no bound to infer.
+        assert_eq!(by_text("ssh trailing").observed_before_ms, None);
+    }
+
+    #[test]
+    fn bound_lookup_uses_the_partial_index() {
+        let store = Store::open_memory().unwrap();
+        let plan: String = store.conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT observed_at_ms FROM observation
+             WHERE revision_id = 1 AND ordinal > 5 AND observed_at_ms IS NOT NULL
+             ORDER BY ordinal LIMIT 1",
+            [],
+            |r| r.get(3),
+        ).unwrap();
+        // A scan over a fully untimed bash history would cost O(rows) per hit.
+        assert!(plan.contains("observation_timed"), "{plan}");
     }
 
     #[test]
