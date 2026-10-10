@@ -207,12 +207,12 @@ mod tests {
 
     #[test]
     fn yields_the_first_record_before_the_source_fails() {
-        let input = b"#1700000000\nfirst\n#1700000001\nsecond\n#1700000002\nthi";
-        let mut parser = Parser::new(BufReader::with_capacity(8, FailsAfter(input)));
+        let input = b"#1700000000\nfirst\n#1700000001\nsecond\n#1700000002\nthird\n";
+        // The source dies inside the second record's command.
+        let mut parser = Parser::new(BufReader::with_capacity(8, FailsAfter(&input[..33])));
         assert_eq!(parser.next().unwrap().unwrap().command, "first");
-        assert_eq!(parser.next().unwrap().unwrap().command, "second");
         assert!(parser.next().unwrap().is_err());
-        assert_eq!(parser.stable_len(), 37);
+        assert_eq!(parser.stable_len(), 18);
     }
 
     #[test]

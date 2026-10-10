@@ -178,13 +178,13 @@ mod tests {
 
     #[test]
     fn yields_the_first_record_before_the_source_fails() {
-        let input = b": 1700000000:0;first\n: 1700000001:0;second\n: 1700000002:0;thi";
-        // An 8-byte buffer: the parser cannot have read ahead to the failure.
-        let mut parser = Parser::new(BufReader::with_capacity(8, FailsAfter(input)));
+        let input = b": 1700000000:0;first\n: 1700000001:0;second\n: 1700000002:0;third\n";
+        // The source dies inside the second record. An 8-byte buffer: the
+        // parser cannot have read ahead to the failure.
+        let mut parser = Parser::new(BufReader::with_capacity(8, FailsAfter(&input[..30])));
         assert_eq!(parser.next().unwrap().unwrap().command, "first");
-        assert_eq!(parser.next().unwrap().unwrap().command, "second");
         assert!(parser.next().unwrap().is_err());
-        assert_eq!(parser.stable_len(), 43);
+        assert_eq!(parser.stable_len(), 21);
     }
 
     #[test]
