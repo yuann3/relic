@@ -193,7 +193,7 @@ mod tests {
     }
 
     fn insert_commands(store: &mut Store, rev_id: i64, commands: &[&str]) {
-        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap().unwrap();
+        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap();
         assert_eq!(rev.revision_id(), rev_id);
         for (i, cmd) in commands.iter().enumerate() {
             rev.insert(&Observation {

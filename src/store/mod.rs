@@ -126,17 +126,34 @@ impl<'a> SourceLock<'a> {
         Ok(RevisionTx { tx, revision_id, next_ordinal: 0 })
     }
 
-    /// Reopen the newest revision to append records after its last one.
-    /// `None` when the source has no revision yet.
-    pub fn append(self) -> Result<Option<RevisionTx<'a>>, StoreError> {
-        let Some(newest) = self.newest else { return Ok(None) };
+    /// The last `n` records of the newest revision, oldest first: the
+    /// `(observed_at_ms, safe_text)` a rewritten file is aligned by. Read
+    /// from the rows themselves, so no hash of them is stored (ADR 0008).
+    pub fn anchor(&self, n: usize) -> Result<Vec<(Option<i64>, String)>, StoreError> {
+        let Some(newest) = &self.newest else { return Ok(vec![]) };
+        let mut records = self
+            .tx
+            .prepare(
+                "SELECT observed_at_ms, safe_text FROM observation
+                 WHERE revision_id = ?1 ORDER BY ordinal DESC LIMIT ?2",
+            )?
+            .query_map(rusqlite::params![newest.revision_id, n as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        records.reverse();
+        Ok(records)
+    }
+
+    /// Reopen the newest revision to append records after its last one. A
+    /// source with no revision yet gets its first.
+    pub fn append(self) -> Result<RevisionTx<'a>, StoreError> {
+        let Some(newest) = &self.newest else { return self.new_revision() };
         let revision_id = newest.revision_id;
         let next_ordinal = self.tx.query_row(
             "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM observation WHERE revision_id = ?1",
             [revision_id],
             |r| r.get(0),
         )?;
-        Ok(Some(RevisionTx { tx: self.tx, revision_id, next_ordinal }))
+        Ok(RevisionTx { tx: self.tx, revision_id, next_ordinal })
     }
 }
 
@@ -207,6 +224,8 @@ impl RevisionTx<'_> {
 /// Local observation store backed by SQLite + FTS5.
 pub struct Store {
     conn: Connection,
+    /// Where the installation key lives; an in-memory store has none.
+    key_path: Option<std::path::PathBuf>,
 }
 
 impl Store {
@@ -214,14 +233,21 @@ impl Store {
     pub fn open(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
         schema::initialize(&conn)?;
-        Ok(Self { conn })
+        let mut key_path = path.as_os_str().to_owned();
+        key_path.push(".key");
+        Ok(Self { conn, key_path: Some(key_path.into()) })
     }
 
     /// Open an in-memory store (for tests).
     pub fn open_memory() -> Result<Self, rusqlite::Error> {
         let conn = Connection::open_in_memory()?;
         schema::initialize(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, key_path: None })
+    }
+
+    /// The installation key's file, beside the database (see `crate::key`).
+    pub fn key_path(&self) -> Option<&std::path::Path> {
+        self.key_path.as_deref()
     }
 
     /// Check whether a table exists in the database.
@@ -787,10 +813,15 @@ mod tests {
     #[test]
     fn append_continues_the_revision_or_changes_nothing() {
         let mut store = Store::open_memory().unwrap();
+        // Nothing to continue yet: the append opens the first revision.
+        let lock = store.lock_source(b"/h", SourceKind::Zsh).unwrap();
+        assert!(lock.anchor(16).unwrap().is_empty());
+        drop(lock.append().unwrap());
+        assert_eq!(newest(&mut store), None);
         insert(&mut store, &[make_observation(0, "one"), make_observation(1, "two")]);
         let first = newest(&mut store).unwrap();
 
-        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap().unwrap();
+        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap();
         rev.insert(&make_observation(2, "abandoned")).unwrap();
         drop(rev);
         assert_eq!(newest(&mut store).unwrap(), first);
@@ -801,9 +832,16 @@ mod tests {
             stable_len: 30,
             boundary_guard: Some([7; 32]),
         };
-        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap().unwrap();
+        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap();
         let id = rev.insert(&make_observation(2, "three")).unwrap();
         rev.commit(&cursor, Provenance::OBSERVED_AT).unwrap();
+
+        let lock = store.lock_source(b"/h", SourceKind::Zsh).unwrap();
+        let texts = |n| lock.anchor(n).unwrap().into_iter().map(|(_, text)| text).collect::<Vec<_>>();
+        assert_eq!(texts(2), ["two", "three"]);
+        assert_eq!(texts(16), ["one", "two", "three"]);
+        assert_eq!(lock.anchor(1).unwrap(), [(Some(1_700_000_000_002), "three".to_string())]);
+        drop(lock);
 
         let three = store.get_observation(id).unwrap().unwrap();
         assert_eq!((three.revision_id, three.ordinal), (first.revision_id, 2));

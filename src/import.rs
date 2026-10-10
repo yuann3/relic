@@ -1,10 +1,12 @@
+use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Seek, SeekFrom};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::domain::{FLAG_LOSSY, Observation, ObservationKind, Provenance};
+use crate::key::{self, InstallationKey};
 use crate::redact::Redactor;
 use crate::source::{self, RawRecord};
 use crate::store::{Cursor, RevisionTx, StatHint, Store, StoreError};
@@ -16,12 +18,35 @@ pub enum SourceKind {
     Bash,
 }
 
+/// How an import related the file to what the store already held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Outcome {
+    /// The stat hint matched the stored one: the file was not read.
+    #[default]
+    Unchanged,
+    /// The source's first revision.
+    First,
+    /// The boundary guard vouched for the stored prefix: only the bytes past
+    /// it were parsed.
+    Appended,
+    /// The file was rewritten and the stored records' end found in it: the
+    /// records after that were added to the existing revision.
+    Aligned,
+    /// The file was rewritten and the stored records' end could not be placed
+    /// uniquely: the whole file is a new revision and the old one is kept.
+    Superseded,
+}
+
 /// Result of an import operation.
 #[derive(Debug, Default)]
 pub struct ImportResult {
     pub records_stored: usize,
+    /// Records the parser yielded, over every pass this import made.
+    pub records_parsed: usize,
     pub revision_id: i64,
-    pub skipped: bool,
+    pub outcome: Outcome,
+    /// The installation key was replaced or could not be written.
+    pub key_warning: Option<String>,
     /// The records are committed, but a reader's open snapshot kept the WAL
     /// from being folded into the database file.
     pub checkpoint_blocked: bool,
@@ -41,8 +66,25 @@ pub struct ImportResult {
 /// 25 ms budget that cannot pay for a truncating checkpoint's fsyncs.
 const CHECKPOINT_MIN_RECORDS: usize = 10_000;
 
-/// Import a history file into the store as one new revision, or skip it when
-/// `stat` says it has not changed since the last import.
+/// The boundary guard covers this many bytes before `stable_len`. A shell
+/// rewrite shifts or drops bytes, so it changes this window; an edit that
+/// keeps every byte in it still gets past (ADR 0002 accepts that for the
+/// 25 ms append gate, which a whole-prefix digest misses at 55 MB).
+const GUARD_WINDOW: u64 = 65536;
+
+/// How many of a revision's last records anchor a rewritten file.
+const ANCHOR_RECORDS: usize = 16;
+
+/// How many consecutive records of the new file must fall inside the anchor.
+/// Half the anchor, so the match survives the shell dropping some anchor
+/// records (zsh's HIST_IGNORE_ALL_DUPS) while one repeated command cannot
+/// place the boundary on its own.
+const ALIGN_WINDOW: usize = 8;
+
+/// Import a history file. Unchanged since the last import: nothing is read.
+/// Grown: only the new tail is parsed. Rewritten: the records after the
+/// stored ones are added, or the whole file becomes a new revision when the
+/// stored ones cannot be found. Nothing already stored is ever removed.
 pub fn import_file(
     store: &mut Store,
     path: &Path,
@@ -50,6 +92,7 @@ pub fn import_file(
     redactor: &Redactor,
 ) -> Result<ImportResult, ImportError> {
     let resolved = resolve(path)?;
+    let key_path = store.key_path().map(Path::to_path_buf);
     // Lock before looking: an importer that decided first and then waited for
     // another import of this file would store the file a second time.
     let source = store.lock_source(resolved.as_os_str().as_bytes(), kind)?;
@@ -62,38 +105,206 @@ pub fn import_file(
         return Err(ImportError::NotRegularFile(path.to_path_buf()));
     }
     let stat = stat_hint(&metadata);
-    if source.newest().is_some_and(|r| r.cursor.stat == stat) {
-        return Ok(ImportResult { skipped: true, ..ImportResult::default() });
+    let newest = source.newest().cloned();
+    if newest.as_ref().is_some_and(|r| r.cursor.stat == stat) {
+        return Ok(ImportResult::default());
     }
 
-    let reader = BufReader::new(file);
-    let mut revision = source.new_revision()?;
-    let (stored, stable_len, dangling_meta, incomplete_tail) = match kind {
-        SourceKind::Zsh => {
-            let mut parser = source::zsh::Parser::new(reader);
-            let stored = store_records(&mut revision, kind, &mut parser, redactor)?;
-            (stored, parser.stable_len(), parser.dangling_meta(), parser.incomplete_tail().is_some())
+    // Under the write lock, so two first imports cannot each write a key.
+    let (key, key_warning) = match key_path.as_deref().map(|path| (path, key::load_or_create(path))) {
+        None => (None, None),
+        Some((path, Ok((key, created)))) => {
+            let lost = created && newest.as_ref().is_some_and(|r| r.cursor.boundary_guard.is_some());
+            let warning = lost.then(|| {
+                format!("installation key {} was missing or unreadable; wrote a new one and aligned this import by content", path.display())
+            });
+            (Some(key), warning)
         }
-        SourceKind::Bash => {
-            let mut parser = source::bash::Parser::new(reader);
-            let stored = store_records(&mut revision, kind, &mut parser, redactor)?;
-            (stored, parser.stable_len(), 0, parser.incomplete_tail().is_some())
+        Some((path, Err(e))) => (
+            None,
+            Some(format!("installation key {}: {e}; every import aligns by content until it can be written", path.display())),
+        ),
+    };
+
+    let mut aligned = 0;
+    let (mut revision, from, outcome) = match &newest {
+        None => (source.new_revision()?, 0, Outcome::First),
+        Some(newest) if prefix_intact(&file, key.as_ref(), &newest.cursor, stat.size)? => {
+            (source.append()?, newest.cursor.stable_len as u64, Outcome::Appended)
+        }
+        Some(_) => {
+            let anchor: Vec<RecordKey> = source
+                .anchor(ANCHOR_RECORDS)?
+                .iter()
+                .map(|(observed_at_ms, safe_text)| record_key(*observed_at_ms, safe_text))
+                .collect();
+            let (boundary, records) = align(&file, kind, redactor, &anchor)?;
+            aligned = records;
+            match boundary {
+                Some(from) => (source.append()?, from, Outcome::Aligned),
+                None => (source.new_revision()?, 0, Outcome::Superseded),
+            }
         }
     };
-    // No guard yet, so nothing may resume from stable_len until change
-    // detection lands (#24).
-    let cursor = Cursor { stat, stable_len: stable_len as i64, boundary_guard: None };
+
+    let (stored, scan) =
+        scan(&file, from, kind, |records| store_records(&mut revision, kind, records, redactor))?;
+    // The hint was taken before reading. If the file changed under the read,
+    // the records stored may not be the bytes on disk now: no guard may vouch
+    // for them, so the next import (which the stale hint forces) aligns.
+    let settled = stat_hint(&file.metadata().map_err(ImportError::Io)?) == stat;
+    let boundary_guard = match &key {
+        Some(key) if settled => Some(boundary_guard(&file, key, scan.stable_len).map_err(ImportError::Io)?),
+        _ => None,
+    };
+    let cursor = Cursor { stat, stable_len: scan.stable_len as i64, boundary_guard };
     let revision_id = revision.revision_id();
     revision.commit(&cursor, stored.provenance)?;
     Ok(ImportResult {
         records_stored: stored.count,
+        records_parsed: aligned + stored.count,
         revision_id,
-        skipped: false,
+        outcome,
+        key_warning,
         checkpoint_blocked: checkpoint_blocked(store, stored.count)?,
         lossy_records: stored.lossy,
-        dangling_meta,
-        incomplete_tail,
+        dangling_meta: scan.dangling_meta,
+        incomplete_tail: scan.incomplete_tail,
     })
+}
+
+/// What a pass over a file's records learned besides the records.
+struct Scan {
+    /// Byte end of the last complete record, from the start of the file.
+    stable_len: u64,
+    dangling_meta: u32,
+    incomplete_tail: bool,
+}
+
+/// Parse `file` from byte `from`, which must be where a record starts, and
+/// hand `run` the records with their offsets counted from the start of the
+/// file.
+fn scan<T>(
+    mut file: &fs::File,
+    from: u64,
+    kind: SourceKind,
+    run: impl FnOnce(&mut dyn Iterator<Item = io::Result<RawRecord>>) -> Result<T, ImportError>,
+) -> Result<(T, Scan), ImportError> {
+    file.seek(SeekFrom::Start(from)).map_err(ImportError::Io)?;
+    let reader = BufReader::new(file);
+    let absolute = |raw: io::Result<RawRecord>| {
+        raw.map(|mut raw| {
+            raw.start += from;
+            raw.end += from;
+            raw
+        })
+    };
+    let (out, stable_len, dangling_meta, incomplete_tail) = match kind {
+        SourceKind::Zsh => {
+            let mut parser = source::zsh::Parser::new(reader);
+            let out = run(&mut parser.by_ref().map(absolute))?;
+            (out, parser.stable_len(), parser.dangling_meta(), parser.incomplete_tail().is_some())
+        }
+        SourceKind::Bash => {
+            let mut parser = source::bash::Parser::new(reader);
+            let out = run(&mut parser.by_ref().map(absolute))?;
+            (out, parser.stable_len(), 0, parser.incomplete_tail().is_some())
+        }
+    };
+    Ok((out, Scan { stable_len: from + stable_len, dangling_meta, incomplete_tail }))
+}
+
+/// Keyed hash of the bytes just before `stable_len`.
+fn boundary_guard(file: &fs::File, key: &InstallationKey, stable_len: u64) -> io::Result<[u8; 32]> {
+    let window = stable_len.min(GUARD_WINDOW);
+    let mut bytes = vec![0; window as usize];
+    file.read_exact_at(&mut bytes, stable_len - window)?;
+    Ok(*blake3::keyed_hash(key, &bytes).as_bytes())
+}
+
+/// Whether the file still holds, where the cursor left them, the bytes the
+/// stored guard was taken over. Without a key or a stored guard nothing is
+/// proven.
+fn prefix_intact(
+    file: &fs::File,
+    key: Option<&InstallationKey>,
+    cursor: &Cursor,
+    size: i64,
+) -> Result<bool, ImportError> {
+    match (key, cursor.boundary_guard) {
+        (Some(key), Some(guard)) if (0..=size).contains(&cursor.stable_len) => {
+            Ok(boundary_guard(file, key, cursor.stable_len as u64).map_err(ImportError::Io)? == guard)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// What two records must share to be the same record across a rewrite.
+/// Unkeyed and never stored: both sides are recomputed from safe text.
+type RecordKey = [u8; 32];
+
+fn record_key(observed_at_ms: Option<i64>, safe_text: &str) -> RecordKey {
+    let mut hasher = blake3::Hasher::new();
+    // Tagged, so an untimed record cannot collide with a timed one whose
+    // time bytes happen to start its text.
+    match observed_at_ms {
+        Some(ms) => hasher.update(&[1]).update(&ms.to_le_bytes()),
+        None => hasher.update(&[0]),
+    };
+    *hasher.update(safe_text.as_bytes()).finalize().as_bytes()
+}
+
+/// Find where the stored records end in a rewritten file: the byte offset
+/// just past the last record the store already holds, or `None` when that
+/// cannot be placed uniquely. Also the number of records read.
+///
+/// A record is a candidate for "last stored" when it and the records before
+/// it, `ALIGN_WINDOW` in all, appear in that order in the anchor, with gaps
+/// allowed for records the shell dropped. Around the true boundary the
+/// candidates are one unbroken run ending at it; a second run means the same
+/// commands repeat elsewhere and the boundary is a guess.
+fn align(
+    file: &fs::File,
+    kind: SourceKind,
+    redactor: &Redactor,
+    anchor: &[RecordKey],
+) -> Result<(Option<u64>, usize), ImportError> {
+    // The revision holds no records, so every record in the file is new.
+    if anchor.is_empty() {
+        return Ok((Some(0), 0));
+    }
+    let width = anchor.len().min(ALIGN_WINDOW);
+    let obs_kind = observation_kind(kind);
+    let mut window = VecDeque::with_capacity(width);
+    let (mut records, mut runs, mut in_run, mut boundary) = (0, 0usize, false, 0);
+    scan(file, 0, kind, |parsed| {
+        for raw in parsed {
+            let raw = raw.map_err(ImportError::Io)?;
+            // Redacted first: the anchor's keys were taken over safe text.
+            let observation = raw_to_observation(&raw, obs_kind, redactor);
+            if window.len() == width {
+                window.pop_front();
+            }
+            window.push_back(record_key(observation.observed_at_ms, &observation.safe_text));
+            let mut later = anchor.iter();
+            let candidate = window.len() == width && window.iter().all(|key| later.any(|a| a == key));
+            if candidate {
+                runs += usize::from(!in_run);
+                boundary = raw.end;
+            }
+            in_run = candidate;
+            records += 1;
+        }
+        Ok(())
+    })?;
+    Ok(((runs == 1).then_some(boundary), records))
+}
+
+fn observation_kind(kind: SourceKind) -> ObservationKind {
+    match kind {
+        SourceKind::Zsh => ObservationKind::ZshCommand,
+        SourceKind::Bash => ObservationKind::BashCommand,
+    }
 }
 
 /// The path a source is known by: its directory with every symlink and `..`
@@ -148,11 +359,7 @@ fn store_records(
     records: impl Iterator<Item = io::Result<RawRecord>>,
     redactor: &Redactor,
 ) -> Result<Stored, ImportError> {
-    let obs_kind = match kind {
-        SourceKind::Zsh => ObservationKind::ZshCommand,
-        SourceKind::Bash => ObservationKind::BashCommand,
-    };
-
+    let obs_kind = observation_kind(kind);
     let mut stored = Stored { count: 0, lossy: 0, provenance: Provenance::COMMAND };
     for raw in records {
         let observation = raw_to_observation(&raw.map_err(ImportError::Io)?, obs_kind, redactor);
@@ -337,43 +544,378 @@ mod tests {
 
         // First import — should process.
         let r1 = import_file(&mut store, &history_path, SourceKind::Zsh, &redactor).unwrap();
-        assert!(!r1.skipped);
-        assert_eq!(r1.records_stored, 2);
+        assert_eq!((r1.outcome, r1.records_stored), (Outcome::First, 2));
 
         // Second import of the same unchanged file — should skip.
         let r2 = import_file(&mut store, &history_path, SourceKind::Zsh, &redactor).unwrap();
-        assert!(r2.skipped);
-        assert_eq!(r2.records_stored, 0);
+        assert_eq!((r2.outcome, r2.records_stored, r2.records_parsed), (Outcome::Unchanged, 0, 0));
 
         // Observations should still be 2, not doubled.
         assert_eq!(store.observation_count().unwrap(), 2);
     }
 
     #[test]
-    fn import_changed_file_reimports() {
+    fn without_a_key_an_append_is_aligned_by_content() {
         let dir = tempfile::tempdir().unwrap();
         let history_path = dir.path().join("zsh_history");
-        {
-            let mut f = fs::File::create(&history_path).unwrap();
-            writeln!(f, ": 1700000000:0;cargo build").unwrap();
-        }
-
+        fs::write(&history_path, zsh_history(0..1)).unwrap();
+        // In memory: no key file, so no guard is stored or checked.
         let mut store = Store::open_memory().unwrap();
         let redactor = Redactor::new();
 
         let r1 = import_file(&mut store, &history_path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!(r1.records_stored, 1);
+        assert_eq!((r1.outcome, r1.records_stored), (Outcome::First, 1));
 
-        // Append to the file: its stat hint no longer matches the stored one.
-        {
-            let mut f = fs::OpenOptions::new().append(true).open(&history_path).unwrap();
-            writeln!(f, ": 1700000001:0;cargo test").unwrap();
-        }
-
-        // A changed hint reimports the whole file as a new revision.
+        append(&history_path, &zsh_history(1..2));
         let r2 = import_file(&mut store, &history_path, SourceKind::Zsh, &redactor).unwrap();
-        assert!(!r2.skipped);
-        assert_eq!(r2.records_stored, 2);
+        assert_eq!((r2.outcome, r2.records_stored, r2.records_parsed), (Outcome::Aligned, 1, 3));
+        assert_eq!(r2.revision_id, r1.revision_id);
+        assert_eq!(texts(&store), ["echo needle 0", "echo needle 1"]);
+    }
+
+    /// Extended-format zsh history: one `echo needle <i>` per `i`.
+    fn zsh_history(range: std::ops::Range<usize>) -> String {
+        range.map(|i| format!(": {}:0;echo needle {i}\n", 1_700_000_000 + i)).collect()
+    }
+
+    fn append(path: &Path, content: &str) {
+        fs::OpenOptions::new().append(true).open(path).unwrap().write_all(content.as_bytes()).unwrap();
+    }
+
+    /// Replace a history the way zsh saves one: a new file renamed over it.
+    fn rewrite(path: &Path, content: &str) {
+        let tmp = path.with_extension("new");
+        fs::write(&tmp, content).unwrap();
+        fs::rename(&tmp, path).unwrap();
+    }
+
+    fn texts(store: &Store) -> Vec<String> {
+        stored(store).into_iter().map(|o| o.safe_text).collect()
+    }
+
+    fn needles(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| format!("echo needle {i}")).collect()
+    }
+
+    #[test]
+    fn an_append_parses_only_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let path = dir.path().join("zsh_history");
+        // Longer than the guard window, so the guard is taken mid-file.
+        fs::write(&path, zsh_history(0..3000)).unwrap();
+        let old_len = fs::metadata(&path).unwrap().len();
+        assert!(old_len > GUARD_WINDOW);
+        let mut store = Store::open(&db).unwrap();
+        let redactor = Redactor::new();
+
+        let first = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((first.outcome, first.records_parsed), (Outcome::First, 3000));
+
+        append(&path, &zsh_history(3000..3100));
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_parsed, r.records_stored), (Outcome::Appended, 100, 100));
+        assert_eq!(r.revision_id, first.revision_id);
+        assert_eq!(visible(&db), [1, 1, 3100, 3100, 3100]);
+        let appended = store.get_observation(3001).unwrap().unwrap();
+        assert_eq!((appended.safe_text.as_str(), appended.ordinal), ("echo needle 3000", 3000));
+        // Offsets count from the start of the file, not of the tail.
+        assert_eq!(appended.locator, old_len.to_le_bytes());
+        assert_eq!(stable_len(&mut store, &path), fs::metadata(&path).unwrap().len() as i64);
+
+        // The cursor an append leaves is as good as a first import's.
+        append(&path, &zsh_history(3100..3101));
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_parsed, r.records_stored), (Outcome::Appended, 1, 1));
+        assert_eq!(visible(&db), [1, 1, 3101, 3101, 3101]);
+    }
+
+    #[test]
+    fn a_bash_append_resumes_after_the_last_timed_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let path = dir.path().join("bash_history");
+        fs::write(&path, "#1700000000\necho one\n").unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let redactor = Redactor::new();
+        import_file(&mut store, &path, SourceKind::Bash, &redactor).unwrap();
+
+        append(&path, "#1700000001\necho two\nmore\n");
+        let r = import_file(&mut store, &path, SourceKind::Bash, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_parsed), (Outcome::Appended, 1));
+        let rows = stored(&store);
+        assert_eq!((rows[1].safe_text.as_str(), rows[1].observed_at_ms), ("echo two\nmore", Some(1_700_000_001_000)));
+        assert_eq!(rows[1].locator, 21u64.to_le_bytes());
+    }
+
+    #[test]
+    fn a_record_completed_after_an_import_is_stored_by_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let path = dir.path().join("zsh_history");
+        fs::write(&path, "echo done\necho parti").unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let redactor = Redactor::new();
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.records_stored, r.incomplete_tail), (1, true));
+
+        append(&path, "al\necho next\n");
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_stored, r.incomplete_tail), (Outcome::Appended, 2, false));
+        assert_eq!(texts(&store), ["echo done", "echo partial", "echo next"]);
+    }
+
+    #[test]
+    fn a_source_first_seen_empty_fills_its_first_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zsh_history");
+        let redactor = Redactor::new();
+        for (mut store, outcome) in [
+            (Store::open(&dir.path().join("relic.db")).unwrap(), Outcome::Appended),
+            (Store::open_memory().unwrap(), Outcome::Aligned),
+        ] {
+            fs::write(&path, "").unwrap();
+            let empty = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+            assert_eq!((empty.outcome, empty.records_stored), (Outcome::First, 0));
+
+            append(&path, &zsh_history(0..3));
+            let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+            assert_eq!((r.outcome, r.records_stored), (outcome, 3));
+            assert_eq!(r.revision_id, empty.revision_id);
+        }
+    }
+
+    #[test]
+    fn a_same_length_rewrite_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let path = dir.path().join("zsh_history");
+        fs::write(&path, "echo needle one\necho needle aaa\necho needle two\n").unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let redactor = Redactor::new();
+        let first = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+
+        // In place, as bash writes: same inode, same length.
+        fs::write(&path, "echo needle one\necho needle bbb\necho needle two\n").unwrap();
+        // Not left to the clock: a coarse one could stamp both writes alike.
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(mtime + std::time::Duration::from_secs(1)).unwrap();
+
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        // The edited record breaks the anchor, so nothing can be placed.
+        assert_eq!((r.outcome, r.records_stored), (Outcome::Superseded, 3));
+        assert_ne!(r.revision_id, first.revision_id);
+        assert_eq!(visible(&db), [1, 2, 6, 6, 6]);
+        assert_eq!(store.search("bbb", 10).unwrap().len(), 1);
+        assert_eq!(store.search("aaa", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_same_length_edit_tens_of_kilobytes_before_the_end_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let path = dir.path().join("zsh_history");
+        let content = zsh_history(0..3000);
+        fs::write(&path, &content).unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let redactor = Redactor::new();
+        import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+
+        let edited = content.replace("echo needle 1500\n", "echo needle 15oo\n");
+        let from_end = content.len() - content.find("echo needle 1500\n").unwrap();
+        assert!((32_768..GUARD_WINDOW as usize).contains(&from_end), "{from_end}");
+        fs::write(&path, &edited).unwrap();
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(mtime + std::time::Duration::from_secs(1)).unwrap();
+
+        // Not trusted as an append: the whole file was read again.
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_parsed, r.records_stored), (Outcome::Aligned, 3000, 0));
+    }
+
+    #[test]
+    fn a_head_trim_keeps_old_rows_and_adds_only_the_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let path = dir.path().join("zsh_history");
+        fs::write(&path, zsh_history(0..30)).unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let redactor = Redactor::new();
+        let first = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+
+        rewrite(&path, &zsh_history(10..33));
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_stored, r.records_parsed), (Outcome::Aligned, 3, 23 + 3));
+        assert_eq!(r.revision_id, first.revision_id);
+        assert_eq!(visible(&db), [1, 1, 33, 33, 33]);
+        assert_eq!(texts(&store), needles(0..33));
+        let rows = stored(&store);
+        assert_eq!(rows.iter().map(|o| o.ordinal).collect::<Vec<_>>(), (0..33).collect::<Vec<_>>());
+
+        // A trim with nothing new adds nothing, and leaves a usable cursor.
+        rewrite(&path, &zsh_history(20..33));
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_stored), (Outcome::Aligned, 0));
+        append(&path, &zsh_history(33..34));
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_stored, r.records_parsed), (Outcome::Appended, 1, 1));
+        assert_eq!(texts(&store), needles(0..34));
+        assert_eq!(visible(&db)[..2], [1, 1]);
+    }
+
+    #[test]
+    fn an_interior_removal_keeps_old_rows_and_adds_only_the_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let redactor = Redactor::new();
+        // HIST_IGNORE_ALL_DUPS: rerunning command 25 drops its old line and
+        // appends a new one, with a new time when the history is timed.
+        let plain: String = (0..30).map(|i| format!("echo needle {i}\n")).collect();
+        for (name, before, after, rerun_at) in [
+            (
+                "timed",
+                zsh_history(0..30),
+                zsh_history(0..25) + &zsh_history(26..30) + ": 1800000000:0;echo needle 25\n",
+                Some(1_800_000_000_000),
+            ),
+            (
+                "plain",
+                plain.clone(),
+                plain.replace("echo needle 25\n", "") + "echo needle 25\n",
+                None,
+            ),
+        ] {
+            let db = dir.path().join(format!("{name}.db"));
+            let path = dir.path().join(name);
+            fs::write(&path, before).unwrap();
+            let mut store = Store::open(&db).unwrap();
+            let first = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+
+            rewrite(&path, &after);
+            let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+            assert_eq!((r.outcome, r.records_stored), (Outcome::Aligned, 1), "{name}");
+            assert_eq!(r.revision_id, first.revision_id, "{name}");
+            assert_eq!(visible(&db), [1, 1, 31, 31, 31], "{name}");
+            let rows = stored(&store);
+            assert_eq!(rows[..30].iter().map(|o| o.safe_text.clone()).collect::<Vec<_>>(), needles(0..30), "{name}");
+            assert_eq!((rows[30].safe_text.as_str(), rows[30].observed_at_ms), ("echo needle 25", rerun_at), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_anchor_supersedes_and_keeps_the_old_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let path = dir.path().join("zsh_history");
+        fs::write(&path, "make needle\nmake test\nmake install\n").unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let redactor = Redactor::new();
+        let first = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+
+        // The stored three appear twice: either could be where they ended.
+        rewrite(&path, "cd a\nmake needle\nmake test\nmake install\ncd b\nmake needle\nmake test\nmake install\n");
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_stored), (Outcome::Superseded, 8));
+        assert_ne!(r.revision_id, first.revision_id);
+        assert_eq!(visible(&db), [1, 2, 11, 11, 3]);
+        let rows = stored(&store);
+        assert!(rows[..3].iter().all(|o| o.revision_id == first.revision_id));
+        assert!(rows[3..].iter().all(|o| o.revision_id == r.revision_id));
+
+        // The new revision is the one later imports continue.
+        append(&path, "cd c\n");
+        let next = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((next.outcome, next.records_stored, next.revision_id), (Outcome::Appended, 1, r.revision_id));
+    }
+
+    #[test]
+    fn removing_a_line_from_the_file_never_removes_it_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let path = dir.path().join("zsh_history");
+        fs::write(&path, zsh_history(0..12)).unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let redactor = Redactor::new();
+        import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+
+        // The last line goes, then one from the middle while a new one arrives.
+        rewrite(&path, &zsh_history(0..11));
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_stored), (Outcome::Aligned, 0));
+        assert_eq!(texts(&store), needles(0..12));
+
+        rewrite(&path, &(zsh_history(0..5) + &zsh_history(6..11) + &zsh_history(12..13)));
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_stored), (Outcome::Aligned, 1));
+        assert_eq!(texts(&store), needles(0..13));
+        assert_eq!(visible(&db), [1, 1, 13, 13, 13]);
+        for removed in ["5", "11"] {
+            assert_eq!(store.search(&format!("needle {removed}"), 10).unwrap().len(), 1, "{removed}");
+        }
+    }
+
+    #[test]
+    fn a_lost_key_creates_no_duplicate_source_and_the_next_import_aligns() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let redactor = Redactor::new();
+        for name in ["deleted", "garbled"] {
+            let db = dir.path().join(format!("{name}.db"));
+            let key = dir.path().join(format!("{name}.db.key"));
+            let path = dir.path().join(name);
+            fs::write(&path, zsh_history(0..20)).unwrap();
+            let mut store = Store::open(&db).unwrap();
+            let first = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+            assert!(first.key_warning.is_none(), "{name}");
+            assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600, "{name}");
+            let old_key = fs::read(&key).unwrap();
+
+            match name {
+                "deleted" => fs::remove_file(&key).unwrap(),
+                _ => fs::write(&key, b"not a key").unwrap(),
+            }
+            append(&path, &zsh_history(20..25));
+            let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+            // The whole file was read to find the anchor, then the tail again.
+            assert_eq!((r.outcome, r.records_stored, r.records_parsed), (Outcome::Aligned, 5, 25 + 5), "{name}");
+            assert!(r.key_warning.is_some(), "{name}");
+            assert_eq!(visible(&db), [1, 1, 25, 25, 25], "{name}");
+            assert_eq!(texts(&store), needles(0..25), "{name}");
+            let new_key = fs::read(&key).unwrap();
+            assert_eq!(new_key.len(), 32, "{name}");
+            assert_ne!(new_key, old_key, "{name}");
+            assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600, "{name}");
+
+            // The fresh key guards the next append.
+            append(&path, &zsh_history(25..30));
+            let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+            assert_eq!((r.outcome, r.records_parsed), (Outcome::Appended, 5), "{name}");
+            assert!(r.key_warning.is_none(), "{name}");
+            assert_eq!(visible(&db), [1, 1, 30, 30, 30], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_written_is_reported_and_imports_still_align() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let path = dir.path().join("zsh_history");
+        // A directory where the key file belongs: unreadable and unwritable.
+        fs::create_dir_all(dir.path().join("relic.db.key/occupied")).unwrap();
+        fs::write(&path, zsh_history(0..5)).unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let redactor = Redactor::new();
+
+        let first = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!(first.records_stored, 5);
+        assert!(first.key_warning.is_some());
+
+        append(&path, &zsh_history(5..7));
+        let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_stored), (Outcome::Aligned, 2));
+        assert!(r.key_warning.is_some());
+        assert_eq!(visible(&db), [1, 1, 7, 7, 7]);
     }
 
     /// One new revision of `locator` holding `records`, as `import_file`
@@ -491,7 +1033,7 @@ mod tests {
             waiter.join().unwrap()
         });
 
-        assert!(waiter.unwrap().skipped);
+        assert_eq!(waiter.unwrap().outcome, Outcome::Unchanged);
         assert_eq!(visible(&db), [1, 1, 1, 1, 1]);
     }
 
@@ -721,7 +1263,8 @@ mod tests {
         std::os::unix::fs::symlink(dir.path(), &via).unwrap();
         let r = import_file(&mut store, &via.join("real_history"), SourceKind::Zsh, &Redactor::new()).unwrap();
         assert_eq!(r.records_stored, 1);
-        assert!(import_file(&mut store, &target, SourceKind::Zsh, &Redactor::new()).unwrap().skipped);
+        let again = import_file(&mut store, &target, SourceKind::Zsh, &Redactor::new()).unwrap();
+        assert_eq!(again.outcome, Outcome::Unchanged);
     }
 
     #[test]

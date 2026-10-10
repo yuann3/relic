@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use relic::app::{self, MatchMode, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
-use relic::import::{ImportError, ImportResult, SourceKind, import_file};
+use relic::import::{ImportError, ImportResult, Outcome, SourceKind, import_file};
 use relic::picker::PickError;
 use relic::store::{Store, StoreError};
 
@@ -75,7 +75,16 @@ fn run(cmd: Command) -> Result<ExitCode> {
             if r.incomplete_tail {
                 eprintln!("relic: note: {}: the last record is incomplete and was not stored", path.display());
             }
-            if r.skipped {
+            if let Some(warning) = &r.key_warning {
+                eprintln!("relic: note: {warning}");
+            }
+            if r.outcome == Outcome::Superseded {
+                eprintln!(
+                    "relic: note: {}: rewritten beyond what relic could align; stored whole as a new revision, earlier records kept",
+                    path.display()
+                );
+            }
+            if r.outcome == Outcome::Unchanged {
                 eprintln!("{}: unchanged since last import", path.display());
             } else {
                 eprintln!("{}: stored {} commands in {}", path.display(), r.records_stored, db.display());

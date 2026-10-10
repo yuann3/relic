@@ -3,6 +3,7 @@ pub mod cli;
 pub mod domain;
 pub mod fixture;
 pub mod import;
+pub mod key;
 pub mod picker;
 pub mod redact;
 pub mod rlm;
