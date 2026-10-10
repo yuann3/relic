@@ -1480,6 +1480,11 @@ mod tests {
         assert_eq!(visible(&db)[..4], [1, 1, 2, 2]);
         assert!(store.search("1700000000", 10).unwrap().is_empty());
         assert_eq!(store.search("alpha", 10).unwrap().len(), 1);
+        // The index holds exactly the rows that are left, not just fewer hits.
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("INSERT INTO observation_fts (observation_fts) VALUES ('integrity-check')", [])
+            .unwrap();
 
         // The corrected kind is the stored one: no --shell, no second replace.
         let r = import_file(&mut store, &path, None, &redactor).unwrap();
