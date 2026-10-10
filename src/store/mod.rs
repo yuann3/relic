@@ -86,6 +86,10 @@ impl<'a> SourceLock<'a> {
     /// Open a new revision, creating the source on first sight.
     pub fn new_revision(self) -> Result<RevisionTx<'a>, StoreError> {
         let Self { tx, locator, kind, .. } = self;
+        let parser_contract = match kind {
+            SourceKind::Zsh => crate::source::zsh::PARSER_CONTRACT,
+            SourceKind::Bash => crate::source::bash::PARSER_CONTRACT,
+        };
         let known: Option<i64> = tx
             .query_row("SELECT id FROM source WHERE private_locator = ?1", [locator], |r| r.get(0))
             .optional()?;
@@ -100,8 +104,8 @@ impl<'a> SourceLock<'a> {
                 };
                 tx.execute(
                     "INSERT INTO source (logical_id, kind, private_locator, parser_contract, enabled)
-                     VALUES (?1, ?2, ?3, 'v1', 1)",
-                    rusqlite::params![logical_id.as_slice(), kind_int, locator],
+                     VALUES (?1, ?2, ?3, ?4, 1)",
+                    rusqlite::params![logical_id.as_slice(), kind_int, locator, parser_contract],
                 )?;
                 tx.last_insert_rowid()
             }
@@ -115,8 +119,8 @@ impl<'a> SourceLock<'a> {
         tx.execute(
             "INSERT INTO source_revision (source_id, dev, ino, size, mtime_ns, ctime_ns,
                 stable_len, provenance, parser_contract, redaction_revision, imported_at_ms)
-             VALUES (?1, 0, 0, 0, 0, 0, 0, 0, 'v1', 'r1', ?2)",
-            rusqlite::params![source_id, now_ms],
+             VALUES (?1, 0, 0, 0, 0, 0, 0, 0, ?2, 'r1', ?3)",
+            rusqlite::params![source_id, parser_contract, now_ms],
         )?;
         let revision_id = tx.last_insert_rowid();
         Ok(RevisionTx { tx, revision_id, next_ordinal: 0 })

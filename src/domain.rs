@@ -52,6 +52,11 @@ impl Provenance {
     }
 }
 
+/// Bit in `Observation::flags`: `safe_text` is not the source's exact text.
+/// The record was cut at the per-record cap, had a dangling zsh Meta byte
+/// dropped, or was not valid UTF-8.
+pub const FLAG_LOSSY: i64 = 1;
+
 /// A sanitized observation ready for storage. The open revision assigns its
 /// revision and ordinal.
 #[derive(Debug, Clone)]

@@ -1,146 +1,157 @@
-use super::RawRecord;
+use std::io::{self, BufRead};
 
-/// Parse zsh history bytes (supports both plain and extended format).
+use super::{Lines, RECORD_CAP, RawRecord, decode};
+
+/// v2: unmetafied, CRLF-tolerant, capped per record, whitespace-only
+/// commands dropped, trailing partial record withheld.
+pub const PARSER_CONTRACT: &str = "zsh-v2";
+
+/// Streams zsh history records (plain and extended format).
 ///
 /// Extended format: `: <timestamp>:<duration>;<command>`
 /// Plain format: `<command>` (one per logical line)
 /// Backslash-newline joins continuation lines into one logical record.
-pub fn parse(input: &[u8]) -> Vec<RawRecord> {
-    let mut records = Vec::new();
-    let mut pos = 0;
-    let len = input.len();
-
-    while pos < len {
-        let record_start = pos;
-
-        // Collect one logical line (joining backslash-newline continuations).
-        let (line, next_pos) = read_logical_line(input, pos);
-        pos = next_pos;
-
-        if line.is_empty() {
-            continue;
-        }
-
-        // Try extended format: `: <timestamp>:<duration>;<command>`
-        if let Some(record) = try_parse_extended(&line, record_start) {
-            records.push(record);
-        } else {
-            // Plain format: the whole line is the command.
-            records.push(RawRecord {
-                timestamp: None,
-                duration: None,
-                command: line,
-                byte_offset: record_start,
-            });
-        }
-    }
-
-    records
+pub struct Parser<R> {
+    lines: Lines<R>,
+    stable_len: u64,
+    incomplete_tail: Option<RawRecord>,
 }
 
-/// Read one logical line from the byte buffer starting at `pos`.
-/// Joins backslash-newline continuations. Returns (decoded_line, next_pos).
-fn read_logical_line(input: &[u8], mut pos: usize) -> (String, usize) {
-    let mut buf = Vec::new();
-    let len = input.len();
+impl<R: BufRead> Parser<R> {
+    pub fn new(reader: R) -> Self {
+        Self { lines: Lines::new(reader, true), stable_len: 0, incomplete_tail: None }
+    }
 
-    while pos < len {
-        let b = input[pos];
-        if b == b'\n' {
-            pos += 1;
-            // Check if the previous byte was a backslash (continuation).
-            if buf.last() == Some(&b'\\') {
-                buf.pop(); // remove the backslash
-                buf.push(b'\n'); // preserve the newline in the command text
-                continue;
+    /// Byte end of the last complete record read so far, stored or not.
+    pub fn stable_len(&self) -> u64 {
+        self.stable_len
+    }
+
+    /// The input's last record once the input is exhausted, if it ended
+    /// without its newline or on a dangling continuation. Never yielded: the
+    /// shell may still be writing it.
+    pub fn incomplete_tail(&self) -> Option<&RawRecord> {
+        self.incomplete_tail.as_ref()
+    }
+
+    /// How many Meta bytes had nothing to decode.
+    pub fn dangling_meta(&self) -> u32 {
+        self.lines.dangling_meta
+    }
+}
+
+impl<R: BufRead> Iterator for Parser<R> {
+    type Item = io::Result<RawRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let start = self.lines.offset;
+            let mut bytes = Vec::new();
+            let mut lossy = false;
+            let complete = loop {
+                let line = match self.lines.read_into(&mut bytes) {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break false,
+                    Err(e) => return Some(Err(e)),
+                };
+                lossy |= line.lossy();
+                if !line.terminated {
+                    break false;
+                }
+                if line.last != Some(b'\\') {
+                    break true;
+                }
+                // A cut line's backslash was never buffered.
+                if !line.cut {
+                    bytes.pop();
+                }
+                if bytes.len() < RECORD_CAP {
+                    bytes.push(b'\n');
+                } else {
+                    lossy = true;
+                }
+            };
+            let end = self.lines.offset;
+            if end == start {
+                return None;
             }
-            break;
+            let record = record(bytes, start, end, lossy);
+            if !complete {
+                self.incomplete_tail = Some(record);
+                return None;
+            }
+            self.stable_len = end;
+            if !record.command.trim().is_empty() {
+                return Some(Ok(record));
+            }
         }
-        buf.push(b);
-        pos += 1;
     }
-
-    let line = String::from_utf8_lossy(&buf).into_owned();
-    (line, pos)
 }
 
-/// Try parsing a line as zsh extended format: `: <timestamp>:<duration>;<command>`
-fn try_parse_extended(line: &str, byte_offset: usize) -> Option<RawRecord> {
-    let rest = line.strip_prefix(": ")?;
+fn record(bytes: Vec<u8>, start: u64, end: u64, mut lossy: bool) -> RawRecord {
+    let line = decode(bytes, &mut lossy);
+    match split_extended(&line) {
+        Some((timestamp, duration, command)) => {
+            RawRecord { timestamp, duration, command: command.to_string(), start, end, lossy }
+        }
+        None => RawRecord { timestamp: None, duration: None, command: line, start, end, lossy },
+    }
+}
 
-    let colon_pos = rest.find(':')?;
-    let timestamp: i64 = rest[..colon_pos].parse().ok()?;
-
-    let after_colon = &rest[colon_pos + 1..];
-    let semi_pos = after_colon.find(';')?;
-    let duration: i64 = after_colon[..semi_pos].parse().ok()?;
-
-    let command = after_colon[semi_pos + 1..].to_string();
-
-    Some(RawRecord {
-        timestamp: Some(timestamp),
-        duration: Some(duration),
-        command,
-        byte_offset,
-    })
+/// Split `: <timestamp>:<duration>;<command>`. A field of digits too long
+/// for an i64 is absent rather than a reason to store the prefix as command
+/// text.
+fn split_extended(line: &str) -> Option<(Option<i64>, Option<i64>, &str)> {
+    let (timestamp, rest) = line.strip_prefix(": ")?.split_once(':')?;
+    let (duration, command) = rest.split_once(';')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(timestamp) || !digits(duration) {
+        return None;
+    }
+    Some((timestamp.parse().ok(), duration.parse().ok(), command))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::testing::FailsAfter;
+    use std::io::BufReader;
 
-    #[test]
-    fn parse_extended_single_command() {
-        let input = b": 1700000000:0;cargo build --release\n";
-        let records = parse(input);
+    fn parse(input: &[u8]) -> Vec<RawRecord> {
+        Parser::new(input).map(Result::unwrap).collect()
+    }
 
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].timestamp, Some(1_700_000_000));
-        assert_eq!(records[0].duration, Some(0));
-        assert_eq!(records[0].command, "cargo build --release");
+    fn commands(input: &[u8]) -> Vec<String> {
+        parse(input).into_iter().map(|r| r.command).collect()
     }
 
     #[test]
-    fn parse_extended_multiple_commands() {
-        let input = b": 1700000000:0;cargo build\n: 1700000001:5;cargo test\n: 1700000010:2;git push\n";
-        let records = parse(input);
-
-        assert_eq!(records.len(), 3);
+    fn parse_extended_commands() {
+        let records = parse(b": 1700000000:0;cargo build\n: 1700000001:5;cargo test\n");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].timestamp, Some(1_700_000_000));
+        assert_eq!(records[0].duration, Some(0));
         assert_eq!(records[0].command, "cargo build");
-        assert_eq!(records[1].command, "cargo test");
         assert_eq!(records[1].duration, Some(5));
-        assert_eq!(records[2].command, "git push");
-        assert_eq!(records[2].timestamp, Some(1_700_000_010));
+        assert_eq!(records[1].command, "cargo test");
     }
 
     #[test]
     fn parse_plain_format() {
-        let input = b"ls -la\ncd /tmp\npwd\n";
-        let records = parse(input);
-
-        assert_eq!(records.len(), 3);
+        let records = parse(b"ls -la\ncd /tmp\n");
         assert_eq!(records[0].command, "ls -la");
         assert_eq!(records[0].timestamp, None);
         assert_eq!(records[1].command, "cd /tmp");
-        assert_eq!(records[2].command, "pwd");
     }
 
     #[test]
     fn parse_backslash_newline_continuation() {
-        let input = b": 1700000000:0;echo hello \\\nworld\n";
-        let records = parse(input);
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].command, "echo hello \nworld");
+        assert_eq!(commands(b": 1700000000:0;echo hello \\\nworld\n"), ["echo hello \nworld"]);
     }
 
     #[test]
     fn parse_mixed_extended_and_plain() {
-        // This shouldn't normally happen, but the parser should handle it.
-        let input = b": 1700000000:0;cargo build\nplain command\n";
-        let records = parse(input);
-
-        assert_eq!(records.len(), 2);
+        let records = parse(b": 1700000000:0;cargo build\nplain command\n");
         assert_eq!(records[0].timestamp, Some(1_700_000_000));
         assert_eq!(records[1].timestamp, None);
         assert_eq!(records[1].command, "plain command");
@@ -148,46 +159,131 @@ mod tests {
 
     #[test]
     fn parse_empty_input() {
-        let records = parse(b"");
-        assert!(records.is_empty());
+        assert!(parse(b"").is_empty());
     }
 
     #[test]
-    fn parse_no_trailing_newline() {
-        let input = b": 1700000000:0;cargo build";
-        let records = parse(input);
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].command, "cargo build");
-    }
-
-    #[test]
-    fn parse_preserves_byte_offsets() {
-        let input = b": 1700000000:0;first\n: 1700000001:0;second\n";
-        let records = parse(input);
-
-        assert_eq!(records[0].byte_offset, 0);
-        assert_eq!(records[1].byte_offset, 21);
-    }
-
-    #[test]
-    fn parse_skips_empty_lines() {
-        let input = b"cargo build\n\n\ncargo test\n";
-        let records = parse(input);
-
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].command, "cargo build");
-        assert_eq!(records[1].command, "cargo test");
+    fn records_carry_their_start_and_end_offsets() {
+        let records = parse(b": 1700000000:0;first\n\n: 1700000001:0;se\\\ncond\n");
+        assert_eq!((records[0].start, records[0].end), (0, 21));
+        assert_eq!((records[1].start, records[1].end), (22, 46));
     }
 
     #[test]
     fn parse_malformed_extended_falls_back_to_plain() {
-        // Missing semicolon — should be treated as plain.
-        let input = b": 1700000000:0 missing semicolon\n";
-        let records = parse(input);
-
-        assert_eq!(records.len(), 1);
+        let records = parse(b": 1700000000:0 missing semicolon\n");
         assert_eq!(records[0].timestamp, None);
         assert_eq!(records[0].command, ": 1700000000:0 missing semicolon");
+    }
+
+    #[test]
+    fn yields_the_first_record_before_the_source_fails() {
+        let input = b": 1700000000:0;first\n: 1700000001:0;second\n: 1700000002:0;thi";
+        // An 8-byte buffer: the parser cannot have read ahead to the failure.
+        let mut parser = Parser::new(BufReader::with_capacity(8, FailsAfter(input)));
+        assert_eq!(parser.next().unwrap().unwrap().command, "first");
+        assert_eq!(parser.next().unwrap().unwrap().command, "second");
+        assert!(parser.next().unwrap().is_err());
+        assert_eq!(parser.stable_len(), 43);
+    }
+
+    #[test]
+    fn meta_pairs_decode_before_utf8() {
+        // zsh 5.9 writes U+90E8 (E9 83 A8) as E9 83 A3 A8.
+        let records = parse(b": 1700000000:0;echo \xE9\x83\xA3\xA8\n");
+        assert_eq!(records[0].command, "echo \u{90E8}");
+        assert!(!records[0].lossy);
+    }
+
+    #[test]
+    fn a_metafied_backslash_or_cr_is_handled_after_decoding() {
+        // Meta 0x7C is `\`, Meta 0x2D is CR.
+        assert_eq!(commands(b"echo a\x83\x7C\nb\x83\x2D\nnext\n"), ["echo a\nb", "next"]);
+    }
+
+    #[test]
+    fn meta_at_eof_warns_and_marks_the_withheld_record_lossy() {
+        let mut parser = Parser::new(&b"echo ok\necho \x83"[..]);
+        assert_eq!(parser.by_ref().map(|r| r.unwrap().command).collect::<Vec<_>>(), ["echo ok"]);
+        assert_eq!(parser.dangling_meta(), 1);
+        let tail = parser.incomplete_tail().unwrap();
+        assert_eq!(tail.command, "echo ");
+        assert!(tail.lossy);
+        assert_eq!(parser.stable_len(), 8);
+    }
+
+    #[test]
+    fn meta_before_a_newline_is_dangling_and_keeps_the_record_boundary() {
+        let mut parser = Parser::new(&b"echo a\x83\necho b\n"[..]);
+        let records: Vec<_> = parser.by_ref().map(Result::unwrap).collect();
+        assert_eq!(records[0].command, "echo a");
+        assert!(records[0].lossy);
+        assert_eq!(records[1].command, "echo b");
+        assert!(!records[1].lossy);
+        assert_eq!(parser.dangling_meta(), 1);
+    }
+
+    #[test]
+    fn invalid_utf8_is_flagged_lossy() {
+        let records = parse(b"echo \xFF\n");
+        assert_eq!(records[0].command, "echo \u{FFFD}");
+        assert!(records[0].lossy);
+    }
+
+    #[test]
+    fn a_record_without_its_newline_is_withheld() {
+        let mut parser = Parser::new(&b": 1700000000:0;done\n: 1700000001:0;cargo bui"[..]);
+        assert_eq!(parser.by_ref().count(), 1);
+        assert_eq!(parser.stable_len(), 20);
+        assert_eq!(parser.incomplete_tail().unwrap().command, "cargo bui");
+    }
+
+    #[test]
+    fn a_dangling_continuation_is_withheld() {
+        let mut parser = Parser::new(&b"done\necho one \\\n"[..]);
+        assert_eq!(parser.by_ref().count(), 1);
+        assert_eq!(parser.stable_len(), 5);
+        assert_eq!(parser.incomplete_tail().unwrap().command, "echo one \n");
+    }
+
+    #[test]
+    fn crlf_endings_are_stripped_and_a_lone_cr_is_kept() {
+        assert_eq!(
+            commands(b": 1700000000:0;echo a\\\r\nb\r\nprintf 'x\ry'\r\n"),
+            ["echo a\nb", "printf 'x\ry'"]
+        );
+    }
+
+    #[test]
+    fn whitespace_only_commands_are_dropped_but_advance_the_boundary() {
+        let mut parser = Parser::new(&b"ls\n\n: 1700000000:0;  \t\n   \n"[..]);
+        assert_eq!(parser.by_ref().map(|r| r.unwrap().command).collect::<Vec<_>>(), ["ls"]);
+        assert_eq!(parser.stable_len(), 27);
+        assert!(parser.incomplete_tail().is_none());
+    }
+
+    #[test]
+    fn a_timestamp_too_long_for_i64_is_absent() {
+        let records = parse(b": 99999999999999999999:0;echo late\n");
+        assert_eq!(records[0].timestamp, None);
+        assert_eq!(records[0].command, "echo late");
+    }
+
+    #[test]
+    fn an_oversized_record_is_cut_at_the_cap_and_the_next_one_survives() {
+        let mut input = b": 1700000000:0;".to_vec();
+        input.resize(input.len() + RECORD_CAP + 4096, b'a');
+        input.extend_from_slice(b"\\\ntail of the same record\n: 1700000001:0;next\n");
+        let end_of_first = (input.len() - b": 1700000001:0;next\n".len()) as u64;
+
+        let records = parse(&input);
+        assert_eq!(records.len(), 2);
+        assert!(records[0].lossy);
+        assert_eq!(records[0].timestamp, Some(1_700_000_000));
+        assert_eq!(records[0].command.len(), RECORD_CAP - b": 1700000000:0;".len());
+        assert!(records[0].command.bytes().all(|b| b == b'a'));
+        assert_eq!(records[0].end, end_of_first);
+        assert_eq!(records[1].command, "next");
+        assert!(!records[1].lossy);
     }
 }

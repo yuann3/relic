@@ -64,6 +64,17 @@ fn run(cmd: Command) -> Result<ExitCode> {
             if r.checkpoint_blocked {
                 eprintln!("relic: note: WAL not checkpointed: a reader is active; the next large import retries");
             }
+            if r.lossy_records > 0 || r.dangling_meta > 0 {
+                eprintln!(
+                    "relic: warning: {}: {} commands stored lossy (cut, or not decodable); {} dangling zsh Meta bytes",
+                    path.display(),
+                    r.lossy_records,
+                    r.dangling_meta
+                );
+            }
+            if r.incomplete_tail {
+                eprintln!("relic: note: {}: the last record is incomplete and was not stored", path.display());
+            }
             if r.skipped {
                 eprintln!("{}: unchanged since last import", path.display());
             } else {

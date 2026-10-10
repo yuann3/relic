@@ -179,8 +179,7 @@ mod tests {
     #[test]
     fn generate_zsh_correct_count() {
         let data = generate_zsh_history(1000, 42);
-        let records = crate::source::zsh::parse(&data);
-        assert_eq!(records.len(), 1000);
+        assert_eq!(crate::source::zsh::Parser::new(&data[..]).count(), 1000);
     }
 
     #[test]
@@ -193,7 +192,6 @@ mod tests {
     #[test]
     fn generate_bash_correct_count() {
         let data = generate_bash_history(1000, 42);
-        let records = crate::source::bash::parse(&data);
-        assert_eq!(records.len(), 1000);
+        assert_eq!(crate::source::bash::Parser::new(&data[..]).count(), 1000);
     }
 }
