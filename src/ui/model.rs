@@ -729,7 +729,7 @@ fn on_recall_event(m: &mut UiModel, op: u64, event: RecallEvent) -> Vec<UiEffect
 mod tests {
     use super::*;
     use crate::app::{PageHit, SEARCH_SCHEMA};
-    use crate::domain::{ObservationKind, StoredObservation};
+    use crate::domain::{ObservationKind, Provenance, StoredObservation};
 
     fn hit(id: i64, text: &str) -> PageHit {
         PageHit {
@@ -763,10 +763,7 @@ mod tests {
             kind: ObservationKind::ZshCommand,
             observed_at_ms: Some(1_700_000_000_000),
             safe_text: text.into(),
-            safe_hash: vec![],
-            keyed_fingerprint: vec![],
             flags: 0,
-            provenance: vec![],
             locator: vec![],
         }
     }
@@ -778,6 +775,7 @@ mod tests {
                 .map(|i| obs(i, &format!("row {i}")))
                 .collect(),
             bounds: Default::default(),
+            provenance: Provenance::COMMAND.with(Provenance::OBSERVED_AT),
         }
     }
 

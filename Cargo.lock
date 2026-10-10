@@ -644,6 +644,7 @@ name = "relic"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "getrandom",
  "libc",
  "ratatui",
  "rusqlite",

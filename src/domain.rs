@@ -24,18 +24,42 @@ impl ObservationKind {
     }
 }
 
-/// A sanitized observation ready for storage.
+/// Which observation fields a revision's source file itself encodes. A field
+/// outside the set is absent for that revision, never inferred. One value per
+/// revision instead of a blob per row (ADR 0008); a single row still says
+/// "no time" with a NULL `observed_at_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Provenance(u8);
+
+impl Provenance {
+    pub const COMMAND: Self = Self(1);
+    pub const OBSERVED_AT: Self = Self(2);
+
+    pub fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub fn has(self, field: Self) -> bool {
+        self.0 & field.0 == field.0
+    }
+
+    pub fn as_i64(self) -> i64 {
+        self.0 as i64
+    }
+
+    pub fn from_i64(v: i64) -> Self {
+        Self(v as u8)
+    }
+}
+
+/// A sanitized observation ready for storage. The open revision assigns its
+/// revision and ordinal.
 #[derive(Debug, Clone)]
 pub struct Observation {
-    pub revision_id: i64,
-    pub ordinal: i64,
     pub kind: ObservationKind,
     pub observed_at_ms: Option<i64>,
     pub safe_text: String,
-    pub safe_hash: Vec<u8>,
-    pub keyed_fingerprint: Vec<u8>,
     pub flags: i64,
-    pub provenance: Vec<u8>,
     pub locator: Vec<u8>,
 }
 
@@ -48,10 +72,7 @@ pub struct StoredObservation {
     pub kind: ObservationKind,
     pub observed_at_ms: Option<i64>,
     pub safe_text: String,
-    pub safe_hash: Vec<u8>,
-    pub keyed_fingerprint: Vec<u8>,
     pub flags: i64,
-    pub provenance: Vec<u8>,
     pub locator: Vec<u8>,
 }
 

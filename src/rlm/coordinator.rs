@@ -368,12 +368,12 @@ fn build_root_state_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Observation, ObservationKind};
+    use crate::domain::{Observation, ObservationKind, Provenance};
+    use crate::import::SourceKind;
+    use crate::store::Cursor;
     use crate::rlm::model::FakeModel;
 
     fn seed_corpus(store: &mut Store) -> i64 {
-        let rev_id = store.insert_raw_source_and_revision().unwrap();
-
         // 50 commands: most generic, with "certbot renew" at ordinal 25
         // and "certbot status" at ordinal 26.
         let cmds: Vec<String> = (0..50)
@@ -384,23 +384,19 @@ mod tests {
             })
             .collect();
 
-        let obs: Vec<Observation> = cmds
-            .iter()
-            .enumerate()
-            .map(|(i, cmd)| Observation {
-                revision_id: rev_id,
-                ordinal: i as i64,
+        let mut rev = store.begin_revision(b"/h", SourceKind::Zsh).unwrap();
+        let rev_id = rev.revision_id();
+        for (i, cmd) in cmds.iter().enumerate() {
+            rev.insert(&Observation {
                 kind: ObservationKind::ZshCommand,
                 observed_at_ms: Some(1_700_000_000_000 + i as i64),
                 safe_text: cmd.clone(),
-                safe_hash: vec![0; 4],
-                keyed_fingerprint: vec![0; 4],
                 flags: 0,
-                provenance: vec![],
                 locator: vec![],
             })
-            .collect();
-        store.insert_observations(&obs).unwrap();
+            .unwrap();
+        }
+        rev.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
         rev_id
     }
 
@@ -522,10 +518,7 @@ mod tests {
                 kind: ObservationKind::ZshCommand,
                 observed_at_ms: Some(1_700_000_000_000),
                 safe_text: format!("command number {i} with some padding text"),
-                safe_hash: vec![0; 4],
-                keyed_fingerprint: vec![0; 4],
                 flags: 0,
-                provenance: vec![],
                 locator: vec![],
             }];
             registry.insert_evidence_set(obs);

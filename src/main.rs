@@ -4,8 +4,9 @@ use std::process::ExitCode;
 
 use relic::app::{self, MatchMode, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
+use relic::import::{ImportError, ImportResult, SourceKind, import_file};
 use relic::picker::PickError;
-use relic::store::Store;
+use relic::store::{Store, StoreError};
 
 fn main() -> ExitCode {
     let cmd = match cli::parse(std::env::args_os().skip(1)) {
@@ -53,13 +54,13 @@ fn run(cmd: Command) -> Result<ExitCode> {
             if let Some(dir) = db.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            let mut store = Store::open(&db)?;
-            let r = relic::import::import_file(
-                &mut store,
-                &path,
-                shell,
-                &relic::redact::Redactor::new(),
-            )?;
+            let r = match import(&db, &path, shell) {
+                Err(ImportError::Busy) => {
+                    eprintln!("relic: busy: another import is writing {}; try again", db.display());
+                    return Ok(ExitCode::from(2));
+                }
+                r => r?,
+            };
             if r.skipped {
                 eprintln!("{}: unchanged since last import", path.display());
             } else {
@@ -68,6 +69,12 @@ fn run(cmd: Command) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn import(db: &Path, path: &Path, shell: SourceKind) -> std::result::Result<ImportResult, ImportError> {
+    // Opening writes too, so a busy store can already refuse here.
+    let mut store = Store::open(db).map_err(StoreError::from)?;
+    import_file(&mut store, path, shell, &relic::redact::Redactor::new())
 }
 
 fn search(args: SearchArgs) -> Result<ExitCode> {

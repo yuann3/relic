@@ -260,10 +260,7 @@ mod tests {
             kind: ObservationKind::ZshCommand,
             observed_at_ms: Some(1_700_000_000_000),
             safe_text: text.to_string(),
-            safe_hash: vec![0; 4],
-            keyed_fingerprint: vec![0; 4],
             flags: 0,
-            provenance: vec![],
             locator: vec![],
         }
     }

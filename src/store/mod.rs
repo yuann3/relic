@@ -2,8 +2,133 @@ mod schema;
 
 pub use schema::SCHEMA_VERSION;
 
-use crate::domain::{Observation, ObservationKind, SearchHit, StoredObservation};
-use rusqlite::Connection;
+use crate::domain::{Observation, ObservationKind, Provenance, SearchHit, StoredObservation};
+use crate::import::SourceKind;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+
+/// A failed write to the store.
+#[derive(Debug)]
+pub enum StoreError {
+    /// Another connection held the write lock past the 250 ms busy_timeout.
+    Busy,
+    Sqlite(rusqlite::Error),
+    /// The OS random source failed while minting a source's logical id.
+    Entropy(getrandom::Error),
+}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(e: rusqlite::Error) -> Self {
+        match e.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::DatabaseBusy) => Self::Busy,
+            _ => Self::Sqlite(e),
+        }
+    }
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => write!(f, "busy: another relic import is writing the store"),
+            Self::Sqlite(e) => write!(f, "{e}"),
+            Self::Entropy(e) => write!(f, "no random bytes for a source id: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// What `stat` said about a source file when it was imported. Equal hints
+/// mean the file is unchanged; `(dev, ino)` is never identity (ADR 0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatHint {
+    pub dev: i64,
+    pub ino: i64,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+}
+
+/// Where the next import of a source resumes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Cursor {
+    pub stat: StatHint,
+    /// Byte end of the last committed record.
+    pub stable_len: i64,
+    /// Keyed hash of the bytes just before `stable_len`. `None` proves
+    /// nothing about the prefix, so the next import must not trust it.
+    pub boundary_guard: Option<[u8; 32]>,
+}
+
+/// A source's newest revision and its cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewestRevision {
+    pub revision_id: i64,
+    pub cursor: Cursor,
+}
+
+/// An open write transaction on one revision. Nothing inserted through it is
+/// visible to any reader until `commit`; dropping it rolls everything back,
+/// including a revision and source row it created (ADR 0005).
+pub struct RevisionTx<'a> {
+    tx: Transaction<'a>,
+    revision_id: i64,
+    next_ordinal: i64,
+}
+
+impl RevisionTx<'_> {
+    pub fn revision_id(&self) -> i64 {
+        self.revision_id
+    }
+
+    /// Append one observation and its FTS row. Returns the row ID.
+    pub fn insert(&mut self, o: &Observation) -> Result<i64, StoreError> {
+        self.tx
+            .prepare_cached(
+                "INSERT INTO observation (revision_id, ordinal, kind, observed_at_ms, safe_text,
+                    flags, locator)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?
+            .execute(rusqlite::params![
+                self.revision_id,
+                self.next_ordinal,
+                o.kind.as_i64(),
+                o.observed_at_ms,
+                o.safe_text,
+                o.flags,
+                o.locator,
+            ])?;
+        let id = self.tx.last_insert_rowid();
+        self.tx
+            .prepare_cached("INSERT INTO observation_fts (rowid, safe_text) VALUES (?1, ?2)")?
+            .execute(rusqlite::params![id, o.safe_text])?;
+        self.next_ordinal += 1;
+        Ok(id)
+    }
+
+    /// Record where the import stopped and make the whole revision visible.
+    /// `provenance` is added to what the revision already claims.
+    pub fn commit(self, cursor: &Cursor, provenance: Provenance) -> Result<(), StoreError> {
+        self.tx.execute(
+            "UPDATE source_revision
+             SET dev = ?2, ino = ?3, size = ?4, mtime_ns = ?5, ctime_ns = ?6,
+                 stable_len = ?7, boundary_guard = ?8, provenance = provenance | ?9
+             WHERE id = ?1",
+            rusqlite::params![
+                self.revision_id,
+                cursor.stat.dev,
+                cursor.stat.ino,
+                cursor.stat.size,
+                cursor.stat.mtime_ns,
+                cursor.stat.ctime_ns,
+                cursor.stable_len,
+                cursor.boundary_guard.as_ref().map(<[u8; 32]>::as_slice),
+                provenance.as_i64(),
+            ],
+        )?;
+        self.tx.commit()?;
+        Ok(())
+    }
+}
 
 /// Local observation store backed by SQLite + FTS5.
 pub struct Store {
@@ -44,75 +169,99 @@ impl Store {
             .map(|v| v.parse::<i64>().unwrap_or(0))
     }
 
-    /// Create a source (if not exists) and a new import revision. Returns revision_id.
-    pub fn create_import_revision(
-        &self,
-        path: &std::path::Path,
-        kind: crate::import::SourceKind,
-        file_len: i64,
-    ) -> Result<i64, rusqlite::Error> {
-        let path_bytes = path.to_string_lossy();
-        let kind_int: i64 = match kind {
-            crate::import::SourceKind::Zsh => 1,
-            crate::import::SourceKind::Bash => 2,
+    /// Open a new revision of the source at `locator`, creating the source on
+    /// first sight. BEGIN IMMEDIATE takes the write lock up front, so a second
+    /// importer fails here with `Busy` instead of midway through its inserts.
+    pub fn begin_revision(
+        &mut self,
+        locator: &[u8],
+        kind: SourceKind,
+    ) -> Result<RevisionTx<'_>, StoreError> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let known: Option<i64> = tx
+            .query_row("SELECT id FROM source WHERE private_locator = ?1", [locator], |r| r.get(0))
+            .optional()?;
+        let source_id = match known {
+            Some(id) => id,
+            None => {
+                let mut logical_id = [0u8; 16];
+                getrandom::fill(&mut logical_id).map_err(StoreError::Entropy)?;
+                let kind_int: i64 = match kind {
+                    SourceKind::Zsh => 1,
+                    SourceKind::Bash => 2,
+                };
+                tx.execute(
+                    "INSERT INTO source (logical_id, kind, private_locator, parser_contract, enabled)
+                     VALUES (?1, ?2, ?3, 'v1', 1)",
+                    rusqlite::params![logical_id.as_slice(), kind_int, locator],
+                )?;
+                tx.last_insert_rowid()
+            }
         };
-        let logical_id = path_bytes.as_bytes();
 
-        // Upsert source.
-        self.conn.execute(
-            "INSERT OR IGNORE INTO source (logical_id, kind, private_locator, parser_contract, enabled)
-             VALUES (?1, ?2, ?3, ?4, 1)",
-            rusqlite::params![logical_id, kind_int, path_bytes.as_bytes(), "v1"],
-        )?;
-        let source_id: i64 = self.conn.query_row(
-            "SELECT id FROM source WHERE logical_id = ?1",
-            [logical_id],
-            |row| row.get(0),
-        )?;
-
-        // Create revision.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-
-        self.conn.execute(
-            "INSERT INTO source_revision (source_id, revision_key, opened_len, stable_len,
-                boundary_guard, snapshot_fingerprint, parser_contract, redaction_revision,
-                imported_at_ms, complete)
-             VALUES (?1, ?2, ?3, ?3, X'00', X'00', 'v1', 'r1', ?4, 0)",
-            rusqlite::params![source_id, now_ms.to_le_bytes().as_slice(), file_len, now_ms],
+        // The cursor is only known once the records are read; `commit` writes it.
+        tx.execute(
+            "INSERT INTO source_revision (source_id, dev, ino, size, mtime_ns, ctime_ns,
+                stable_len, provenance, parser_contract, redaction_revision, imported_at_ms)
+             VALUES (?1, 0, 0, 0, 0, 0, 0, 0, 'v1', 'r1', ?2)",
+            rusqlite::params![source_id, now_ms],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let revision_id = tx.last_insert_rowid();
+        Ok(RevisionTx { tx, revision_id, next_ordinal: 0 })
     }
 
-    /// Mark a revision as complete.
-    pub fn complete_revision(&self, revision_id: i64) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "UPDATE source_revision SET complete = 1 WHERE id = ?1",
+    /// Reopen an existing revision to append records after its last one.
+    pub fn append_revision(&mut self, revision_id: i64) -> Result<RevisionTx<'_>, StoreError> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let next_ordinal = tx.query_row(
+            "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM observation WHERE revision_id = ?1",
             [revision_id],
+            |r| r.get(0),
         )?;
-        Ok(())
+        Ok(RevisionTx { tx, revision_id, next_ordinal })
     }
 
-    /// Check if a source already has a complete revision with the given file length.
-    /// Returns true if the file is unchanged and can be skipped.
-    pub fn has_unchanged_revision(
-        &self,
-        path: &std::path::Path,
-        file_len: i64,
-    ) -> Result<bool, rusqlite::Error> {
-        let path_bytes = path.to_string_lossy();
-        let logical_id = path_bytes.as_bytes();
+    /// The newest revision of the source at `locator`, if it was ever imported.
+    pub fn newest_revision(&self, locator: &[u8]) -> Result<Option<NewestRevision>, rusqlite::Error> {
+        self.conn
+            .query_row(
+                "SELECT sr.id, sr.dev, sr.ino, sr.size, sr.mtime_ns, sr.ctime_ns,
+                        sr.stable_len, sr.boundary_guard
+                 FROM source s JOIN source_revision sr ON sr.source_id = s.id
+                 WHERE s.private_locator = ?1
+                 ORDER BY sr.id DESC LIMIT 1",
+                [locator],
+                |r| {
+                    Ok(NewestRevision {
+                        revision_id: r.get(0)?,
+                        cursor: Cursor {
+                            stat: StatHint {
+                                dev: r.get(1)?,
+                                ino: r.get(2)?,
+                                size: r.get(3)?,
+                                mtime_ns: r.get(4)?,
+                                ctime_ns: r.get(5)?,
+                            },
+                            stable_len: r.get(6)?,
+                            boundary_guard: r.get(7)?,
+                        },
+                    })
+                },
+            )
+            .optional()
+    }
 
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM source s
-             JOIN source_revision sr ON sr.source_id = s.id
-             WHERE s.logical_id = ?1 AND sr.stable_len = ?2 AND sr.complete = 1",
-            rusqlite::params![logical_id, file_len],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+    /// Which fields the revision's source file encodes.
+    pub fn revision_provenance(&self, revision_id: i64) -> Result<Provenance, rusqlite::Error> {
+        self.conn.query_row(
+            "SELECT provenance FROM source_revision WHERE id = ?1",
+            [revision_id],
+            |r| r.get(0).map(Provenance::from_i64),
+        )
     }
 
     /// Count total observations in the store.
@@ -120,66 +269,10 @@ impl Store {
         self.conn.query_row("SELECT COUNT(*) FROM observation", [], |row| row.get(0))
     }
 
-    /// Create a dummy source + revision for tests. Returns the revision_id.
-    pub fn insert_raw_source_and_revision(&self) -> Result<i64, rusqlite::Error> {
-        self.conn.execute(
-            "INSERT INTO source (logical_id, kind, private_locator, parser_contract, enabled)
-             VALUES (X'01', 1, X'00', 'zsh/v1', 1)",
-            [],
-        )?;
-        let source_id = self.conn.last_insert_rowid();
-        self.conn.execute(
-            "INSERT INTO source_revision (source_id, revision_key, opened_len, stable_len,
-                boundary_guard, snapshot_fingerprint, parser_contract, redaction_revision,
-                imported_at_ms, complete)
-             VALUES (?1, X'AA', 1000, 1000, X'BB', X'CC', 'zsh/v1', 'r1', 0, 1)",
-            [source_id],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Checkpoint the WAL. Call after large imports to compact the database.
+    /// Fold the WAL into the database file and truncate it.
     pub fn checkpoint(&self) -> Result<(), rusqlite::Error> {
         self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
-    }
-
-    /// Insert observations in a batch transaction. Returns assigned row IDs.
-    pub fn insert_observations(&mut self, obs: &[Observation]) -> Result<Vec<i64>, rusqlite::Error> {
-        let tx = self.conn.transaction()?;
-        let mut ids = Vec::with_capacity(obs.len());
-
-        {
-            let mut insert_obs = tx.prepare_cached(
-                "INSERT INTO observation (revision_id, ordinal, kind, observed_at_ms, safe_text,
-                    safe_hash, keyed_fingerprint, flags, provenance, locator)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
-            let mut insert_fts = tx.prepare_cached(
-                "INSERT INTO observation_fts (rowid, safe_text) VALUES (?1, ?2)",
-            )?;
-
-            for o in obs {
-                insert_obs.execute(rusqlite::params![
-                    o.revision_id,
-                    o.ordinal,
-                    o.kind.as_i64(),
-                    o.observed_at_ms,
-                    o.safe_text,
-                    o.safe_hash,
-                    o.keyed_fingerprint,
-                    o.flags,
-                    o.provenance,
-                    o.locator,
-                ])?;
-                let id = tx.last_insert_rowid();
-                insert_fts.execute(rusqlite::params![id, o.safe_text])?;
-                ids.push(id);
-            }
-        }
-
-        tx.commit()?;
-        Ok(ids)
     }
 
     /// Search observations via FTS5. Query terms are escaped (no raw FTS syntax).
@@ -323,7 +416,7 @@ impl Store {
         let hi = center_ordinal + after as i64;
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, revision_id, ordinal, kind, observed_at_ms, safe_text,
-                    safe_hash, keyed_fingerprint, flags, provenance, locator
+                    flags, locator
              FROM observation
              WHERE revision_id = ?1 AND ordinal >= ?2 AND ordinal <= ?3
              ORDER BY ordinal",
@@ -338,7 +431,7 @@ impl Store {
     pub fn get_observation(&self, id: i64) -> Result<Option<StoredObservation>, rusqlite::Error> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, revision_id, ordinal, kind, observed_at_ms, safe_text,
-                    safe_hash, keyed_fingerprint, flags, provenance, locator
+                    flags, locator
              FROM observation WHERE id = ?1",
         )?;
         let mut rows = stmt.query([id])?;
@@ -377,11 +470,8 @@ fn row_to_stored_observation(row: &rusqlite::Row<'_>) -> Result<StoredObservatio
         kind: ObservationKind::from_i64(kind_val).unwrap_or(ObservationKind::ZshCommand),
         observed_at_ms: row.get(4)?,
         safe_text: row.get(5)?,
-        safe_hash: row.get(6)?,
-        keyed_fingerprint: row.get(7)?,
-        flags: row.get(8)?,
-        provenance: row.get(9)?,
-        locator: row.get(10)?,
+        flags: row.get(6)?,
+        locator: row.get(7)?,
     })
 }
 
@@ -389,38 +479,22 @@ fn row_to_stored_observation(row: &rusqlite::Row<'_>) -> Result<StoredObservatio
 mod tests {
     use super::*;
 
-    /// Insert a dummy source + revision so FK constraints are satisfied.
-    /// Returns the revision_id.
-    fn setup_revision(store: &Store) -> i64 {
-        store.conn.execute(
-            "INSERT INTO source (logical_id, kind, private_locator, parser_contract, enabled)
-             VALUES (X'01', 1, X'00', 'zsh/v1', 1)",
-            [],
-        ).unwrap();
-        let source_id = store.conn.last_insert_rowid();
-        store.conn.execute(
-            "INSERT INTO source_revision (source_id, revision_key, opened_len, stable_len,
-                boundary_guard, snapshot_fingerprint, parser_contract, redaction_revision,
-                imported_at_ms, complete)
-             VALUES (?1, X'AA', 1000, 1000, X'BB', X'CC', 'zsh/v1', 'r1', 0, 1)",
-            [source_id],
-        ).unwrap();
-        store.conn.last_insert_rowid()
-    }
-
-    fn make_observation(revision_id: i64, ordinal: i64, text: &str) -> Observation {
+    fn make_observation(ordinal: i64, text: &str) -> Observation {
         Observation {
-            revision_id,
-            ordinal,
             kind: ObservationKind::ZshCommand,
             observed_at_ms: Some(1_700_000_000_000 + ordinal),
             safe_text: text.to_string(),
-            safe_hash: vec![0; 4],
-            keyed_fingerprint: vec![0; 4],
             flags: 0,
-            provenance: vec![],
             locator: vec![],
         }
+    }
+
+    /// Commit `obs` as one new revision. Returns the row IDs.
+    fn insert(store: &mut Store, obs: &[Observation]) -> Vec<i64> {
+        let mut rev = store.begin_revision(b"/h", SourceKind::Zsh).unwrap();
+        let ids = obs.iter().map(|o| rev.insert(o).unwrap()).collect();
+        rev.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
+        ids
     }
 
     #[test]
@@ -470,28 +544,26 @@ mod tests {
     #[test]
     fn insert_and_read_observation() {
         let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
 
-        let obs = make_observation(rev_id, 0, "cargo build --release");
-        let ids = store.insert_observations(&[obs]).unwrap();
+        let obs = make_observation(0, "cargo build --release");
+        let ids = insert(&mut store, &[obs]);
         assert_eq!(ids.len(), 1);
 
         let stored = store.get_observation(ids[0]).unwrap().expect("should exist");
         assert_eq!(stored.safe_text, "cargo build --release");
         assert_eq!(stored.kind, ObservationKind::ZshCommand);
         assert_eq!(stored.ordinal, 0);
-        assert_eq!(stored.revision_id, rev_id);
+        assert_eq!(stored.revision_id, 1);
     }
 
     #[test]
     fn insert_batch_assigns_sequential_ids() {
         let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
 
         let batch: Vec<Observation> = (0..5)
-            .map(|i| make_observation(rev_id, i, &format!("cmd_{i}")))
+            .map(|i| make_observation(i, &format!("cmd_{i}")))
             .collect();
-        let ids = store.insert_observations(&batch).unwrap();
+        let ids = insert(&mut store, &batch);
 
         assert_eq!(ids.len(), 5);
         for (i, &id) in ids.iter().enumerate() {
@@ -512,13 +584,12 @@ mod tests {
     #[test]
     fn search_finds_matching_observations() {
         let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
 
-        store.insert_observations(&[
-            make_observation(rev_id, 0, "cargo build --release"),
-            make_observation(rev_id, 1, "git push origin main"),
-            make_observation(rev_id, 2, "cargo test --lib"),
-        ]).unwrap();
+        insert(&mut store, &[
+            make_observation(0, "cargo build --release"),
+            make_observation(1, "git push origin main"),
+            make_observation(2, "cargo test --lib"),
+        ]);
 
         let hits = store.search("cargo", 10).unwrap();
         assert_eq!(hits.len(), 2);
@@ -531,12 +602,11 @@ mod tests {
     #[test]
     fn search_respects_limit() {
         let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
 
         let batch: Vec<Observation> = (0..20)
-            .map(|i| make_observation(rev_id, i, &format!("cargo command_{i}")))
+            .map(|i| make_observation(i, &format!("cargo command_{i}")))
             .collect();
-        store.insert_observations(&batch).unwrap();
+        insert(&mut store, &batch);
 
         let hits = store.search("cargo", 5).unwrap();
         assert_eq!(hits.len(), 5);
@@ -552,11 +622,10 @@ mod tests {
     #[test]
     fn search_no_match_returns_empty() {
         let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
 
-        store.insert_observations(&[
-            make_observation(rev_id, 0, "cargo build"),
-        ]).unwrap();
+        insert(&mut store, &[
+            make_observation(0, "cargo build"),
+        ]);
 
         let hits = store.search("nonexistent_term", 10).unwrap();
         assert!(hits.is_empty());
@@ -565,11 +634,10 @@ mod tests {
     #[test]
     fn recent_prefix_matches_partial_last_word() {
         let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
-        store.insert_observations(&[
-            make_observation(rev_id, 0, "git push origin main"),
-            make_observation(rev_id, 1, "cargo build"),
-        ]).unwrap();
+        insert(&mut store, &[
+            make_observation(0, "git push origin main"),
+            make_observation(1, "cargo build"),
+        ]);
 
         assert!(store.search("gi", 10).unwrap().is_empty());
         let hits = store.search_recent_prefix("gi", 10).unwrap();
@@ -583,8 +651,7 @@ mod tests {
     #[test]
     fn recent_prefix_does_not_pass_fts_syntax_through() {
         let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
-        store.insert_observations(&[make_observation(rev_id, 0, "echo NEAR(a b)")]).unwrap();
+        insert(&mut store, &[make_observation(0, "echo NEAR(a b)")]);
 
         // A stray quote or operator in user input must not become FTS syntax.
         assert!(store.search_recent_prefix("\"", 10).unwrap().is_empty());
@@ -594,14 +661,13 @@ mod tests {
     #[test]
     fn recent_prefix_orders_newest_first() {
         let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
         // BM25 would put the shortest row first; recency must not.
-        store.insert_observations(&[
-            make_observation(rev_id, 0, "git"),
-            make_observation(rev_id, 1, "git commit -m one two three four"),
-            make_observation(rev_id, 2, "ls"),
-            make_observation(rev_id, 3, "git push origin main --force"),
-        ]).unwrap();
+        insert(&mut store, &[
+            make_observation(0, "git"),
+            make_observation(1, "git commit -m one two three four"),
+            make_observation(2, "ls"),
+            make_observation(3, "git push origin main --force"),
+        ]);
 
         let texts = |hits: Vec<SearchHit>| hits.into_iter().map(|h| h.safe_text).collect::<Vec<_>>();
         assert_eq!(
@@ -615,15 +681,14 @@ mod tests {
     #[test]
     fn untimed_hits_are_bounded_by_the_next_timed_command() {
         let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
-        let untimed = |o, t| Observation { observed_at_ms: None, ..make_observation(rev_id, o, t) };
-        store.insert_observations(&[
+        let untimed = |o, t| Observation { observed_at_ms: None, ..make_observation(o, t) };
+        insert(&mut store, &[
             untimed(0, "ssh old-host"),
             untimed(1, "brew install gh"),
-            make_observation(rev_id, 2, "cd Developer"),
-            make_observation(rev_id, 3, "ssh new-host"),
+            make_observation(2, "cd Developer"),
+            make_observation(3, "ssh new-host"),
             untimed(4, "ssh trailing"),
-        ]).unwrap();
+        ]);
 
         let hits = store.search("ssh", 10).unwrap();
         let by_text = |t: &str| hits.iter().find(|h| h.safe_text == t).unwrap();
@@ -653,15 +718,124 @@ mod tests {
     #[test]
     fn search_escapes_fts_operators() {
         let mut store = Store::open_memory().unwrap();
-        let rev_id = setup_revision(&store);
 
         // Insert text that contains FTS operator-like chars.
-        store.insert_observations(&[
-            make_observation(rev_id, 0, "git log --oneline OR --graph"),
-        ]).unwrap();
+        insert(&mut store, &[
+            make_observation(0, "git log --oneline OR --graph"),
+        ]);
 
         // Searching for "OR" as a literal word should not break.
         let hits = store.search("OR", 10).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    // --- Revision transactions (ADR 0005) ---
+
+    fn count(store: &Store, table: &str) -> i64 {
+        store.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_dropped_revision_leaves_nothing_behind() {
+        let mut store = Store::open_memory().unwrap();
+        let mut rev = store.begin_revision(b"/h", SourceKind::Zsh).unwrap();
+        rev.insert(&make_observation(0, "cargo build")).unwrap();
+        drop(rev);
+
+        for table in ["source", "source_revision", "observation", "observation_fts_docsize"] {
+            assert_eq!(count(&store, table), 0, "{table}");
+        }
+        assert!(store.search("cargo", 10).unwrap().is_empty());
+        assert_eq!(store.newest_revision(b"/h").unwrap(), None);
+    }
+
+    #[test]
+    fn append_continues_the_revision_or_changes_nothing() {
+        let mut store = Store::open_memory().unwrap();
+        insert(&mut store, &[make_observation(0, "one"), make_observation(1, "two")]);
+        let first = store.newest_revision(b"/h").unwrap().unwrap();
+
+        let mut rev = store.append_revision(first.revision_id).unwrap();
+        rev.insert(&make_observation(2, "abandoned")).unwrap();
+        drop(rev);
+        assert_eq!(store.newest_revision(b"/h").unwrap().unwrap(), first);
+        assert!(store.search("abandoned", 10).unwrap().is_empty());
+
+        let cursor = Cursor {
+            stat: StatHint { dev: 1, ino: 2, size: 30, mtime_ns: 4, ctime_ns: 5 },
+            stable_len: 30,
+            boundary_guard: Some([7; 32]),
+        };
+        let mut rev = store.append_revision(first.revision_id).unwrap();
+        let id = rev.insert(&make_observation(2, "three")).unwrap();
+        rev.commit(&cursor, Provenance::OBSERVED_AT).unwrap();
+
+        let three = store.get_observation(id).unwrap().unwrap();
+        assert_eq!((three.revision_id, three.ordinal), (first.revision_id, 2));
+        assert_eq!(store.search("three", 10).unwrap().len(), 1);
+        assert_eq!(
+            store.newest_revision(b"/h").unwrap().unwrap(),
+            NewestRevision { revision_id: first.revision_id, cursor }
+        );
+        // The append adds to what the revision already claimed.
+        assert_eq!(
+            store.revision_provenance(first.revision_id).unwrap(),
+            Provenance::COMMAND.with(Provenance::OBSERVED_AT)
+        );
+    }
+
+    #[test]
+    fn a_locator_is_one_source_with_a_random_logical_id() {
+        let mut store = Store::open_memory().unwrap();
+        insert(&mut store, &[make_observation(0, "one")]);
+        insert(&mut store, &[make_observation(0, "two")]);
+        let mut other = store.begin_revision(b"/other", SourceKind::Bash).unwrap();
+        other.insert(&make_observation(0, "three")).unwrap();
+        other.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
+
+        assert_eq!(count(&store, "source"), 2);
+        assert_eq!(count(&store, "source_revision"), 3);
+        let ids: Vec<Vec<u8>> = store
+            .conn
+            .prepare("SELECT logical_id FROM source")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(ids.iter().all(|id| id.len() == 16));
+        assert_ne!(ids[0], ids[1]);
+        // The path must not leak into the public id.
+        assert!(!ids.iter().any(|id| id.windows(2).any(|w| w == b"/h")));
+    }
+
+    #[test]
+    fn read_only_reader_searches_while_an_import_transaction_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let mut store = Store::open(&db).unwrap();
+        insert(&mut store, &[make_observation(0, "needle committed")]);
+
+        let mut writing = store.begin_revision(b"/other", SourceKind::Zsh).unwrap();
+        writing.insert(&make_observation(0, "needle pending")).unwrap();
+
+        let reader = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        let found = |reader: &Connection| -> Vec<String> {
+            reader
+                .prepare(
+                    "SELECT o.safe_text FROM observation_fts f JOIN observation o ON o.id = f.rowid
+                     WHERE observation_fts MATCH 'needle' ORDER BY o.id",
+                )
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(found(&reader), ["needle committed"]);
+
+        writing.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
+        assert_eq!(found(&reader), ["needle committed", "needle pending"]);
     }
 }

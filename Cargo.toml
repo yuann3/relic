@@ -10,6 +10,7 @@ tui = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
 crossterm = { version = "0.29", optional = true, default-features = false, features = ["events", "bracketed-paste"] }
+getrandom = "0.4"
 libc = "0.2"
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm_0_29", "unstable-rendered-line-info"] }
 rusqlite = { version = "0.35", features = ["bundled", "modern_sqlite"] }

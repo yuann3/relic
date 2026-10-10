@@ -12,6 +12,7 @@ use super::model::{
     RecallStatus, StepState, UiModel,
 };
 use crate::app::{MIN_PREFIX_CHARS, When, display_line, source_label};
+use crate::domain::Provenance;
 
 /// Below this the panes cannot show a usable row, so say so instead.
 pub const MIN_WIDTH: u16 = 40;
@@ -285,12 +286,10 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             Span::raw(value),
         ])
     };
-    // The importer stores an empty provenance blob today. Say so rather than
-    // imply a source location we do not have.
-    let provenance = if o.provenance.is_empty() {
-        "not recorded (store keeps none yet)".to_string()
-    } else {
-        format!("{} bytes, not decoded by the prototype", o.provenance.len())
+    let provenance = match m.evidence.view.as_ref().map(|v| v.provenance) {
+        Some(p) if p.has(Provenance::OBSERVED_AT) => "text, time from file",
+        Some(_) => "text only from file",
+        None => "unknown",
     };
     let mut lines = vec![
         field("id", format!("#{}", o.id)),
@@ -300,7 +299,7 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             "revision",
             format!("{} · ordinal {}", o.revision_id, o.ordinal),
         ),
-        field("provenance", provenance),
+        field("provenance", provenance.to_string()),
         Line::raw(""),
         Line::styled("exact text, redacted at import:", t.title),
     ];
@@ -636,6 +635,7 @@ mod tests {
         let s = text(&render(&typed(&store, "certb", false), 120, 40));
         assert!(s.contains("hit  unknown     certbot renew"), "{s}");
         assert!(!s.contains("hit wn time"), "{s}");
+        assert!(s.contains("provenance: text only from file"), "{s}");
     }
 
     #[test]
@@ -661,7 +661,7 @@ mod tests {
             "cd /etc/nginx",
             "hit  11-14 22:13 certbot renew",
             "11-14 22:13 systemctl relo",
-            "provenance: not recorded",
+            "provenance: text, time from file",
             "revision: 1 · ordinal 1",
             "exact text, redacted at import:",
             "status: idle",
@@ -699,7 +699,7 @@ mod tests {
         tab(&mut m);
         let s = text(&render(&m, 80, 24));
         assert!(
-            s.contains("[Evidence]") && s.contains("provenance: not recorded"),
+            s.contains("[Evidence]") && s.contains("provenance: text, time from file"),
             "{s}"
         );
         tab(&mut m);
@@ -833,16 +833,14 @@ mod tests {
             kind: ObservationKind::ZshCommand,
             observed_at_ms: Some(0),
             safe_text: text.into(),
-            safe_hash: vec![],
-            keyed_fingerprint: vec![],
             flags: 0,
-            provenance: vec![],
             locator: vec![],
         };
         let view = EvidenceView {
             observation: o.clone(),
             timeline: vec![o],
             bounds: Default::default(),
+            provenance: Provenance::COMMAND.with(Provenance::OBSERVED_AT),
         };
         update(
             &mut m,
