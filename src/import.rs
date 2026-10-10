@@ -18,6 +18,15 @@ pub enum SourceKind {
     Bash,
 }
 
+impl std::fmt::Display for SourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Zsh => "zsh",
+            Self::Bash => "bash",
+        })
+    }
+}
+
 /// How an import related the file to what the store already held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Outcome {
@@ -38,8 +47,13 @@ pub enum Outcome {
 }
 
 /// Result of an import operation.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ImportResult {
+    /// The shell the file was read as: asked for, else stored, else detected.
+    pub kind: SourceKind,
+    /// The source was stored as this other shell: that many records, parsed
+    /// by the wrong grammar, were deleted before this import.
+    pub replaced: Option<(SourceKind, usize)>,
     pub records_stored: usize,
     /// Records the parser yielded, over every pass this import made.
     pub records_parsed: usize,
@@ -56,6 +70,24 @@ pub struct ImportResult {
     pub dangling_meta: u32,
     /// The file ended in a partial record, which was not stored.
     pub incomplete_tail: bool,
+}
+
+impl ImportResult {
+    fn unchanged(kind: SourceKind) -> Self {
+        Self {
+            kind,
+            replaced: None,
+            records_stored: 0,
+            records_parsed: 0,
+            revision_id: 0,
+            outcome: Outcome::Unchanged,
+            key_warning: None,
+            checkpoint_blocked: false,
+            lossy_records: 0,
+            dangling_meta: 0,
+            incomplete_tail: false,
+        }
+    }
 }
 
 /// A single-transaction import leaves the whole import in the WAL, and
@@ -81,33 +113,104 @@ const ANCHOR_RECORDS: usize = 16;
 /// place the boundary on its own.
 const ALIGN_WINDOW: usize = 8;
 
+/// A history file opened for import, before any store exists: everything
+/// that can be wrong with the file alone is refused here, so a failed first
+/// import need not create a database.
+pub struct History {
+    path: PathBuf,
+    resolved: PathBuf,
+    file: fs::File,
+    stat: StatHint,
+    detected: Option<SourceKind>,
+}
+
+impl History {
+    pub fn open(path: &Path) -> Result<Self, ImportError> {
+        // An OS error alone does not say which file it was about.
+        let named = |e: ImportError| match e {
+            ImportError::Io(e) => ImportError::Io(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+            e => e,
+        };
+        let resolved = resolve(path).map_err(named)?;
+        let file = open_no_follow(&resolved).map_err(named)?;
+        // fstat on the open file: the hint describes the bytes this import
+        // reads, even when the name is renamed over meanwhile.
+        let metadata = file.metadata().map_err(ImportError::Io)?;
+        // Before reading: a device never ends.
+        if !metadata.is_file() {
+            return Err(ImportError::NotRegularFile(path.to_path_buf()));
+        }
+        let detected = detect(&file, &resolved).map_err(ImportError::Io)?;
+        Ok(Self { path: path.to_path_buf(), resolved, file, stat: stat_hint(&metadata), detected })
+    }
+
+    /// The shell the file's content or name gives away, if either does.
+    pub fn detected(&self) -> Option<SourceKind> {
+        self.detected
+    }
+}
+
+/// How much of a file is read to tell its shell.
+const DETECT_WINDOW: usize = 65536;
+
+/// Which shell wrote `file`: its content first (a zsh extended-history line
+/// or a bash `#<epoch>` marker near the start), then its name. `None` when
+/// neither says, or when the content says both.
+fn detect(file: &fs::File, resolved: &Path) -> io::Result<Option<SourceKind>> {
+    let mut head = vec![0; DETECT_WINDOW];
+    let read = file.read_at(&mut head, 0)?;
+    let head = &head[..read];
+    // The parsers decide, so detection cannot disagree with the grammar.
+    let zsh = source::zsh::Parser::new(head).any(|r| r.is_ok_and(|r| r.timestamp.is_some()));
+    let bash = source::bash::Parser::new(head).any(|r| r.is_ok_and(|r| r.timestamp.is_some()));
+    let name = resolved.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+    Ok(match (zsh, bash) {
+        (true, false) => Some(SourceKind::Zsh),
+        (false, true) => Some(SourceKind::Bash),
+        _ if name.contains("zsh") || name.contains("zhistory") => Some(SourceKind::Zsh),
+        _ if name.contains("bash") => Some(SourceKind::Bash),
+        _ => None,
+    })
+}
+
 /// Import a history file. Unchanged since the last import: nothing is read.
 /// Grown: only the new tail is parsed. Rewritten: the records after the
 /// stored ones are added, or the whole file becomes a new revision when the
-/// stored ones cannot be found. Nothing already stored is ever removed.
+/// stored ones cannot be found. Nothing already stored is ever removed,
+/// except by a `shell` that differs from the one the source was stored as.
 pub fn import_file(
     store: &mut Store,
     path: &Path,
-    kind: SourceKind,
+    shell: impl Into<Option<SourceKind>>,
     redactor: &Redactor,
 ) -> Result<ImportResult, ImportError> {
-    let resolved = resolve(path)?;
+    import(store, &History::open(path)?, shell.into(), redactor)
+}
+
+pub fn import(
+    store: &mut Store,
+    history: &History,
+    shell: Option<SourceKind>,
+    redactor: &Redactor,
+) -> Result<ImportResult, ImportError> {
+    let History { file, stat, .. } = history;
+    let stat = *stat;
     let key_path = store.key_path().map(Path::to_path_buf);
     // Lock before looking: an importer that decided first and then waited for
     // another import of this file would store the file a second time.
-    let source = store.lock_source(resolved.as_os_str().as_bytes(), kind)?;
-    let file = open_no_follow(&resolved)?;
-    // fstat on the open file: the hint describes the bytes this import reads,
-    // even when the name is renamed over meanwhile.
-    let metadata = file.metadata().map_err(ImportError::Io)?;
-    // Before reading: a device never ends.
-    if !metadata.is_file() {
-        return Err(ImportError::NotRegularFile(path.to_path_buf()));
-    }
-    let stat = stat_hint(&metadata);
+    let mut source = store.lock_source(history.resolved.as_os_str().as_bytes())?;
+    // Asked beats stored beats detected: a stored kind was either asked for
+    // once or detected once, and detection must not flip it later.
+    let (kind, replaced) = match (shell, source.stored_kind(), history.detected) {
+        (Some(asked), Some(stored), _) if asked != stored => {
+            (asked, Some((stored, source.replace_kind(asked)?)))
+        }
+        (Some(kind), ..) | (None, Some(kind), _) | (None, None, Some(kind)) => (kind, None),
+        (None, None, None) => return Err(ImportError::UnknownShell(history.path.clone())),
+    };
     let newest = source.newest().cloned();
     if newest.as_ref().is_some_and(|r| r.cursor.stat == stat) {
-        return Ok(ImportResult::default());
+        return Ok(ImportResult { replaced, ..ImportResult::unchanged(kind) });
     }
 
     // Under the write lock, so two first imports cannot each write a key.
@@ -128,9 +231,9 @@ pub fn import_file(
 
     let mut aligned = 0;
     let (mut revision, from, outcome) = match &newest {
-        None => (source.new_revision()?, 0, Outcome::First),
-        Some(newest) if prefix_intact(&file, key.as_ref(), &newest.cursor, stat.size)? => {
-            (source.append()?, newest.cursor.stable_len as u64, Outcome::Appended)
+        None => (source.new_revision(kind)?, 0, Outcome::First),
+        Some(newest) if prefix_intact(file, key.as_ref(), &newest.cursor, stat.size)? => {
+            (source.append(kind)?, newest.cursor.stable_len as u64, Outcome::Appended)
         }
         Some(_) => {
             let anchor: Vec<RecordKey> = source
@@ -138,29 +241,31 @@ pub fn import_file(
                 .iter()
                 .map(|(observed_at_ms, safe_text)| record_key(*observed_at_ms, safe_text))
                 .collect();
-            let (boundary, records) = align(&file, kind, redactor, &anchor)?;
+            let (boundary, records) = align(file, kind, redactor, &anchor)?;
             aligned = records;
             match boundary {
-                Some(from) => (source.append()?, from, Outcome::Aligned),
-                None => (source.new_revision()?, 0, Outcome::Superseded),
+                Some(from) => (source.append(kind)?, from, Outcome::Aligned),
+                None => (source.new_revision(kind)?, 0, Outcome::Superseded),
             }
         }
     };
 
     let (stored, scan) =
-        scan(&file, from, kind, |records| store_records(&mut revision, kind, records, redactor))?;
+        scan(file, from, kind, |records| store_records(&mut revision, kind, records, redactor))?;
     // The hint was taken before reading. If the file changed under the read,
     // the records stored may not be the bytes on disk now: no guard may vouch
     // for them, so the next import (which the stale hint forces) aligns.
     let settled = stat_hint(&file.metadata().map_err(ImportError::Io)?) == stat;
     let boundary_guard = match &key {
-        Some(key) if settled => Some(boundary_guard(&file, key, scan.stable_len).map_err(ImportError::Io)?),
+        Some(key) if settled => Some(boundary_guard(file, key, scan.stable_len).map_err(ImportError::Io)?),
         _ => None,
     };
     let cursor = Cursor { stat, stable_len: scan.stable_len as i64, boundary_guard };
     let revision_id = revision.revision_id();
     revision.commit(&cursor, stored.provenance)?;
     Ok(ImportResult {
+        kind,
+        replaced,
         records_stored: stored.count,
         records_parsed: aligned + stored.count,
         revision_id,
@@ -400,6 +505,9 @@ pub enum ImportError {
     NotRegularFile(PathBuf),
     /// The path's last component is a symlink, which is never followed.
     FinalSymlink { path: PathBuf, target: PathBuf },
+    /// Neither `--shell`, an earlier import, the content nor the name says
+    /// which shell wrote the file.
+    UnknownShell(PathBuf),
     /// Another import holds the store's write lock.
     Busy,
     Store(StoreError),
@@ -417,13 +525,18 @@ impl From<StoreError> for ImportError {
 impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::Io(e) => write!(f, "{e}"),
             Self::NotRegularFile(path) => write!(f, "{}: not a regular file", path.display()),
             Self::FinalSymlink { path, target } => write!(
                 f,
                 "{}: is a symlink to {}; relic does not follow it, import the target instead",
                 path.display(),
                 target.display()
+            ),
+            Self::UnknownShell(path) => write!(
+                f,
+                "{}: cannot tell whether this is a zsh or a bash history; pass --shell zsh or --shell bash",
+                path.display()
             ),
             Self::Busy => write!(f, "{}", StoreError::Busy),
             Self::Store(e) => write!(f, "store error: {e}"),
@@ -925,13 +1038,13 @@ mod tests {
         locator: &[u8],
         records: impl Iterator<Item = io::Result<RawRecord>>,
     ) -> Result<ImportResult, ImportError> {
-        let mut revision = store.lock_source(locator, SourceKind::Zsh)?.new_revision()?;
+        let mut revision = store.lock_source(locator)?.new_revision(SourceKind::Zsh)?;
         let stored = store_records(&mut revision, SourceKind::Zsh, records, &Redactor::new())?;
         revision.commit(&Cursor::default(), stored.provenance)?;
         Ok(ImportResult {
             records_stored: stored.count,
             checkpoint_blocked: checkpoint_blocked(store, stored.count)?,
-            ..ImportResult::default()
+            ..ImportResult::unchanged(SourceKind::Zsh)
         })
     }
 
@@ -995,7 +1108,7 @@ mod tests {
         let mut second = Store::open(&db).unwrap();
         let redactor = Redactor::new();
 
-        let writing = first.lock_source(b"/other", SourceKind::Zsh).unwrap();
+        let writing = first.lock_source(b"/other").unwrap();
         let started = std::time::Instant::now();
         let err = import_file(&mut second, &history_path, SourceKind::Zsh, &redactor).unwrap_err();
         assert!(matches!(err, ImportError::Busy), "{err}");
@@ -1020,7 +1133,7 @@ mod tests {
         let resolved = resolve(&history_path).unwrap();
         let locator = resolved.as_os_str().as_bytes();
 
-        let mut writing = first.lock_source(locator, SourceKind::Zsh).unwrap().new_revision().unwrap();
+        let mut writing = first.lock_source(locator).unwrap().new_revision(SourceKind::Zsh).unwrap();
         let raw = RawRecord { timestamp: Some(1_700_000_000), duration: None, command: "echo needle".into(), start: 0, end: 27, lossy: false };
         writing.insert(&raw_to_observation(&raw, ObservationKind::ZshCommand, &Redactor::new())).unwrap();
         let stat = stat_hint(&fs::metadata(&history_path).unwrap());
@@ -1082,7 +1195,7 @@ mod tests {
 
     fn stable_len(store: &mut Store, path: &Path) -> i64 {
         let resolved = resolve(path).unwrap();
-        let lock = store.lock_source(resolved.as_os_str().as_bytes(), SourceKind::Zsh).unwrap();
+        let lock = store.lock_source(resolved.as_os_str().as_bytes()).unwrap();
         lock.newest().unwrap().cursor.stable_len
     }
 
@@ -1256,7 +1369,7 @@ mod tests {
         assert!(matches!(&err, ImportError::FinalSymlink { target: t, .. } if *t == target), "{err}");
         assert!(err.to_string().contains(target.to_str().unwrap()), "{err}");
         assert_eq!(store.observation_count().unwrap(), 0);
-        assert!(store.lock_source(resolve(&link).unwrap().as_os_str().as_bytes(), SourceKind::Zsh).unwrap().newest().is_none());
+        assert!(store.lock_source(resolve(&link).unwrap().as_os_str().as_bytes()).unwrap().newest().is_none());
 
         // A symlinked directory on the way there is resolved, not refused.
         let via = dir.path().join("via");
@@ -1301,4 +1414,76 @@ mod tests {
         );
         assert_eq!(store.revision_provenance(u.revision_id).unwrap(), Provenance::COMMAND);
     }
+    fn import_as(name: &str, content: &str, shell: Option<SourceKind>) -> Result<ImportResult, ImportError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        fs::write(&path, content).unwrap();
+        import_file(&mut Store::open_memory().unwrap(), &path, shell, &Redactor::new())
+    }
+
+    #[test]
+    fn the_shell_is_told_from_content_before_the_file_name() {
+        let zsh = ": 1700000000:0;echo one\n";
+        let bash = "#1700000000\necho one\n";
+        // Misleading names: the content decides.
+        assert_eq!(import_as("bash_history", zsh, None).unwrap().kind, SourceKind::Zsh);
+        assert_eq!(import_as(".zsh_history", bash, None).unwrap().kind, SourceKind::Bash);
+        // Untimed content says nothing, so the name decides.
+        assert_eq!(import_as(".zsh_history", "echo one\n", None).unwrap().kind, SourceKind::Zsh);
+        assert_eq!(import_as(".zhistory", "echo one\n", None).unwrap().kind, SourceKind::Zsh);
+        assert_eq!(import_as(".bash_history", "echo one\n", None).unwrap().kind, SourceKind::Bash);
+    }
+
+    #[test]
+    fn a_file_that_gives_no_shell_away_is_refused_unless_one_is_given() {
+        let plain = "echo one\n";
+        assert!(matches!(import_as("history", plain, None), Err(ImportError::UnknownShell(_))));
+        // Both grammars' timed lines: the content contradicts itself.
+        let both = ": 1700000000:0;echo one\n#1700000001\necho two\n";
+        assert!(matches!(import_as("history", both, None), Err(ImportError::UnknownShell(_))));
+        assert_eq!(import_as("history", plain, Some(SourceKind::Bash)).unwrap().kind, SourceKind::Bash);
+    }
+
+    #[test]
+    fn a_stored_shell_outlasts_what_later_content_suggests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        fs::write(&path, "echo one\n").unwrap();
+        let mut store = Store::open(&dir.path().join("relic.db")).unwrap();
+        let redactor = Redactor::new();
+        import_file(&mut store, &path, SourceKind::Bash, &redactor).unwrap();
+
+        // A zsh-looking line typed into bash must not flip the source to zsh.
+        append(&path, ": 1700000000:0;echo two\n");
+        let r = import_file(&mut store, &path, None, &redactor).unwrap();
+        assert_eq!((r.kind, r.replaced, r.records_stored), (SourceKind::Bash, None, 1));
+        assert_eq!(texts(&store), ["echo one", ": 1700000000:0;echo two"]);
+    }
+
+    #[test]
+    fn a_differing_shell_replaces_the_source_and_its_search_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let path = dir.path().join("history");
+        // Read as zsh these are four plain commands; as bash, two timed ones.
+        fs::write(&path, "#1700000000\necho alpha\n#1700000001\necho beta\n").unwrap();
+        let mut store = Store::open(&db).unwrap();
+        let redactor = Redactor::new();
+        let wrong = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
+        assert_eq!(wrong.records_stored, 4);
+        assert_eq!(store.search("1700000000", 10).unwrap().len(), 1);
+
+        let r = import_file(&mut store, &path, SourceKind::Bash, &redactor).unwrap();
+        assert_eq!((r.kind, r.replaced, r.outcome), (SourceKind::Bash, Some((SourceKind::Zsh, 4)), Outcome::First));
+        assert_eq!(texts(&store), ["echo alpha", "echo beta"]);
+        // One source, one revision, and nothing of the zsh reading left to find.
+        assert_eq!(visible(&db)[..4], [1, 1, 2, 2]);
+        assert!(store.search("1700000000", 10).unwrap().is_empty());
+        assert_eq!(store.search("alpha", 10).unwrap().len(), 1);
+
+        // The corrected kind is the stored one: no --shell, no second replace.
+        let r = import_file(&mut store, &path, None, &redactor).unwrap();
+        assert_eq!((r.kind, r.replaced, r.outcome), (SourceKind::Bash, None, Outcome::Unchanged));
+    }
+
 }

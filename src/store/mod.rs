@@ -73,7 +73,7 @@ pub struct NewestRevision {
 pub struct SourceLock<'a> {
     tx: Transaction<'a>,
     locator: &'a [u8],
-    kind: SourceKind,
+    stored_kind: Option<SourceKind>,
     newest: Option<NewestRevision>,
 }
 
@@ -83,13 +83,49 @@ impl<'a> SourceLock<'a> {
         self.newest.as_ref()
     }
 
-    /// Open a new revision, creating the source on first sight.
-    pub fn new_revision(self) -> Result<RevisionTx<'a>, StoreError> {
-        let Self { tx, locator, kind, .. } = self;
-        let parser_contract = match kind {
-            SourceKind::Zsh => crate::source::zsh::PARSER_CONTRACT,
-            SourceKind::Bash => crate::source::bash::PARSER_CONTRACT,
-        };
+    /// The shell this source was first imported as, if it ever was.
+    pub fn stored_kind(&self) -> Option<SourceKind> {
+        self.stored_kind
+    }
+
+    /// Delete everything stored for this source and record it as `kind`, for
+    /// a source that was imported as the wrong shell: its records were parsed
+    /// by the wrong grammar, so none of them is evidence. Returns how many
+    /// records went. Nothing is gone until the revision that follows commits.
+    pub fn replace_kind(&mut self, kind: SourceKind) -> Result<usize, StoreError> {
+        let revisions = "SELECT sr.id FROM source_revision sr JOIN source s ON s.id = sr.source_id
+                         WHERE s.private_locator = ?1";
+        // External-content FTS keeps its own index: each row has to be
+        // removed from it by its text before the row itself goes.
+        self.tx.execute(
+            &format!(
+                "INSERT INTO observation_fts (observation_fts, rowid, safe_text)
+                 SELECT 'delete', id, safe_text FROM observation WHERE revision_id IN ({revisions})"
+            ),
+            [self.locator],
+        )?;
+        let removed = self.tx.execute(
+            &format!("DELETE FROM observation WHERE revision_id IN ({revisions})"),
+            [self.locator],
+        )?;
+        self.tx.execute(
+            "DELETE FROM source_revision
+             WHERE source_id IN (SELECT id FROM source WHERE private_locator = ?1)",
+            [self.locator],
+        )?;
+        self.tx.execute(
+            "UPDATE source SET kind = ?2, parser_contract = ?3 WHERE private_locator = ?1",
+            rusqlite::params![self.locator, kind_int(kind), parser_contract(kind)],
+        )?;
+        self.stored_kind = Some(kind);
+        self.newest = None;
+        Ok(removed)
+    }
+
+    /// Open a new revision, creating the source as `kind` on first sight.
+    pub fn new_revision(self, kind: SourceKind) -> Result<RevisionTx<'a>, StoreError> {
+        let Self { tx, locator, .. } = self;
+        let parser_contract = parser_contract(kind);
         let known: Option<i64> = tx
             .query_row("SELECT id FROM source WHERE private_locator = ?1", [locator], |r| r.get(0))
             .optional()?;
@@ -98,14 +134,10 @@ impl<'a> SourceLock<'a> {
             None => {
                 let mut logical_id = [0u8; 16];
                 getrandom::fill(&mut logical_id).map_err(StoreError::Entropy)?;
-                let kind_int: i64 = match kind {
-                    SourceKind::Zsh => 1,
-                    SourceKind::Bash => 2,
-                };
                 tx.execute(
                     "INSERT INTO source (logical_id, kind, private_locator, parser_contract, enabled)
                      VALUES (?1, ?2, ?3, ?4, 1)",
-                    rusqlite::params![logical_id.as_slice(), kind_int, locator, parser_contract],
+                    rusqlite::params![logical_id.as_slice(), kind_int(kind), locator, parser_contract],
                 )?;
                 tx.last_insert_rowid()
             }
@@ -145,8 +177,8 @@ impl<'a> SourceLock<'a> {
 
     /// Reopen the newest revision to append records after its last one. A
     /// source with no revision yet gets its first.
-    pub fn append(self) -> Result<RevisionTx<'a>, StoreError> {
-        let Some(newest) = &self.newest else { return self.new_revision() };
+    pub fn append(self, kind: SourceKind) -> Result<RevisionTx<'a>, StoreError> {
+        let Some(newest) = &self.newest else { return self.new_revision(kind) };
         let revision_id = newest.revision_id;
         let next_ordinal = self.tx.query_row(
             "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM observation WHERE revision_id = ?1",
@@ -273,12 +305,14 @@ impl Store {
     /// `locator` under it. BEGIN IMMEDIATE takes the lock up front, so a
     /// second importer waits here, then fails with `Busy`, instead of deciding
     /// on a revision that another importer is about to replace.
-    pub fn lock_source<'a>(
-        &'a mut self,
-        locator: &'a [u8],
-        kind: SourceKind,
-    ) -> Result<SourceLock<'a>, StoreError> {
+    pub fn lock_source<'a>(&'a mut self, locator: &'a [u8]) -> Result<SourceLock<'a>, StoreError> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored_kind = tx
+            .query_row("SELECT kind FROM source WHERE private_locator = ?1", [locator], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .map(|kind| if kind == kind_int(SourceKind::Bash) { SourceKind::Bash } else { SourceKind::Zsh });
         let newest = tx
             .query_row(
                 "SELECT sr.id, sr.dev, sr.ino, sr.size, sr.mtime_ns, sr.ctime_ns,
@@ -305,7 +339,7 @@ impl Store {
                 },
             )
             .optional()?;
-        Ok(SourceLock { tx, locator, kind, newest })
+        Ok(SourceLock { tx, locator, stored_kind, newest })
     }
 
     /// Which fields the revision's source file encodes.
@@ -501,6 +535,20 @@ impl Store {
 /// Each word becomes a quoted phrase token. No raw FTS operators pass through;
 /// the only operator Relic itself adds is `*` on the last token when
 /// `last_prefix` is set.
+fn kind_int(kind: SourceKind) -> i64 {
+    match kind {
+        SourceKind::Zsh => 1,
+        SourceKind::Bash => 2,
+    }
+}
+
+fn parser_contract(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Zsh => crate::source::zsh::PARSER_CONTRACT,
+        SourceKind::Bash => crate::source::bash::PARSER_CONTRACT,
+    }
+}
+
 fn escape_fts_query(query: &str, last_prefix: bool) -> String {
     let tokens: Vec<&str> = query.split_whitespace().collect();
     let last = tokens.len().saturating_sub(1);
@@ -545,11 +593,11 @@ mod tests {
     }
 
     fn begin<'a>(store: &'a mut Store, locator: &'a [u8]) -> RevisionTx<'a> {
-        store.lock_source(locator, SourceKind::Zsh).unwrap().new_revision().unwrap()
+        store.lock_source(locator).unwrap().new_revision(SourceKind::Zsh).unwrap()
     }
 
     fn newest(store: &mut Store) -> Option<NewestRevision> {
-        store.lock_source(b"/h", SourceKind::Zsh).unwrap().newest().cloned()
+        store.lock_source(b"/h").unwrap().newest().cloned()
     }
 
     /// Commit `obs` as one new revision. Returns the row IDs.
@@ -814,14 +862,14 @@ mod tests {
     fn append_continues_the_revision_or_changes_nothing() {
         let mut store = Store::open_memory().unwrap();
         // Nothing to continue yet: the append opens the first revision.
-        let lock = store.lock_source(b"/h", SourceKind::Zsh).unwrap();
+        let lock = store.lock_source(b"/h").unwrap();
         assert!(lock.anchor(16).unwrap().is_empty());
-        drop(lock.append().unwrap());
+        drop(lock.append(SourceKind::Zsh).unwrap());
         assert_eq!(newest(&mut store), None);
         insert(&mut store, &[make_observation(0, "one"), make_observation(1, "two")]);
         let first = newest(&mut store).unwrap();
 
-        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap();
+        let mut rev = store.lock_source(b"/h").unwrap().append(SourceKind::Zsh).unwrap();
         rev.insert(&make_observation(2, "abandoned")).unwrap();
         drop(rev);
         assert_eq!(newest(&mut store).unwrap(), first);
@@ -832,11 +880,11 @@ mod tests {
             stable_len: 30,
             boundary_guard: Some([7; 32]),
         };
-        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap();
+        let mut rev = store.lock_source(b"/h").unwrap().append(SourceKind::Zsh).unwrap();
         let id = rev.insert(&make_observation(2, "three")).unwrap();
         rev.commit(&cursor, Provenance::OBSERVED_AT).unwrap();
 
-        let lock = store.lock_source(b"/h", SourceKind::Zsh).unwrap();
+        let lock = store.lock_source(b"/h").unwrap();
         let texts = |n| lock.anchor(n).unwrap().into_iter().map(|(_, text)| text).collect::<Vec<_>>();
         assert_eq!(texts(2), ["two", "three"]);
         assert_eq!(texts(16), ["one", "two", "three"]);
@@ -862,7 +910,7 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         insert(&mut store, &[make_observation(0, "one")]);
         insert(&mut store, &[make_observation(0, "two")]);
-        let mut other = store.lock_source(b"/other", SourceKind::Bash).unwrap().new_revision().unwrap();
+        let mut other = store.lock_source(b"/other").unwrap().new_revision(SourceKind::Bash).unwrap();
         other.insert(&make_observation(0, "three")).unwrap();
         other.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
 

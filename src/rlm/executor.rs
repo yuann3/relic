@@ -186,14 +186,14 @@ mod tests {
     const KEY: &[u8] = b"test-key";
 
     fn seed_store(store: &mut Store) -> i64 {
-        let rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().new_revision().unwrap();
+        let rev = store.lock_source(b"/h").unwrap().new_revision(SourceKind::Zsh).unwrap();
         let id = rev.revision_id();
         rev.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
         id
     }
 
     fn insert_commands(store: &mut Store, rev_id: i64, commands: &[&str]) {
-        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap();
+        let mut rev = store.lock_source(b"/h").unwrap().append(SourceKind::Zsh).unwrap();
         assert_eq!(rev.revision_id(), rev_id);
         for (i, cmd) in commands.iter().enumerate() {
             rev.insert(&Observation {
