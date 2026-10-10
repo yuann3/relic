@@ -103,12 +103,12 @@ BM25 `rank` stays useful for explicit, non-interactive searches, such as `relic 
 - **Query set (22):** 1-char `g* c* d*`. 2-char `gi* ca* do* ku*`. 3-char `git* car* doc*`. Full words as the TUI sends them (`cargo* docker*`; `git*` is the 3-char row). Exact words as #8 measured them (`git cargo docker`, Words mode). The keystrokes toward a two-word query: `git c*`, `git co*`, `git com*`, `cargo bu*`, `cargo re*`. And two **sparse ANDs**, frequent words that rarely or never share a row (`cargo com*` with 148 matches, `docker git*` with 0). The sparse ANDs are the worst case for an early-exit rowid walk.
 - **Reproduce:**
   ```console
-  cargo run --release --bin fixture_db -- target/fixtures/1m.db 1000000
-  cargo run --release --bin interactive_fts -- target/fixtures/1m.db target/fts-variants 50
+  cargo run --release --example fixture_db -- target/fixtures/1m.db 1000000
+  cargo run --release --example interactive_fts -- target/fixtures/1m.db target/fts-variants 50
   ```
   This takes about 40 min, nearly all of it slow rank cells. The hot-token study alone (rowid DESC only, about 10 min):
   ```console
-  cargo run --release --bin interactive_fts -- target/fixtures/1m.db target/fts-variants 50 --hot
+  cargo run --release --example interactive_fts -- target/fixtures/1m.db target/fts-variants 50 --hot
   ```
 
 ## Size per variant

@@ -3,8 +3,8 @@
 //! and times every keystroke-shaped query with each ordering.
 //!
 //! Run with:
-//!   cargo run --release --bin fixture_db -- target/fixtures/1m.db 1000000
-//!   cargo run --release --bin interactive_fts -- target/fixtures/1m.db target/fts-variants [RUNS] [--hot]
+//!   cargo run --release --example fixture_db -- target/fixtures/1m.db 1000000
+//!   cargo run --release --example interactive_fts -- target/fixtures/1m.db target/fts-variants [RUNS] [--hot]
 //!
 //! `--hot` runs only the high-frequency-token prefix study (`hot_study`),
 //! which takes minutes instead of the full run's ~40.
