@@ -384,7 +384,7 @@ mod tests {
             })
             .collect();
 
-        let mut rev = store.begin_revision(b"/h", SourceKind::Zsh).unwrap();
+        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().new_revision().unwrap();
         let rev_id = rev.revision_id();
         for (i, cmd) in cmds.iter().enumerate() {
             rev.insert(&Observation {

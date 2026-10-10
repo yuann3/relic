@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::domain::{Observation, ObservationKind, Provenance};
 use crate::redact::Redactor;
 use crate::source::{self, RawRecord};
-use crate::store::{Cursor, StatHint, Store, StoreError};
+use crate::store::{Cursor, RevisionTx, StatHint, Store, StoreError};
 
 /// Which shell format to parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,10 +19,12 @@ pub enum SourceKind {
 /// Result of an import operation.
 #[derive(Debug)]
 pub struct ImportResult {
-    pub records_parsed: usize,
     pub records_stored: usize,
     pub revision_id: i64,
     pub skipped: bool,
+    /// The records are committed, but a reader's open snapshot kept the WAL
+    /// from being folded into the database file.
+    pub checkpoint_blocked: bool,
 }
 
 /// A single-transaction import leaves the whole import in the WAL, and
@@ -41,23 +43,16 @@ pub fn import_file(
     kind: SourceKind,
     redactor: &Redactor,
 ) -> Result<ImportResult, ImportError> {
-    let metadata = fs::metadata(path).map_err(ImportError::Io)?;
-    let stat = StatHint {
-        dev: metadata.dev() as i64,
-        ino: metadata.ino() as i64,
-        size: metadata.size() as i64,
-        mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
-        ctime_ns: metadata.ctime() * 1_000_000_000 + metadata.ctime_nsec(),
-    };
-    let locator = path.as_os_str().as_bytes();
-
-    let newest = store.newest_revision(locator).map_err(StoreError::from)?;
-    if newest.is_some_and(|r| r.cursor.stat == stat) {
+    // Lock before looking: an importer that decided first and then waited for
+    // another import of this file would store the file a second time.
+    let source = store.lock_source(path.as_os_str().as_bytes(), kind)?;
+    let stat = stat_hint(&fs::metadata(path).map_err(ImportError::Io)?);
+    if source.newest().is_some_and(|r| r.cursor.stat == stat) {
         return Ok(ImportResult {
-            records_parsed: 0,
             records_stored: 0,
             revision_id: 0,
             skipped: true,
+            checkpoint_blocked: false,
         });
     }
 
@@ -67,29 +62,40 @@ pub fn import_file(
         SourceKind::Bash => source::bash::parse(&data),
     };
     // The parser cannot say where the last complete record ends yet, so the
-    // cursor claims the whole file and carries no guard. Nothing resumes from
-    // it until change detection lands (#24).
-    let cursor = Cursor { stat, stable_len: data.len() as i64, boundary_guard: None };
-    import_records(store, locator, kind, &cursor, raw_records.into_iter().map(Ok), redactor)
+    // cursor claims no stable prefix and carries no guard: nothing may resume
+    // from it until change detection lands (#24).
+    let cursor = Cursor { stat, stable_len: 0, boundary_guard: None };
+    let (revision_id, stored) =
+        write_records(source.new_revision()?, kind, &cursor, raw_records.into_iter().map(Ok), redactor)?;
+    committed(store, revision_id, stored)
 }
 
-/// Stream `records` into one revision transaction. Any error, from the
-/// records or the store, drops the transaction: nothing of this import
-/// becomes visible and a retry starts clean.
-fn import_records(
-    store: &mut Store,
-    locator: &[u8],
+fn stat_hint(metadata: &fs::Metadata) -> StatHint {
+    StatHint {
+        dev: metadata.dev() as i64,
+        ino: metadata.ino() as i64,
+        size: metadata.size() as i64,
+        mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+        ctime_ns: metadata.ctime() * 1_000_000_000 + metadata.ctime_nsec(),
+    }
+}
+
+/// Stream `records` into one revision transaction and commit it. Any error,
+/// from the records or the store, drops the transaction: nothing of this
+/// import becomes visible and a retry starts clean. Returns the revision and
+/// how many records it gained.
+fn write_records(
+    mut revision: RevisionTx<'_>,
     kind: SourceKind,
     cursor: &Cursor,
     records: impl Iterator<Item = io::Result<RawRecord>>,
     redactor: &Redactor,
-) -> Result<ImportResult, ImportError> {
+) -> Result<(i64, usize), ImportError> {
     let obs_kind = match kind {
         SourceKind::Zsh => ObservationKind::ZshCommand,
         SourceKind::Bash => ObservationKind::BashCommand,
     };
 
-    let mut revision = store.begin_revision(locator, kind)?;
     let mut provenance = Provenance::COMMAND;
     let mut stored = 0;
     for raw in records {
@@ -102,17 +108,16 @@ fn import_records(
     }
     let revision_id = revision.revision_id();
     revision.commit(cursor, provenance)?;
+    Ok((revision_id, stored))
+}
 
-    if stored >= CHECKPOINT_MIN_RECORDS {
-        store.checkpoint().map_err(StoreError::from)?;
-    }
-
-    Ok(ImportResult {
-        records_parsed: stored,
-        records_stored: stored,
-        revision_id,
-        skipped: false,
-    })
+/// Checkpoint after a bulk commit. The revision is already durable here, so a
+/// checkpoint error is reported as a store error, never as `Busy`: "try
+/// again" would be wrong advice for an import that succeeded.
+fn committed(store: &Store, revision_id: i64, stored: usize) -> Result<ImportResult, ImportError> {
+    let checkpoint_blocked = stored >= CHECKPOINT_MIN_RECORDS
+        && !store.checkpoint().map_err(|e| ImportError::Store(StoreError::Sqlite(e)))?;
+    Ok(ImportResult { records_stored: stored, revision_id, skipped: false, checkpoint_blocked })
 }
 
 fn raw_to_observation(raw: &RawRecord, kind: ObservationKind, redactor: &Redactor) -> Observation {
@@ -179,7 +184,6 @@ mod tests {
 
         let result = import_file(&mut store, &history_path, SourceKind::Zsh, &redactor).unwrap();
 
-        assert_eq!(result.records_parsed, 3);
         assert_eq!(result.records_stored, 3);
 
         // Verify search finds imported records.
@@ -209,7 +213,6 @@ mod tests {
 
         let result = import_file(&mut store, &history_path, SourceKind::Bash, &redactor).unwrap();
 
-        assert_eq!(result.records_parsed, 2);
         assert_eq!(result.records_stored, 2);
 
         let hits = store.search("cargo", 10).unwrap();
@@ -293,19 +296,30 @@ mod tests {
         let r1 = import_file(&mut store, &history_path, SourceKind::Zsh, &redactor).unwrap();
         assert_eq!(r1.records_stored, 1);
 
-        // Append to file (different length).
+        // Append to the file: its stat hint no longer matches the stored one.
         {
             let mut f = fs::OpenOptions::new().append(true).open(&history_path).unwrap();
             writeln!(f, ": 1700000001:0;cargo test").unwrap();
         }
 
-        // File is now longer — should reimport.
+        // A changed hint reimports the whole file as a new revision.
         let r2 = import_file(&mut store, &history_path, SourceKind::Zsh, &redactor).unwrap();
         assert!(!r2.skipped);
         assert_eq!(r2.records_stored, 2);
     }
 
-    // --- Revision transactions (ADR 0005) ---
+    /// One new revision of `locator` holding `records`, as `import_file`
+    /// stores a file it has already read.
+    fn import_records(
+        store: &mut Store,
+        locator: &[u8],
+        records: impl Iterator<Item = io::Result<RawRecord>>,
+    ) -> Result<ImportResult, ImportError> {
+        let revision = store.lock_source(locator, SourceKind::Zsh)?.new_revision()?;
+        let (revision_id, stored) =
+            write_records(revision, SourceKind::Zsh, &Cursor::default(), records, &Redactor::new())?;
+        committed(store, revision_id, stored)
+    }
 
     fn records(n: usize, fail_at: Option<usize>) -> impl Iterator<Item = io::Result<RawRecord>> {
         (0..n).map(move |i| {
@@ -344,17 +358,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("relic.db");
         let mut store = Store::open(&db).unwrap();
-        let redactor = Redactor::new();
-        let cursor = Cursor::default();
 
-        let err = import_records(&mut store, b"/h", SourceKind::Zsh, &cursor, records(50, Some(30)), &redactor)
-            .unwrap_err();
+        let err = import_records(&mut store, b"/h", records(50, Some(30))).unwrap_err();
         assert!(matches!(err, ImportError::Io(_)), "{err}");
         assert_eq!(visible(&db), [0, 0, 0, 0, 0]);
         assert!(store.search("needle", 100).unwrap().is_empty());
 
-        let r = import_records(&mut store, b"/h", SourceKind::Zsh, &cursor, records(50, None), &redactor)
-            .unwrap();
+        let r = import_records(&mut store, b"/h", records(50, None)).unwrap();
         assert_eq!(r.records_stored, 50);
         assert_eq!(visible(&db), [1, 1, 50, 50, 50]);
     }
@@ -369,7 +379,7 @@ mod tests {
         let mut second = Store::open(&db).unwrap();
         let redactor = Redactor::new();
 
-        let writing = first.begin_revision(b"/other", SourceKind::Zsh).unwrap();
+        let writing = first.lock_source(b"/other", SourceKind::Zsh).unwrap();
         let started = std::time::Instant::now();
         let err = import_file(&mut second, &history_path, SourceKind::Zsh, &redactor).unwrap_err();
         assert!(matches!(err, ImportError::Busy), "{err}");
@@ -384,29 +394,73 @@ mod tests {
     }
 
     #[test]
+    fn an_importer_that_waited_for_the_same_file_does_not_store_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let history_path = dir.path().join("zsh_history");
+        fs::write(&history_path, ": 1700000000:0;echo needle\n").unwrap();
+        let mut first = Store::open(&db).unwrap();
+        let mut second = Store::open(&db).unwrap();
+        let locator = history_path.as_os_str().as_bytes();
+
+        let mut writing = first.lock_source(locator, SourceKind::Zsh).unwrap().new_revision().unwrap();
+        let raw = RawRecord { timestamp: Some(1_700_000_000), duration: None, command: "echo needle".into(), byte_offset: 0 };
+        writing.insert(&raw_to_observation(&raw, ObservationKind::ZshCommand, &Redactor::new())).unwrap();
+        let stat = stat_hint(&fs::metadata(&history_path).unwrap());
+
+        let waiter = std::thread::scope(|s| {
+            let waiter = s.spawn(|| import_file(&mut second, &history_path, SourceKind::Zsh, &Redactor::new()));
+            // Well inside the 250 ms busy_timeout: the waiter gets the lock, not Busy.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            writing.commit(&Cursor { stat, ..Cursor::default() }, Provenance::COMMAND).unwrap();
+            waiter.join().unwrap()
+        });
+
+        assert!(waiter.unwrap().skipped);
+        assert_eq!(visible(&db), [1, 1, 1, 1, 1]);
+    }
+
+    #[test]
     fn only_a_bulk_import_truncates_the_wal() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("relic.db");
         let wal_len = || fs::metadata(dir.path().join("relic.db-wal")).unwrap().len();
         let mut store = Store::open(&db).unwrap();
-        let redactor = Redactor::new();
-        let cursor = Cursor::default();
 
-        import_records(&mut store, b"/small", SourceKind::Zsh, &cursor, records(100, None), &redactor)
-            .unwrap();
+        let small = import_records(&mut store, b"/small", records(100, None)).unwrap();
+        assert!(!small.checkpoint_blocked);
         assert!(wal_len() > 0);
 
-        import_records(
-            &mut store,
-            b"/bulk",
-            SourceKind::Zsh,
-            &cursor,
-            records(CHECKPOINT_MIN_RECORDS, None),
-            &redactor,
-        )
-        .unwrap();
+        let bulk = import_records(&mut store, b"/bulk", records(CHECKPOINT_MIN_RECORDS, None)).unwrap();
+        assert!(!bulk.checkpoint_blocked);
         assert_eq!(wal_len(), 0);
         assert_eq!(visible(&db)[2], 100 + CHECKPOINT_MIN_RECORDS as i64);
+    }
+
+    #[test]
+    fn a_reader_blocking_the_checkpoint_is_reported_and_the_import_still_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let wal_len = || fs::metadata(dir.path().join("relic.db-wal")).unwrap().len();
+        let mut store = Store::open(&db).unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        // An open read transaction pins the reader's snapshot in the WAL.
+        reader.execute_batch("BEGIN").unwrap();
+        let seen: i64 = reader.query_row("SELECT COUNT(*) FROM observation", [], |r| r.get(0)).unwrap();
+        assert_eq!(seen, 0);
+
+        let r = import_records(&mut store, b"/bulk", records(CHECKPOINT_MIN_RECORDS, None)).unwrap();
+        assert!(r.checkpoint_blocked);
+        assert!(wal_len() > 0);
+        assert_eq!(visible(&db)[2], CHECKPOINT_MIN_RECORDS as i64);
+
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(store.checkpoint().unwrap());
+        assert_eq!(wal_len(), 0);
     }
 
     #[test]

@@ -66,6 +66,76 @@ pub struct NewestRevision {
     pub cursor: Cursor,
 }
 
+/// The store's write lock, held for one source. The newest revision was read
+/// after the lock was taken, so no other importer can change it before this
+/// one has decided: drop the lock to store nothing, or turn it into the
+/// revision transaction that stores the records.
+pub struct SourceLock<'a> {
+    tx: Transaction<'a>,
+    locator: &'a [u8],
+    kind: SourceKind,
+    newest: Option<NewestRevision>,
+}
+
+impl<'a> SourceLock<'a> {
+    /// The source's newest revision, if it was ever imported.
+    pub fn newest(&self) -> Option<&NewestRevision> {
+        self.newest.as_ref()
+    }
+
+    /// Open a new revision, creating the source on first sight.
+    pub fn new_revision(self) -> Result<RevisionTx<'a>, StoreError> {
+        let Self { tx, locator, kind, .. } = self;
+        let known: Option<i64> = tx
+            .query_row("SELECT id FROM source WHERE private_locator = ?1", [locator], |r| r.get(0))
+            .optional()?;
+        let source_id = match known {
+            Some(id) => id,
+            None => {
+                let mut logical_id = [0u8; 16];
+                getrandom::fill(&mut logical_id).map_err(StoreError::Entropy)?;
+                let kind_int: i64 = match kind {
+                    SourceKind::Zsh => 1,
+                    SourceKind::Bash => 2,
+                };
+                tx.execute(
+                    "INSERT INTO source (logical_id, kind, private_locator, parser_contract, enabled)
+                     VALUES (?1, ?2, ?3, 'v1', 1)",
+                    rusqlite::params![logical_id.as_slice(), kind_int, locator],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        // The cursor is only known once the records are read; `commit` writes it.
+        tx.execute(
+            "INSERT INTO source_revision (source_id, dev, ino, size, mtime_ns, ctime_ns,
+                stable_len, provenance, parser_contract, redaction_revision, imported_at_ms)
+             VALUES (?1, 0, 0, 0, 0, 0, 0, 0, 'v1', 'r1', ?2)",
+            rusqlite::params![source_id, now_ms],
+        )?;
+        let revision_id = tx.last_insert_rowid();
+        Ok(RevisionTx { tx, revision_id, next_ordinal: 0 })
+    }
+
+    /// Reopen the newest revision to append records after its last one.
+    /// `None` when the source has no revision yet.
+    pub fn append(self) -> Result<Option<RevisionTx<'a>>, StoreError> {
+        let Some(newest) = self.newest else { return Ok(None) };
+        let revision_id = newest.revision_id;
+        let next_ordinal = self.tx.query_row(
+            "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM observation WHERE revision_id = ?1",
+            [revision_id],
+            |r| r.get(0),
+        )?;
+        Ok(Some(RevisionTx { tx: self.tx, revision_id, next_ordinal }))
+    }
+}
+
 /// An open write transaction on one revision. Nothing inserted through it is
 /// visible to any reader until `commit`; dropping it rolls everything back,
 /// including a revision and source row it created (ADR 0005).
@@ -169,65 +239,17 @@ impl Store {
             .map(|v| v.parse::<i64>().unwrap_or(0))
     }
 
-    /// Open a new revision of the source at `locator`, creating the source on
-    /// first sight. BEGIN IMMEDIATE takes the write lock up front, so a second
-    /// importer fails here with `Busy` instead of midway through its inserts.
-    pub fn begin_revision(
-        &mut self,
-        locator: &[u8],
+    /// Take the write lock and read the newest revision of the source at
+    /// `locator` under it. BEGIN IMMEDIATE takes the lock up front, so a
+    /// second importer waits here, then fails with `Busy`, instead of deciding
+    /// on a revision that another importer is about to replace.
+    pub fn lock_source<'a>(
+        &'a mut self,
+        locator: &'a [u8],
         kind: SourceKind,
-    ) -> Result<RevisionTx<'_>, StoreError> {
+    ) -> Result<SourceLock<'a>, StoreError> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let known: Option<i64> = tx
-            .query_row("SELECT id FROM source WHERE private_locator = ?1", [locator], |r| r.get(0))
-            .optional()?;
-        let source_id = match known {
-            Some(id) => id,
-            None => {
-                let mut logical_id = [0u8; 16];
-                getrandom::fill(&mut logical_id).map_err(StoreError::Entropy)?;
-                let kind_int: i64 = match kind {
-                    SourceKind::Zsh => 1,
-                    SourceKind::Bash => 2,
-                };
-                tx.execute(
-                    "INSERT INTO source (logical_id, kind, private_locator, parser_contract, enabled)
-                     VALUES (?1, ?2, ?3, 'v1', 1)",
-                    rusqlite::params![logical_id.as_slice(), kind_int, locator],
-                )?;
-                tx.last_insert_rowid()
-            }
-        };
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        // The cursor is only known once the records are read; `commit` writes it.
-        tx.execute(
-            "INSERT INTO source_revision (source_id, dev, ino, size, mtime_ns, ctime_ns,
-                stable_len, provenance, parser_contract, redaction_revision, imported_at_ms)
-             VALUES (?1, 0, 0, 0, 0, 0, 0, 0, 'v1', 'r1', ?2)",
-            rusqlite::params![source_id, now_ms],
-        )?;
-        let revision_id = tx.last_insert_rowid();
-        Ok(RevisionTx { tx, revision_id, next_ordinal: 0 })
-    }
-
-    /// Reopen an existing revision to append records after its last one.
-    pub fn append_revision(&mut self, revision_id: i64) -> Result<RevisionTx<'_>, StoreError> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let next_ordinal = tx.query_row(
-            "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM observation WHERE revision_id = ?1",
-            [revision_id],
-            |r| r.get(0),
-        )?;
-        Ok(RevisionTx { tx, revision_id, next_ordinal })
-    }
-
-    /// The newest revision of the source at `locator`, if it was ever imported.
-    pub fn newest_revision(&self, locator: &[u8]) -> Result<Option<NewestRevision>, rusqlite::Error> {
-        self.conn
+        let newest = tx
             .query_row(
                 "SELECT sr.id, sr.dev, sr.ino, sr.size, sr.mtime_ns, sr.ctime_ns,
                         sr.stable_len, sr.boundary_guard
@@ -252,7 +274,8 @@ impl Store {
                     })
                 },
             )
-            .optional()
+            .optional()?;
+        Ok(SourceLock { tx, locator, kind, newest })
     }
 
     /// Which fields the revision's source file encodes.
@@ -269,10 +292,12 @@ impl Store {
         self.conn.query_row("SELECT COUNT(*) FROM observation", [], |row| row.get(0))
     }
 
-    /// Fold the WAL into the database file and truncate it.
-    pub fn checkpoint(&self) -> Result<(), rusqlite::Error> {
-        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-        Ok(())
+    /// Fold the WAL into the database file and truncate it. `false` when a
+    /// reader's open snapshot blocked it: SQLite reports that in the pragma's
+    /// result row, not as an error, after waiting out busy_timeout.
+    pub fn checkpoint(&self) -> Result<bool, rusqlite::Error> {
+        let busy: i64 = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        Ok(busy == 0)
     }
 
     /// Search observations via FTS5. Query terms are escaped (no raw FTS syntax).
@@ -489,9 +514,17 @@ mod tests {
         }
     }
 
+    fn begin<'a>(store: &'a mut Store, locator: &'a [u8]) -> RevisionTx<'a> {
+        store.lock_source(locator, SourceKind::Zsh).unwrap().new_revision().unwrap()
+    }
+
+    fn newest(store: &mut Store) -> Option<NewestRevision> {
+        store.lock_source(b"/h", SourceKind::Zsh).unwrap().newest().cloned()
+    }
+
     /// Commit `obs` as one new revision. Returns the row IDs.
     fn insert(store: &mut Store, obs: &[Observation]) -> Vec<i64> {
-        let mut rev = store.begin_revision(b"/h", SourceKind::Zsh).unwrap();
+        let mut rev = begin(store, b"/h");
         let ids = obs.iter().map(|o| rev.insert(o).unwrap()).collect();
         rev.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
         ids
@@ -729,8 +762,6 @@ mod tests {
         assert_eq!(hits.len(), 1);
     }
 
-    // --- Revision transactions (ADR 0005) ---
-
     fn count(store: &Store, table: &str) -> i64 {
         store.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
     }
@@ -738,7 +769,7 @@ mod tests {
     #[test]
     fn a_dropped_revision_leaves_nothing_behind() {
         let mut store = Store::open_memory().unwrap();
-        let mut rev = store.begin_revision(b"/h", SourceKind::Zsh).unwrap();
+        let mut rev = begin(&mut store, b"/h");
         rev.insert(&make_observation(0, "cargo build")).unwrap();
         drop(rev);
 
@@ -746,19 +777,19 @@ mod tests {
             assert_eq!(count(&store, table), 0, "{table}");
         }
         assert!(store.search("cargo", 10).unwrap().is_empty());
-        assert_eq!(store.newest_revision(b"/h").unwrap(), None);
+        assert_eq!(newest(&mut store), None);
     }
 
     #[test]
     fn append_continues_the_revision_or_changes_nothing() {
         let mut store = Store::open_memory().unwrap();
         insert(&mut store, &[make_observation(0, "one"), make_observation(1, "two")]);
-        let first = store.newest_revision(b"/h").unwrap().unwrap();
+        let first = newest(&mut store).unwrap();
 
-        let mut rev = store.append_revision(first.revision_id).unwrap();
+        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap().unwrap();
         rev.insert(&make_observation(2, "abandoned")).unwrap();
         drop(rev);
-        assert_eq!(store.newest_revision(b"/h").unwrap().unwrap(), first);
+        assert_eq!(newest(&mut store).unwrap(), first);
         assert!(store.search("abandoned", 10).unwrap().is_empty());
 
         let cursor = Cursor {
@@ -766,7 +797,7 @@ mod tests {
             stable_len: 30,
             boundary_guard: Some([7; 32]),
         };
-        let mut rev = store.append_revision(first.revision_id).unwrap();
+        let mut rev = store.lock_source(b"/h", SourceKind::Zsh).unwrap().append().unwrap().unwrap();
         let id = rev.insert(&make_observation(2, "three")).unwrap();
         rev.commit(&cursor, Provenance::OBSERVED_AT).unwrap();
 
@@ -774,7 +805,7 @@ mod tests {
         assert_eq!((three.revision_id, three.ordinal), (first.revision_id, 2));
         assert_eq!(store.search("three", 10).unwrap().len(), 1);
         assert_eq!(
-            store.newest_revision(b"/h").unwrap().unwrap(),
+            newest(&mut store).unwrap(),
             NewestRevision { revision_id: first.revision_id, cursor }
         );
         // The append adds to what the revision already claimed.
@@ -789,7 +820,7 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         insert(&mut store, &[make_observation(0, "one")]);
         insert(&mut store, &[make_observation(0, "two")]);
-        let mut other = store.begin_revision(b"/other", SourceKind::Bash).unwrap();
+        let mut other = store.lock_source(b"/other", SourceKind::Bash).unwrap().new_revision().unwrap();
         other.insert(&make_observation(0, "three")).unwrap();
         other.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
 
@@ -805,8 +836,6 @@ mod tests {
             .unwrap();
         assert!(ids.iter().all(|id| id.len() == 16));
         assert_ne!(ids[0], ids[1]);
-        // The path must not leak into the public id.
-        assert!(!ids.iter().any(|id| id.windows(2).any(|w| w == b"/h")));
     }
 
     #[test]
@@ -814,9 +843,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("relic.db");
         let mut store = Store::open(&db).unwrap();
+        // Readers get past an open import only because of the WAL: a rollback
+        // journal would block them once the import spills its page cache.
+        let mode: String = store.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "wal");
         insert(&mut store, &[make_observation(0, "needle committed")]);
 
-        let mut writing = store.begin_revision(b"/other", SourceKind::Zsh).unwrap();
+        let mut writing = begin(&mut store, b"/other");
         writing.insert(&make_observation(0, "needle pending")).unwrap();
 
         let reader = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

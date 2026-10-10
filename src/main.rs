@@ -61,6 +61,9 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 }
                 r => r?,
             };
+            if r.checkpoint_blocked {
+                eprintln!("relic: note: WAL not checkpointed: a reader is active; the next large import retries");
+            }
             if r.skipped {
                 eprintln!("{}: unchanged since last import", path.display());
             } else {
