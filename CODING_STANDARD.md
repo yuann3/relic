@@ -1,6 +1,6 @@
 # Coding Standard
 
-`cargo clippy -- -D warnings` and `cargo test` enforce mechanical rules. Don't review what the toolchain already catches.
+`cargo clippy --all-targets -- -D warnings` and `cargo test` enforce mechanical rules. Don't review what the toolchain already catches.
 
 ## Surgical changes
 
@@ -40,4 +40,4 @@
 
 ## Clippy
 
-`cargo clippy -- -D warnings` must pass with zero diagnostics. No `#[allow(clippy::*)]` without a comment explaining why.
+`cargo clippy --all-targets -- -D warnings` must pass with zero diagnostics. No `#[allow(clippy::*)]` without a comment explaining why.

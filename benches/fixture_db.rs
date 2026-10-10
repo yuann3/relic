@@ -1,6 +1,6 @@
 //! Build a deterministic fixture database for the interactive search prototype.
 //!
-//! Run with: cargo run --release --bin fixture_db -- <OUT.db> <RECORDS>
+//! Run with: cargo run --release --example fixture_db -- <OUT.db> <RECORDS>
 
 use std::time::Instant;
 

@@ -39,7 +39,13 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn run(cmd: Command) -> Result<ExitCode> {
     match cmd {
         Command::Help => print!("{}", cli::USAGE),
-        Command::Version => println!("relic {}", env!("CARGO_PKG_VERSION")),
+        Command::Version => {
+            // The gate harness reads the build from here: nothing else tells a
+            // headless, full or debug binary apart from outside.
+            let build = if cfg!(feature = "tui") { "tui" } else { "headless" };
+            let debug = if cfg!(debug_assertions) { ", debug" } else { "" };
+            println!("relic {} ({build}{debug})", env!("CARGO_PKG_VERSION"));
+        }
         Command::Search(args) => return search(args),
         Command::Ui { db } => ui(&existing_db(db)?)?,
         Command::Import { path, shell, db } => {

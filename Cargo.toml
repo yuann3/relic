@@ -15,7 +15,6 @@ ratatui = { version = "0.30", optional = true, default-features = false, feature
 rusqlite = { version = "0.35", features = ["bundled", "modern_sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tempfile = "3"
 
 [[bin]]
 name = "relic"
@@ -24,19 +23,23 @@ path = "src/main.rs"
 [lib]
 bench = false
 
-[[bin]]
-name = "perf_spike"
-path = "benches/perf_spike.rs"
-bench = false
+[dev-dependencies]
+tempfile = "3"
+
+# The bench programs are examples so they build against dev-dependencies and
+# stay out of the shipped crate.
+[[example]]
+name = "gates"
+path = "benches/gates.rs"
+test = true
 
 # Builds the deterministic 100k/1M fixture databases for #10.
-[[bin]]
+[[example]]
 name = "fixture_db"
 path = "benches/fixture_db.rs"
-bench = false
 
 # Search-as-you-type FTS variants and their size/latency cost for #10/#11.
-[[bin]]
+[[example]]
 name = "interactive_fts"
 path = "benches/interactive_fts.rs"
-bench = false
+test = true
