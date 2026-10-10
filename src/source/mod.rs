@@ -34,7 +34,11 @@ pub struct RawRecord {
 fn decode(bytes: Vec<u8>, lossy: &mut bool) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| {
         *lossy = true;
-        String::from_utf8_lossy(e.as_bytes()).into_owned()
+        let mut text = String::from_utf8_lossy(e.as_bytes()).into_owned();
+        // U+FFFD is three bytes for one bad byte: the cap is on what is
+        // stored, so cut again.
+        text.truncate(text.floor_char_boundary(RECORD_CAP));
+        text
     })
 }
 
@@ -74,15 +78,22 @@ struct Lines<R> {
     offset: u64,
     unmetafy: bool,
     dangling_meta: u32,
+    /// The reader failed. The bytes consumed before the failure are gone, so
+    /// reading on would yield the rest of that line as a clean record.
+    failed: bool,
 }
 
 impl<R: BufRead> Lines<R> {
     fn new(reader: R, unmetafy: bool) -> Self {
-        Self { reader, offset: 0, unmetafy, dangling_meta: 0 }
+        Self { reader, offset: 0, unmetafy, dangling_meta: 0, failed: false }
     }
 
-    /// Append the next line's content to `out`. `None` at end of input.
+    /// Append the next line's content to `out`. `None` at end of input, and
+    /// on every call after an error.
     fn read_into(&mut self, out: &mut Vec<u8>) -> io::Result<Option<Line>> {
+        if self.failed {
+            return Ok(None);
+        }
         let begin = self.offset;
         let mut line = Line { terminated: false, cut: false, dangling_meta: false, last: None };
         let mut meta = false;
@@ -91,8 +102,13 @@ impl<R: BufRead> Lines<R> {
         loop {
             let chunk = match self.reader.fill_buf() {
                 Ok(chunk) => chunk,
+                // A signal interrupted the syscall: nothing was read or lost,
+                // so retrying is not hiding a source failure.
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.failed = true;
+                    return Err(e);
+                }
             };
             if chunk.is_empty() {
                 break;
@@ -160,6 +176,27 @@ pub(crate) mod testing {
                 return Err(io::Error::other("source went away"));
             }
             self.0.read(buf)
+        }
+    }
+
+    /// Serves `before`, fails one read, then serves `after`: a source that
+    /// recovers, which a parser must not resume from.
+    pub struct FailsOnce<'a> {
+        pub before: &'a [u8],
+        pub after: &'a [u8],
+        pub failed: bool,
+    }
+
+    impl Read for FailsOnce<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.before.is_empty() {
+                return self.before.read(buf);
+            }
+            if !self.failed {
+                self.failed = true;
+                return Err(io::Error::other("transient failure"));
+            }
+            self.after.read(buf)
         }
     }
 }

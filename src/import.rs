@@ -556,15 +556,20 @@ mod tests {
         let mut content = b": 1700000000:0;echo ".to_vec();
         content.resize(source::RECORD_CAP * 2, b'a');
         content.extend_from_slice(b"\n: 1700000001:0;echo after\n");
+        // Undecodable bytes each become a three-byte U+FFFD: still capped.
+        content.resize(content.len() + source::RECORD_CAP, 0xFF);
+        content.push(b'\n');
         fs::write(&path, &content).unwrap();
         let mut store = Store::open_memory().unwrap();
 
         let r = import_file(&mut store, &path, SourceKind::Zsh, &Redactor::new()).unwrap();
-        assert_eq!((r.records_stored, r.lossy_records), (2, 1));
+        assert_eq!((r.records_stored, r.lossy_records), (3, 2));
         let rows = stored(&store);
         assert!(rows[0].safe_text.len() <= source::RECORD_CAP);
         assert_eq!(rows[0].flags, FLAG_LOSSY);
         assert_eq!((rows[1].safe_text.as_str(), rows[1].flags), ("echo after", 0));
+        assert!(rows[2].safe_text.len() <= source::RECORD_CAP);
+        assert_eq!(rows[2].flags, FLAG_LOSSY);
         assert_eq!(stable_len(&mut store, &path), content.len() as i64);
     }
 
@@ -602,15 +607,20 @@ mod tests {
     #[test]
     fn a_timestamp_whose_milliseconds_overflow_is_absent() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("zsh_history");
         // i64::MAX seconds parses, but times 1000 does not fit.
-        fs::write(&path, format!(": {}:0;echo far\n: 1700000000:0;echo near\n", i64::MAX)).unwrap();
-        let mut store = Store::open_memory().unwrap();
+        for (name, kind, content) in [
+            ("zsh", SourceKind::Zsh, format!(": {}:0;echo far\n: 1700000000:0;echo near\n", i64::MAX)),
+            ("bash", SourceKind::Bash, format!("#{}\necho far\n#1700000000\necho near\n", i64::MAX)),
+        ] {
+            let path = dir.path().join(name);
+            fs::write(&path, content).unwrap();
+            let mut store = Store::open_memory().unwrap();
 
-        import_file(&mut store, &path, SourceKind::Zsh, &Redactor::new()).unwrap();
-        let rows = stored(&store);
-        assert_eq!((rows[0].safe_text.as_str(), rows[0].observed_at_ms), ("echo far", None));
-        assert_eq!(rows[1].observed_at_ms, Some(1_700_000_000_000));
+            import_file(&mut store, &path, kind, &Redactor::new()).unwrap();
+            let rows = stored(&store);
+            assert_eq!((rows[0].safe_text.as_str(), rows[0].observed_at_ms), ("echo far", None), "{name}");
+            assert_eq!(rows[1].observed_at_ms, Some(1_700_000_000_000), "{name}");
+        }
     }
 
     #[test]
@@ -634,14 +644,21 @@ mod tests {
         let fifo = dir.path().join("fifo");
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        let mut store = Store::open_memory().unwrap();
 
-        // Opening the FIFO would block forever: nothing ever writes to it.
-        for path in [fifo.as_path(), Path::new("/dev/null"), dir.path()] {
-            let err = import_file(&mut store, path, SourceKind::Zsh, &Redactor::new()).unwrap_err();
-            assert!(matches!(&err, ImportError::NotRegularFile(p) if p == path), "{err}");
+        for path in [fifo.clone(), PathBuf::from("/dev/null"), dir.path().to_path_buf()] {
+            // On a thread: a FIFO nobody writes to blocks in open forever, and
+            // a wrong check must fail this test, not hang the suite.
+            let (done, refused) = std::sync::mpsc::channel();
+            let import_path = path.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open_memory().unwrap();
+                let r = import_file(&mut store, &import_path, SourceKind::Zsh, &Redactor::new());
+                let refused = matches!(&r, Err(ImportError::NotRegularFile(p)) if *p == import_path);
+                let _ = done.send((refused, store.observation_count().unwrap()));
+            });
+            let outcome = refused.recv_timeout(std::time::Duration::from_secs(10));
+            assert_eq!(outcome, Ok((true, 0)), "{}", path.display());
         }
-        assert_eq!(store.observation_count().unwrap(), 0);
     }
 
     #[test]

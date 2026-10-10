@@ -3,7 +3,8 @@ use std::io::{self, BufRead};
 use super::{Lines, RECORD_CAP, RawRecord, decode};
 
 /// v2: unmetafied, CRLF-tolerant, capped per record, whitespace-only
-/// commands dropped, trailing partial record withheld.
+/// commands dropped, trailing partial record withheld, the space zsh pads a
+/// final backslash with removed.
 pub const PARSER_CONTRACT: &str = "zsh-v2";
 
 /// Streams zsh history records (plain and extended format).
@@ -59,6 +60,14 @@ impl<R: BufRead> Iterator for Parser<R> {
                     break false;
                 }
                 if line.last != Some(b'\\') {
+                    // zsh writes a command ending in `\` as `\ ` so the
+                    // backslash is not read as a continuation, and when it
+                    // reads the file back drops one space from a line ending
+                    // in a backslash and spaces.
+                    let spaces = bytes.iter().rev().take_while(|&&b| b == b' ').count();
+                    if !line.cut && spaces > 0 && bytes[..bytes.len() - spaces].ends_with(b"\\") {
+                        bytes.pop();
+                    }
                     break true;
                 }
                 // A cut line's backslash was never buffered.
@@ -114,7 +123,7 @@ fn split_extended(line: &str) -> Option<(Option<i64>, Option<i64>, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::testing::FailsAfter;
+    use crate::source::testing::{FailsAfter, FailsOnce};
     use std::io::BufReader;
 
     fn parse(input: &[u8]) -> Vec<RawRecord> {
@@ -188,6 +197,27 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_yielded_after_the_source_fails_even_if_it_recovers() {
+        let input = b"first\nsecond record\nthird\n";
+        let source = FailsOnce { before: &input[..12], after: &input[12..], failed: false };
+        let mut parser = Parser::new(BufReader::with_capacity(4, source));
+        assert_eq!(parser.next().unwrap().unwrap().command, "first");
+        assert!(parser.next().unwrap().is_err());
+        assert!(parser.next().is_none());
+        assert_eq!(parser.stable_len(), 6);
+        assert!(parser.incomplete_tail().is_none());
+    }
+
+    #[test]
+    fn the_space_zsh_pads_a_final_backslash_with_is_dropped() {
+        // Only the one space zsh added, whatever precedes the backslash.
+        assert_eq!(
+            commands(b": 1700000000:0;echo a\\ \necho b\\   \necho c\\\\ \necho d  \necho e\\ x \n"),
+            ["echo a\\", "echo b\\  ", "echo c\\\\", "echo d  ", "echo e\\ x "]
+        );
+    }
+
+    #[test]
     fn meta_pairs_decode_before_utf8() {
         // zsh 5.9 writes U+90E8 (E9 83 A8) as E9 83 A3 A8.
         let records = parse(b": 1700000000:0;echo \xE9\x83\xA3\xA8\n");
@@ -228,6 +258,17 @@ mod tests {
         let records = parse(b"echo \xFF\n");
         assert_eq!(records[0].command, "echo \u{FFFD}");
         assert!(records[0].lossy);
+    }
+
+    #[test]
+    fn an_oversized_undecodable_record_is_stored_within_the_cap() {
+        let mut input = vec![0xFF; RECORD_CAP + 16];
+        input.extend_from_slice(b"\nnext\n");
+        let records = parse(&input);
+        assert!(records[0].lossy);
+        assert!(records[0].command.len() <= RECORD_CAP);
+        assert!(records[0].command.len() > RECORD_CAP - 3);
+        assert_eq!(records[1].command, "next");
     }
 
     #[test]

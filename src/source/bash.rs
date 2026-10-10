@@ -3,7 +3,8 @@ use std::io::{self, BufRead};
 use super::{Line, Lines, RECORD_CAP, RawRecord, decode};
 
 /// v2: markers detected per record, CRLF-tolerant, capped per record,
-/// whitespace-only commands dropped, trailing partial record withheld.
+/// whitespace-only commands dropped, whitespace-only lines trimmed from both
+/// ends of a timed record, trailing partial record withheld.
 pub const PARSER_CONTRACT: &str = "bash-v2";
 
 /// Streams Bash history records.
@@ -87,12 +88,21 @@ impl<R: BufRead> Parser<R> {
             let mut lossy = false;
             let mut terminated = false;
             let mut end = self.lines.offset;
+            // Length of `bytes` up to its last line with a command on it.
+            let mut content_len = 0;
             while let Some(line) = self.read_line()? {
                 if let Some(timestamp) = marker_time(&self.line, &line) {
                     self.marker = Some(Marker { timestamp, start: end });
                     break;
                 }
-                // Blank lines before the command are not part of it.
+                terminated = line.terminated;
+                end = self.lines.offset;
+                let blank = self.line.iter().all(u8::is_ascii_whitespace);
+                // Whitespace-only lines around the command are not part of
+                // it; the ones inside it are.
+                if blank && bytes.is_empty() {
+                    continue;
+                }
                 if !bytes.is_empty() {
                     if bytes.len() < RECORD_CAP {
                         bytes.push(b'\n');
@@ -103,9 +113,11 @@ impl<R: BufRead> Parser<R> {
                 let room = RECORD_CAP - bytes.len();
                 lossy |= line.lossy() || self.line.len() > room;
                 bytes.extend_from_slice(&self.line[..self.line.len().min(room)]);
-                terminated = line.terminated;
-                end = self.lines.offset;
+                if !blank {
+                    content_len = bytes.len();
+                }
             }
+            bytes.truncate(content_len);
             let command = decode(bytes, &mut lossy);
             let blank = command.trim().is_empty();
             let record =
@@ -145,7 +157,7 @@ fn marker_time(bytes: &[u8], line: &Line) -> Option<Option<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::testing::FailsAfter;
+    use crate::source::testing::{FailsAfter, FailsOnce};
     use std::io::BufReader;
 
     fn parse(input: &[u8]) -> Vec<RawRecord> {
@@ -213,6 +225,34 @@ mod tests {
         assert_eq!(parser.next().unwrap().unwrap().command, "first");
         assert!(parser.next().unwrap().is_err());
         assert_eq!(parser.stable_len(), 18);
+    }
+
+    #[test]
+    fn nothing_is_yielded_after_the_source_fails_even_if_it_recovers() {
+        let input = b"#1700000000\nfirst\n#1700000001\nsecond record\n#1700000002\nthird\n";
+        let source = FailsOnce { before: &input[..36], after: &input[36..], failed: false };
+        let mut parser = Parser::new(BufReader::with_capacity(4, source));
+        assert_eq!(parser.next().unwrap().unwrap().command, "first");
+        assert!(parser.next().unwrap().is_err());
+        assert!(parser.next().is_none());
+        assert_eq!(parser.stable_len(), 18);
+        assert!(parser.incomplete_tail().is_none());
+    }
+
+    #[test]
+    fn whitespace_only_lines_are_trimmed_around_a_timed_command_and_kept_inside_it() {
+        let records = parse(b"#1\n \n\nfoo  \n\nbar\n\n   \n#2\nbaz\n");
+        assert_eq!(records[0].command, "foo  \n\nbar");
+        assert_eq!((records[0].start, records[0].end), (0, 22));
+        assert_eq!(records[1].command, "baz");
+        assert_eq!(commands(b"#1\nfoo\n\n\n"), ["foo"]);
+    }
+
+    #[test]
+    fn invalid_utf8_is_flagged_lossy() {
+        let records = parse(b"#1700000000\necho \xFF\n");
+        assert_eq!(records[0].command, "echo \u{FFFD}");
+        assert!(records[0].lossy);
     }
 
     #[test]
