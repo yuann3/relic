@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{self, BufReader};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::domain::{FLAG_LOSSY, Observation, ObservationKind, Provenance};
@@ -49,11 +49,15 @@ pub fn import_file(
     kind: SourceKind,
     redactor: &Redactor,
 ) -> Result<ImportResult, ImportError> {
+    let resolved = resolve(path)?;
     // Lock before looking: an importer that decided first and then waited for
     // another import of this file would store the file a second time.
-    let source = store.lock_source(path.as_os_str().as_bytes(), kind)?;
-    let metadata = fs::metadata(path).map_err(ImportError::Io)?;
-    // Before opening: a FIFO blocks in open, a device never ends.
+    let source = store.lock_source(resolved.as_os_str().as_bytes(), kind)?;
+    let file = open_no_follow(&resolved)?;
+    // fstat on the open file: the hint describes the bytes this import reads,
+    // even when the name is renamed over meanwhile.
+    let metadata = file.metadata().map_err(ImportError::Io)?;
+    // Before reading: a device never ends.
     if !metadata.is_file() {
         return Err(ImportError::NotRegularFile(path.to_path_buf()));
     }
@@ -62,7 +66,7 @@ pub fn import_file(
         return Ok(ImportResult { skipped: true, ..ImportResult::default() });
     }
 
-    let reader = BufReader::new(fs::File::open(path).map_err(ImportError::Io)?);
+    let reader = BufReader::new(file);
     let mut revision = source.new_revision()?;
     let (stored, stable_len, dangling_meta, incomplete_tail) = match kind {
         SourceKind::Zsh => {
@@ -90,6 +94,32 @@ pub fn import_file(
         dangling_meta,
         incomplete_tail,
     })
+}
+
+/// The path a source is known by: its directory with every symlink and `..`
+/// resolved, and the file name as given. The name is not resolved, because
+/// zsh's save-by-copy turns a symlinked history into a regular file and a
+/// followed link would then change identity (ADR 0002).
+pub fn resolve(path: &Path) -> Result<PathBuf, ImportError> {
+    // No name to keep: `/`, or a path ending in `..`.
+    let name = path.file_name().ok_or_else(|| ImportError::NotRegularFile(path.to_path_buf()))?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Ok(fs::canonicalize(parent).map_err(ImportError::Io)?.join(name))
+}
+
+fn open_no_follow(resolved: &Path) -> Result<fs::File, ImportError> {
+    fs::OpenOptions::new()
+        .read(true)
+        // Non-blocking, or opening a FIFO nobody writes to never returns.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(resolved)
+        .map_err(|e| match fs::read_link(resolved) {
+            Ok(target) => ImportError::FinalSymlink { path: resolved.to_path_buf(), target },
+            Err(_) => ImportError::Io(e),
+        })
 }
 
 fn stat_hint(metadata: &fs::Metadata) -> StatHint {
@@ -161,6 +191,8 @@ pub enum ImportError {
     Io(io::Error),
     /// A directory, device, FIFO or socket: refused before any read.
     NotRegularFile(PathBuf),
+    /// The path's last component is a symlink, which is never followed.
+    FinalSymlink { path: PathBuf, target: PathBuf },
     /// Another import holds the store's write lock.
     Busy,
     Store(StoreError),
@@ -180,6 +212,12 @@ impl std::fmt::Display for ImportError {
         match self {
             Self::Io(e) => write!(f, "IO error: {e}"),
             Self::NotRegularFile(path) => write!(f, "{}: not a regular file", path.display()),
+            Self::FinalSymlink { path, target } => write!(
+                f,
+                "{}: is a symlink to {}; relic does not follow it, import the target instead",
+                path.display(),
+                target.display()
+            ),
             Self::Busy => write!(f, "{}", StoreError::Busy),
             Self::Store(e) => write!(f, "store error: {e}"),
         }
@@ -437,7 +475,8 @@ mod tests {
         fs::write(&history_path, ": 1700000000:0;echo needle\n").unwrap();
         let mut first = Store::open(&db).unwrap();
         let mut second = Store::open(&db).unwrap();
-        let locator = history_path.as_os_str().as_bytes();
+        let resolved = resolve(&history_path).unwrap();
+        let locator = resolved.as_os_str().as_bytes();
 
         let mut writing = first.lock_source(locator, SourceKind::Zsh).unwrap().new_revision().unwrap();
         let raw = RawRecord { timestamp: Some(1_700_000_000), duration: None, command: "echo needle".into(), start: 0, end: 27, lossy: false };
@@ -500,7 +539,8 @@ mod tests {
     }
 
     fn stable_len(store: &mut Store, path: &Path) -> i64 {
-        let lock = store.lock_source(path.as_os_str().as_bytes(), SourceKind::Zsh).unwrap();
+        let resolved = resolve(path).unwrap();
+        let lock = store.lock_source(resolved.as_os_str().as_bytes(), SourceKind::Zsh).unwrap();
         lock.newest().unwrap().cursor.stable_len
     }
 
@@ -659,6 +699,29 @@ mod tests {
             let outcome = refused.recv_timeout(std::time::Duration::from_secs(10));
             assert_eq!(outcome, Ok((true, 0)), "{}", path.display());
         }
+    }
+
+    #[test]
+    fn a_final_symlink_is_refused_naming_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real_history");
+        let link = dir.path().join("zsh_history");
+        fs::write(&target, "echo needle\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut store = Store::open_memory().unwrap();
+
+        let err = import_file(&mut store, &link, SourceKind::Zsh, &Redactor::new()).unwrap_err();
+        assert!(matches!(&err, ImportError::FinalSymlink { target: t, .. } if *t == target), "{err}");
+        assert!(err.to_string().contains(target.to_str().unwrap()), "{err}");
+        assert_eq!(store.observation_count().unwrap(), 0);
+        assert!(store.lock_source(resolve(&link).unwrap().as_os_str().as_bytes(), SourceKind::Zsh).unwrap().newest().is_none());
+
+        // A symlinked directory on the way there is resolved, not refused.
+        let via = dir.path().join("via");
+        std::os::unix::fs::symlink(dir.path(), &via).unwrap();
+        let r = import_file(&mut store, &via.join("real_history"), SourceKind::Zsh, &Redactor::new()).unwrap();
+        assert_eq!(r.records_stored, 1);
+        assert!(import_file(&mut store, &target, SourceKind::Zsh, &Redactor::new()).unwrap().skipped);
     }
 
     #[test]
