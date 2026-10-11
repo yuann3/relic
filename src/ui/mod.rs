@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 
-use crate::app::{self, MatchMode, SearchRequest};
+use crate::app::{self, Budget, MatchMode, Order, SearchRequest};
 use crate::picker::{self, PickError};
 use crate::store::Store;
 use model::{PAGE_LIMIT, PickOutcome, UiAction, UiEffect, UiModel, update};
@@ -47,8 +47,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub fn run(db: &Path) -> Result<()> {
     let started = Instant::now();
     // Evidence loads are single indexed lookups, cheap enough for the main
-    // thread; searches get their own connection and thread.
-    let store = Store::open(db)?;
+    // thread; searches get their own connection and thread. Both open before
+    // the terminal is taken, so a store that cannot be read is an error on
+    // stderr and not a pane that fails on every keystroke.
+    let store = Store::open_read_only(db)?;
+    let worker_store = Store::open_read_only(db)?;
     let mono = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
 
@@ -57,10 +60,10 @@ pub fn run(db: &Path) -> Result<()> {
     // thread to stop.
     let mailbox = Arc::new(Mailbox::default());
     let worker = {
-        let (db, mb, tx) = (db.to_path_buf(), Arc::clone(&mailbox), tx.clone());
+        let (mb, tx) = (Arc::clone(&mailbox), tx.clone());
         std::thread::Builder::new()
             .name("relic-search".into())
-            .spawn(move || search_worker(&db, &mb, &tx, debounce()))?
+            .spawn(move || search_worker(&worker_store, &mb, &tx, debounce()))?
     };
     let outcome = (|| {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -350,8 +353,7 @@ fn debounce() -> Duration {
         .map_or(DEBOUNCE, Duration::from_millis)
 }
 
-fn search_worker(db: &Path, mailbox: &Mailbox, tx: &SyncSender<UiAction>, debounce: Duration) {
-    let store = Store::open(db).map_err(|e| e.to_string());
+fn search_worker(store: &Store, mailbox: &Mailbox, tx: &SyncSender<UiAction>, debounce: Duration) {
     while let Some(mut job) = mailbox.take(None) {
         // The quiet period runs from the keystroke, not from when this
         // worker got free: time a job spent queued behind a running search
@@ -371,12 +373,10 @@ fn search_worker(db: &Path, mailbox: &Mailbox, tx: &SyncSender<UiAction>, deboun
             query: job.query,
             limit: PAGE_LIMIT,
             mode: MatchMode::PrefixLast,
+            order: Order::RecentlyImported,
         };
         let t = Instant::now();
-        let result = match &store {
-            Ok(s) => app::search(s, &req).map_err(|e| e.to_string()),
-            Err(e) => Err(format!("cannot open the database: {e}")),
-        };
+        let result = app::search(store, &req, &Budget::start());
         let elapsed = t.elapsed();
         if tx
             .send(UiAction::SearchDone {
@@ -476,11 +476,12 @@ mod tests {
         let redactor = crate::redact::Redactor::new();
         crate::import::import_file(&mut s, &hist, crate::import::SourceKind::Zsh, &redactor)
             .unwrap();
+        let s = Store::open_read_only(&db).unwrap();
         let mb = Arc::new(Mailbox::default());
         let (tx, rx) = mpsc::sync_channel(capacity);
         let h = {
             let mb = Arc::clone(&mb);
-            std::thread::spawn(move || search_worker(&db, &mb, &tx, debounce))
+            std::thread::spawn(move || search_worker(&s, &mb, &tx, debounce))
         };
         (mb, rx, h, dir)
     }

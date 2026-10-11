@@ -1,12 +1,14 @@
 use crate::domain::StoredObservation;
 use crate::rlm::evidence::{HandleId, HandleRegistry};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary};
+use crate::app::{self, Budget, Order, SearchRequest};
 use crate::rlm::protocol::*;
 use crate::store::Store;
 
 #[derive(Debug)]
 pub enum ExecError {
     Store(rusqlite::Error),
+    Search(app::SearchError),
     HandleNotFound(String),
     NoObservationsForExpand,
     Model(crate::rlm::model::ModelError),
@@ -32,13 +34,19 @@ pub fn execute_search(
         MatchMode::All => search.terms.join(" "),
     };
 
-    let hits = store
-        .search(&query, search.limit as usize)
-        .map_err(ExecError::Store)?;
+    // Through the shared use case, so the model's searches run under the
+    // same word cap and deadline as the user's (ADR 0006).
+    let req = SearchRequest {
+        query,
+        limit: search.limit as usize,
+        mode: app::MatchMode::Words,
+        order: Order::RecentlyImported,
+    };
+    let page = app::search(store, &req, &Budget::start()).map_err(ExecError::Search)?;
 
     // Fetch full StoredObservation for each hit.
-    let mut observations = Vec::with_capacity(hits.len());
-    for hit in &hits {
+    let mut observations = Vec::with_capacity(page.hits.len());
+    for hit in &page.hits {
         if let Some(obs) = store.get_observation(hit.id).map_err(ExecError::Store)? {
             observations.push(obs);
         }

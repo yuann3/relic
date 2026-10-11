@@ -42,7 +42,8 @@ impl std::fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 const MAX_OPS_PER_PLAN: usize = 8;
-const MAX_SEARCH_TERMS: usize = 12;
+/// The one word cap every search shares (ADR 0006).
+const MAX_SEARCH_TERMS: usize = crate::app::MAX_QUERY_WORDS;
 const MAX_ASSESS_ITEMS: u32 = 64;
 const MAX_EXPAND_PER_SIDE: u32 = 32;
 

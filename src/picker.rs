@@ -277,6 +277,8 @@ mod tests {
             limit: 10,
             truncated: false,
             deferred: None,
+            words_dropped: 0,
+            order: app::Order::RecentlyImported,
             hits,
         }
     }

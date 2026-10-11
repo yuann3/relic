@@ -129,7 +129,7 @@ fn escape(query: &str, last_prefix: bool) -> String {
 fn fts_sql(order: Order, ranged: bool) -> String {
     let range = if ranged { " AND rowid > ?3" } else { "" };
     let order = match order {
-        Order::Rank => "rank",
+        Order::Rank => "rank, rowid DESC",
         Order::RowidDesc => "rowid DESC",
     };
     format!(
@@ -701,8 +701,11 @@ fn end_to_end(path: &Path, name: &str, with_store: bool, runs: usize) {
                     query: text.to_owned(),
                     limit: page,
                     mode: if prefix { MatchMode::PrefixLast } else { MatchMode::Words },
+                    order: app::Order::Rank,
                 };
-                let (s, _) = measure(runs, || app::search(store, &req).unwrap().hits.len());
+                // Measured to the end: the bench wants the cost, not the cut-off.
+                let far = || app::Budget { deadline: Instant::now() + std::time::Duration::from_secs(600), cancel: None };
+                let (s, _) = measure(runs, || app::search(store, &req, &far()).unwrap().hits.len());
                 line.push_str(&format!(" {} |", cell(s)));
             } else if store.is_some() {
                 line.push_str(" n/a |");
@@ -1286,9 +1289,9 @@ mod tests {
         let conn = open_read(&db);
         let ids = |hits: Vec<relic::domain::SearchHit>| hits.iter().map(|h| h.id).collect::<Vec<_>>();
         for query in ["g", "gi", "gi pu", "git c", "git pu", "src/main.rs", "\""] {
-            let recent = ids(store.search_recent_prefix(query, 100).unwrap());
+            let recent = ids(store.search_prefix(query, 100).unwrap());
             assert_eq!(rowid_desc(&conn, query, true).unwrap_or_default(), recent, "{query:?}");
-            let ranked = ids(store.search(query, 100).unwrap());
+            let ranked = ids(store.search_ranked(query, false, 100).unwrap());
             let got = fts_rowids(&conn, &fts_sql(Order::Rank, false), &fts_params(&escape(query, false), 100, None))
                 .unwrap_or_default();
             assert_eq!(got, ranked, "{query:?}");

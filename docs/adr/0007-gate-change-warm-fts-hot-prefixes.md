@@ -57,4 +57,3 @@ User-perceptible impact:
 
 - How often real keystrokes hit the deadline on a real history (dogfooding; the fixture has 30 command prefixes and one command per second).
 - The measured sparse-AND floor for two high-frequency tokens that never co-occur at 1M (extrapolated about 60 ms).
-- Whether the interrupt lands inside a single merge ([0006](0006-search-ordering-and-query-budget.md)); if not, the bound is the longest single merge.

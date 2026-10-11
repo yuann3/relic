@@ -172,15 +172,27 @@ fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             // replaces the other notes; the status line still says
             // "(more exist)" for a full page.
             match p.deferred.as_deref() {
+                _ if s.too_broad => format!(
+                    "Results {} · still for \"{}\"",
+                    p.hits.len(),
+                    display_line(&p.query)
+                ),
                 Some(w) => format!(
                     "Results {} · \"{}\" needs {MIN_PREFIX_CHARS}+ chars",
                     p.hits.len(),
                     display_line(w)
                 ),
-                None if p.truncated => {
-                    format!("Results {} (page full; narrow the query) · newest first", p.hits.len())
+                None if p.words_dropped > 0 => {
+                    let s = if p.words_dropped == 1 { "" } else { "s" };
+                    format!("Results {} · {} word{s} ignored", p.hits.len(), p.words_dropped)
                 }
-                None => format!("Results {} · newest first", p.hits.len()),
+                // "+" for a full page: the label must survive a narrow pane,
+                // and the status line spells out "(more exist)".
+                None => format!(
+                    "Results {}{} · recently imported",
+                    p.hits.len(),
+                    if p.truncated { "+" } else { "" }
+                ),
             }
         }
         None => "Results".into(),
@@ -381,6 +393,10 @@ fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let search = match (&s.error, s.pending, &s.page, s.latency) {
         (Some(_), _, _, _) => Span::styled("search: failed", t.bad),
         (None, true, _, _) => Span::styled("search: running", t.busy),
+        (None, false, Some(_), _) if s.too_broad => Span::styled(
+            format!("search: too broad, stopped after {} ms", crate::app::QUERY_DEADLINE.as_millis()),
+            t.bad,
+        ),
         (None, false, Some(p), Some(lat)) => Span::raw(format!(
             "search: {} hits in {:.1} ms{}",
             p.hits.len(),
@@ -535,8 +551,9 @@ mod tests {
                             query,
                             limit: 200,
                             mode: MatchMode::PrefixLast,
+                            order: app::Order::RecentlyImported,
                         };
-                        let result = app::search(store, &req).map_err(|e| e.to_string());
+                        let result = app::search(store, &req, &app::Budget::start());
                         let elapsed = Duration::from_micros(1500);
                         queue.push(UiAction::SearchDone {
                             generation,
@@ -642,7 +659,35 @@ mod tests {
         let s = text(&render(&typed(&store, "certbot r", false), 120, 40));
         assert!(s.contains("Results 1 · \"r\" needs 2+ chars"), "{s}");
         let s = text(&render(&typed(&store, "certbot re", false), 120, 40));
-        assert!(s.contains("[ Results 1 · newest first ]"), "{s}");
+        assert!(s.contains("[ Results 1 · recently imported ]"), "{s}");
+    }
+
+    #[test]
+    fn results_say_when_words_were_ignored_and_keep_the_order_label_on_a_full_page() {
+        let store = store_with(NGINX);
+        let long = vec!["x"; crate::app::MAX_WORD_TOKENS + 1].join("/");
+        let s = text(&render(&typed(&store, &format!("certbot {long} "), false), 120, 40));
+        assert!(s.contains("[ Results 1 · 1 word ignored ]"), "{s}");
+
+        let mut m = typed(&store, "certbot re", false);
+        m.search.page.as_mut().unwrap().truncated = true;
+        // The narrowest three-pane layout: the label is not cut off.
+        let s = text(&render(&m, 100, 40));
+        assert!(s.contains("[ Results 1+ · recently imported ]"), "{s}");
+    }
+
+    #[test]
+    fn a_too_broad_query_says_whose_page_is_still_shown() {
+        let store = store_with(NGINX);
+        let mut m = typed(&store, "certbot re", false);
+        update(&mut m, UiAction::Key(Key::Char('n')));
+        let generation = m.search.generation;
+        let result = Err(crate::app::SearchError::TooBroad);
+        update(&mut m, UiAction::SearchDone { generation, result, elapsed: Duration::from_millis(100) });
+        let s = text(&render(&m, 120, 40));
+        assert!(s.contains("> certbot ren"), "{s}");
+        assert!(s.contains("[ Results 1 · still for \"certbot re\" ]"), "{s}");
+        assert!(s.contains("search: too broad, stopped after 100 ms"), "{s}");
     }
 
     #[test]
@@ -813,6 +858,8 @@ mod tests {
             limit: 200,
             truncated: false,
             deferred: None,
+            words_dropped: 0,
+            order: crate::app::Order::RecentlyImported,
             hits: vec![hit],
         };
         let generation = m.search.generation;

@@ -2,7 +2,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use relic::app::{self, MatchMode, SearchRequest};
+use relic::app::{self, Budget, MatchMode, Order, SearchError, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
 use relic::import::{History, ImportError, ImportResult, Outcome, SourceKind};
 use relic::picker::PickError;
@@ -57,7 +57,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
             let owns_dir = cli::owns_data_dir(&db);
             let db = existing_db(db)?;
             tighten(&db, owns_dir);
-            let (forgotten, scrubbed) = Store::open(&db)?.forget(&ids).map_err(|e| e.to_string())?;
+            let (forgotten, scrubbed) = Store::open(&db)?.forget(&ids)?;
             for id in &forgotten {
                 eprintln!("relic: forgot record #{id}");
             }
@@ -171,19 +171,25 @@ fn import(
     history: &History,
     shell: Option<SourceKind>,
 ) -> std::result::Result<ImportResult, ImportError> {
-    // Opening writes too, so a busy store can already refuse here.
-    let mut store = Store::open(db).map_err(StoreError::from)?;
+    let mut store = Store::open(db)?;
     relic::import::import(&mut store, history, shell, &relic::redact::Redactor::new())
 }
 
 fn search(args: SearchArgs) -> Result<ExitCode> {
-    let store = Store::open(&existing_db(args.db)?)?;
+    let store = match Store::open_read_only(&existing_db(args.db)?) {
+        Err(e @ StoreError::Busy) => return Ok(could_not_look(&e)),
+        store => store?,
+    };
     let mode = if args.prefix { MatchMode::PrefixLast } else { MatchMode::Words };
+    let order = if args.rank { Order::Rank } else { Order::RecentlyImported };
     // fzf is for narrowing a broad page; 20 rows would defeat it.
     let default_limit = if args.output == Output::Fzf { app::MAX_PAGE } else { 20 };
     let limit = args.limit.unwrap_or(default_limit);
-    let req = SearchRequest { query: args.query, limit, mode };
-    let page = app::search(&store, &req)?;
+    let req = SearchRequest { query: args.query, limit, mode, order };
+    let page = match app::search(&store, &req, &Budget::start()) {
+        Err(e @ (SearchError::TooBroad | SearchError::Cancelled)) => return Ok(could_not_look(&e)),
+        page => page?,
+    };
     let mut out = std::io::stdout().lock();
     match args.output {
         Output::Json => {
@@ -225,6 +231,12 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// "Could not look" is not "nothing found": exit 2, not 1 (ADR 0011).
+fn could_not_look(e: &dyn std::error::Error) -> ExitCode {
+    eprintln!("relic: {e}");
+    ExitCode::from(2)
+}
+
 fn print_page(out: &mut impl Write, page: &app::SearchPage) -> Result<()> {
     for h in &page.hits {
         writeln!(out, "{} {:<4}  {}", h.when().label(), h.source, app::display_line(&h.text))?;
@@ -240,6 +252,15 @@ fn page_notes(page: &app::SearchPage) {
             "(\"{}\" is too short to filter by; type {}+ characters)",
             app::display_line(w),
             app::MIN_PREFIX_CHARS
+        );
+    }
+    if page.words_dropped > 0 {
+        eprintln!(
+            "({} word{} ignored: a query uses at most {} words of at most {} parts each)",
+            page.words_dropped,
+            if page.words_dropped == 1 { "" } else { "s" },
+            app::MAX_QUERY_WORDS,
+            app::MAX_WORD_TOKENS
         );
     }
     if page.truncated {

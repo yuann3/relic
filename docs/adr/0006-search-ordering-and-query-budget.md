@@ -27,6 +27,9 @@ Query budget:
 - A tokens-per-word cap, which bounds a single word that tokenizes into a long phrase.
 - Every query runs under a progress-handler deadline plus a cancel flag (rusqlite `hooks` feature). A stopped query returns `TooBroad` or `Cancelled`.
 - Both caps are reported in the JSON page (`words_dropped`).
+- Values set by S3 on the 1M fixture (macOS arm64): tokens-per-word cap **16**, which keeps real paths and URLs; deadline **100 ms**; epsilon **20 ms** for a fresh process, which covers start-up, the read-only open and the stop itself.
+- The stop lands inside a single prefix merge and a single phrase scan: FTS5 reads its index through statements of its own, so the progress handler fires during one. `"ta"*`, a 20 ms merge, stopped 0.06 ms after a 1 ms deadline. Polling every 100 VM steps, a stop landed under 2 ms after the deadline; every 1000, up to 10 ms.
+- The tokens-per-word cap is what bounds the 51-token word: it is dropped and counted, and never reaches FTS5. The deadline is proved on what the caps let through: one word of 16 hot tokens (317 ms unbounded) and `task` by rank (250 ms unbounded) both stop as `TooBroad`.
 
 ## Amends
 
@@ -54,5 +57,4 @@ Query budget:
 
 ## Open facts
 
-- Whether the progress-handler interrupt lands inside a single FTS5 prefix merge or phrase scan at 1M (S1c).
-- The tokens-per-word cap value, and the deadline value with its epsilon; the S1c bench sets and proves both.
+- The same measurements on Linux x86_64 (the release slice).

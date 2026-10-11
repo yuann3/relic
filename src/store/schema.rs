@@ -1,35 +1,85 @@
-use rusqlite::Connection;
+use std::path::Path;
 
+use rusqlite::{Connection, ErrorCode};
+
+use super::StoreError;
+
+/// Kept in `PRAGMA user_version`: a reader can check it without a table to
+/// read it from, and a file that is not Relic's says 0 (ADR 0005).
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Initialize pragmas and create tables if they don't exist.
-pub fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
-    // Pragmas — applied on every connection open.
+/// How long a connection waits on another's lock before it is `Busy`. Set
+/// through the API, which reads nothing: the version check comes first.
+pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The version the file at `path` claims (0 for a file no Relic stamped),
+/// and whether it holds nothing at all. One statement, so one snapshot: a
+/// first import committing between two reads would look like a foreign file.
+pub fn stored_version(conn: &Connection, path: &Path) -> Result<(i64, bool), StoreError> {
+    let read = conn.query_row(
+        "SELECT user_version, (SELECT COUNT(*) FROM sqlite_master) = 0 FROM pragma_user_version",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    );
+    match read {
+        Err(e) if e.sqlite_error_code() == Some(ErrorCode::NotADatabase) => {
+            Err(StoreError::NotRelic(path.to_path_buf()))
+        }
+        read => Ok(read?),
+    }
+}
+
+/// Refuse any version but this build's.
+pub fn check_version(version: i64, path: &Path) -> Result<(), StoreError> {
+    match version {
+        v if v == i64::from(SCHEMA_VERSION) => Ok(()),
+        0 => Err(StoreError::NotRelic(path.to_path_buf())),
+        found => Err(StoreError::Version { path: path.to_path_buf(), found }),
+    }
+}
+
+/// Set the writer's pragmas, and create the schema in a file that has none.
+pub fn initialize(conn: &Connection, path: &Path) -> Result<(), StoreError> {
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // Decided before anything writes: `journal_mode = WAL` alone would
+    // convert a file that is another program's.
+    let (version, empty) = stored_version(conn, path)?;
+    if !empty {
+        check_version(version, path)?;
+    }
+
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA temp_store = MEMORY;
-         PRAGMA busy_timeout = 250;
          PRAGMA cache_size = -16384;
          PRAGMA secure_delete = ON;",
     )?;
 
-    // Schema creation — idempotent via IF NOT EXISTS.
-    conn.execute_batch(SCHEMA_SQL)?;
-
-    // Without this FTS5 only tombstones a deleted row and its terms stay in
-    // the index until some later merge: a forgotten secret would still be on
-    // disk. The setting is stored in the index, so once is enough.
-    conn.execute("INSERT INTO observation_fts (observation_fts, rank) VALUES ('secure-delete', 1)", [])?;
-
-    // Set version if not present.
-    conn.execute(
-        "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', ?1)",
-        [SCHEMA_VERSION.to_string()],
-    )?;
-
+    if empty {
+        // One transaction, so a reader never finds half a schema, and the
+        // version goes in last. Without 'secure-delete' FTS5 only tombstones
+        // a deleted row and its terms stay in the index until some later
+        // merge: a forgotten secret would still be on disk. The setting is
+        // stored in the index, so once is enough.
+        conn.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             {SCHEMA_SQL}
+             INSERT INTO observation_fts (observation_fts, rank) VALUES ('secure-delete', 1);
+             PRAGMA user_version = {SCHEMA_VERSION};
+             COMMIT;"
+        ))?;
+    }
     Ok(())
+}
+
+/// What a reader may set: nothing here writes to the file.
+pub fn configure_reader(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = -16384;",
+    )
 }
 
 const SCHEMA_SQL: &str = "

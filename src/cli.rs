@@ -10,7 +10,7 @@ pub const USAGE: &str = "\
 relic — recall what you did in the terminal, with evidence
 
 USAGE:
-    relic search <QUERY>... [--db PATH] [--limit N] [--prefix] [--json | --fzf]
+    relic search <QUERY>... [--db PATH] [--limit N] [--prefix] [--rank] [--json | --fzf]
     relic ui [--db PATH]
     relic import <HISTORY_FILE> [--shell zsh|bash] [--db PATH]
     relic forget <ID>... [--db PATH]
@@ -21,6 +21,8 @@ OPTIONS:
                   $XDG_DATA_HOME/relic/relic.db (~/.local/share/relic/relic.db)
     --limit N     Maximum results (default 20, or 5000 with --fzf; capped at 5000)
     --prefix      Let the last word match as a prefix, as the TUI does
+    --rank        Order by relevance. Default: most recently imported first,
+                  which is import order, not the time a command ran
     --json        Print one relic.search/v1 document on stdout
     --fzf         Pick one result with fzf and show its evidence
     forget        Delete records for good, by the id search --json and the TUI
@@ -48,6 +50,7 @@ pub struct SearchArgs {
     /// None means the output's default page size.
     pub limit: Option<usize>,
     pub prefix: bool,
+    pub rank: bool,
     pub output: Output,
 }
 
@@ -126,7 +129,7 @@ fn parse_search(
     mut args: impl Iterator<Item = Result<String, String>>,
 ) -> Result<Command, String> {
     let (mut words, mut db, mut limit, mut prefix) = (Vec::new(), None, None, false);
-    let (mut json, mut fzf) = (false, false);
+    let (mut json, mut fzf, mut rank) = (false, false, false);
     let mut options_done = false;
     while let Some(a) = args.next().transpose()? {
         match a.as_str() {
@@ -143,6 +146,7 @@ fn parse_search(
                 limit = Some(n);
             }
             "--prefix" => prefix = true,
+            "--rank" => rank = true,
             "--json" => json = true,
             "--fzf" => fzf = true,
             f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
@@ -158,7 +162,7 @@ fn parse_search(
         (false, true) => Output::Fzf,
         (false, false) => Output::Text,
     };
-    Ok(Command::Search(SearchArgs { query: words.join(" "), db, limit, prefix, output }))
+    Ok(Command::Search(SearchArgs { query: words.join(" "), db, limit, prefix, rank, output }))
 }
 
 fn value(
@@ -226,7 +230,8 @@ mod tests {
         assert_eq!(search(&["search", "x"]).limit, None);
         assert_eq!(s.output, Output::Json);
         assert_eq!(s.db, Some(PathBuf::from("x.db")));
-        assert!(!s.prefix);
+        assert!(!s.prefix && !s.rank);
+        assert!(search(&["search", "x", "--rank"]).rank);
     }
 
     #[test]

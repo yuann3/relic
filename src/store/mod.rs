@@ -4,13 +4,29 @@ pub use schema::SCHEMA_VERSION;
 
 use crate::domain::{Observation, ObservationKind, Provenance, SearchHit, StoredObservation};
 use crate::import::SourceKind;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
+use std::path::{Path, PathBuf};
 
-/// A failed write to the store.
+/// SQLite VM steps between polls of `Store::interruptible`'s check. FTS5 reads
+/// its index through statements of its own, so the count advances inside one
+/// prefix merge or phrase scan too, only slowly: on the 1M fixture a stop
+/// landed up to 10 ms late at 1000 steps and under 2 ms late at 100, with no
+/// measurable cost to the query.
+const PROGRESS_STEPS: i32 = 100;
+
+/// A failed open of, or write to, the store.
 #[derive(Debug)]
 pub enum StoreError {
-    /// Another connection held the write lock past the 250 ms busy_timeout.
+    /// Another connection held a lock past the 250 ms busy_timeout.
     Busy,
+    /// Not SQLite, another program's database, or a store from a pre-release
+    /// build, which ADR 0005 discards.
+    NotRelic(PathBuf),
+    /// A store written under another schema version.
+    Version { path: PathBuf, found: i64 },
+    /// A reader needs to create the WAL's side files, and this file or
+    /// directory would not let it.
+    Unwritable(PathBuf),
     Sqlite(rusqlite::Error),
     /// The OS random source failed while minting a source's logical id.
     Entropy(getrandom::Error),
@@ -28,7 +44,24 @@ impl From<rusqlite::Error> for StoreError {
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Busy => write!(f, "busy: another relic import is writing the store"),
+            Self::Busy => write!(f, "busy: another relic is using the store; try again"),
+            Self::NotRelic(path) => write!(
+                f,
+                "{} is not a store this relic can read: it is another program's file, or a \
+                 pre-release relic wrote it. Move it away and run `relic import` again",
+                path.display()
+            ),
+            Self::Version { path, found } => write!(
+                f,
+                "{} is store version {found} and this relic reads version {SCHEMA_VERSION}. Use the \
+                 relic that wrote it, or move it away and run `relic import` again",
+                path.display()
+            ),
+            Self::Unwritable(path) => write!(
+                f,
+                "{} is not writable: relic needs write access to a store and its directory even to read it",
+                path.display()
+            ),
             Self::Sqlite(e) => write!(f, "{e}"),
             Self::Entropy(e) => write!(f, "no random bytes for a source id: {e}"),
         }
@@ -261,20 +294,61 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open or create a store at the given path.
-    pub fn open(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
+    /// Open or create a store at the given path, to write to it.
+    pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
-        schema::initialize(&conn)?;
-        let mut key_path = path.as_os_str().to_owned();
-        key_path.push(".key");
-        Ok(Self { conn, key_path: Some(key_path.into()) })
+        schema::initialize(&conn, path)?;
+        Ok(Self { conn, key_path: Some(key_path(path)) })
+    }
+
+    /// Open an existing store to read it. Nothing here writes to the file:
+    /// no DDL, no journal switch, no write lock, so it reads while an import
+    /// is writing and never stamps Relic's schema into another file (ADR 0005).
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        // Even a reader creates the WAL's -shm beside the database. Where it
+        // cannot, SQLite fails with "unable to open database file"; beside a
+        // read-only database it leaves read-only side files that block the
+        // next import. Refuse both before SQLite touches anything.
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        for needed in [path, dir] {
+            if !writable(needed) {
+                return Err(StoreError::Unwritable(needed.to_path_buf()));
+            }
+        }
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        conn.busy_timeout(schema::BUSY_TIMEOUT)?;
+        // The first read is where a reader meets a store that another relic
+        // is recovering after a crashed write: measured on bundled SQLite
+        // 3.49.1, that is SQLITE_BUSY_RECOVERY once busy_timeout runs out.
+        // One retry, said out loud, and no loop (ADR 0005).
+        let (version, _) = match schema::stored_version(&conn, path) {
+            Err(StoreError::Busy) => {
+                eprintln!("relic: note: the store was busy, as it is while another relic recovers it; trying once more");
+                schema::stored_version(&conn, path)?
+            }
+            version => version?,
+        };
+        schema::check_version(version, path)?;
+        schema::configure_reader(&conn)?;
+        Ok(Self { conn, key_path: Some(key_path(path)) })
     }
 
     /// Open an in-memory store (for tests).
-    pub fn open_memory() -> Result<Self, rusqlite::Error> {
+    pub fn open_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
-        schema::initialize(&conn)?;
+        schema::initialize(&conn, Path::new(":memory:"))?;
         Ok(Self { conn, key_path: None })
+    }
+
+    /// Run `f` while polling `stop`. Once `stop` returns true the running
+    /// statement fails with an error `is_interrupt` recognises. FTS5 does a
+    /// query's work inside SQLite, so this is the only way to give up on one.
+    pub fn interruptible<T>(&self, stop: impl FnMut() -> bool + Send + 'static, f: impl FnOnce(&Self) -> T) -> T {
+        self.conn.progress_handler(PROGRESS_STEPS, Some(stop));
+        let out = f(self);
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+        out
     }
 
     /// The installation key's file, beside the database (see `crate::key`).
@@ -294,11 +368,7 @@ impl Store {
 
     /// Return the stored schema version.
     pub fn schema_version(&self) -> Result<i64, rusqlite::Error> {
-        self.conn
-            .query_row("SELECT value FROM schema_meta WHERE key = 'version'", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .map(|v| v.parse::<i64>().unwrap_or(0))
+        self.conn.query_row("PRAGMA user_version", [], |row| row.get(0))
     }
 
     /// Take the write lock and read the newest revision of the source at
@@ -491,33 +561,31 @@ impl Store {
         Ok(busy == 0)
     }
 
-    /// Search observations via FTS5. Query terms are escaped (no raw FTS syntax).
-    /// Returns up to `limit` hits ranked by BM25.
-    ///
-    /// Two-step: (1) FTS5 narrowing with `ORDER BY rank` for the internal
-    /// priority-queue optimization, (2) fetch observation metadata by rowid.
+    /// Matches where every word matches whole, most recently imported first
+    /// (ADR 0006). Query terms are escaped (no raw FTS syntax). Rank must
+    /// score every match before returning any, while rowid order lets FTS5
+    /// stop after `limit` rows (260 ms vs 0.04 ms at 1M).
+    /// Hits carry score 0.0. Rowid order is import order, not observed time.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
-        self.search_fts(&escape_fts_query(query, false), limit, true)
+        self.search_fts(&escape_fts_query(query, false), limit, false)
     }
 
-    /// Newest-first matches where the last word is a prefix, so partially
-    /// typed input ("gi") finds completed words ("git"). Rank must score every
-    /// match before returning any, while rowid order lets FTS5 stop after
-    /// `limit` rows for whole words (260 ms vs 0.04 ms at 1M). An unindexed
-    /// prefix still merges all its postings first; see
-    /// docs/research/interactive-fts-measurements.md.
-    /// Hits carry score 0.0. Rowid order is import order, not observed time.
-    pub fn search_recent_prefix(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchHit>, rusqlite::Error> {
+    /// `search` where the last word is a prefix, so partially typed input
+    /// ("gi") finds completed words ("git"). A prefix merges all its postings
+    /// before the first row; see docs/research/interactive-fts-measurements.md.
+    pub fn search_prefix(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
         self.search_fts(&escape_fts_query(query, true), limit, false)
     }
 
-    /// Newest-first matches where every word matches whole.
-    pub fn search_recent(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
-        self.search_fts(&escape_fts_query(query, false), limit, false)
+    /// Matches by BM25 rank, the more recently imported first among equals.
+    /// Costs about 0.5 µs per match, so run it under `interruptible`.
+    pub fn search_ranked(
+        &self,
+        query: &str,
+        last_prefix: bool,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, rusqlite::Error> {
+        self.search_fts(&escape_fts_query(query, last_prefix), limit, true)
     }
 
     /// The newest observations, unfiltered.
@@ -545,7 +613,7 @@ impl Store {
         let sql = if by_rank {
             "SELECT rowid, rank FROM observation_fts
              WHERE observation_fts MATCH ?1
-             ORDER BY rank
+             ORDER BY rank, rowid DESC
              LIMIT ?2"
         } else {
             "SELECT rowid, 0.0 FROM observation_fts
@@ -576,7 +644,9 @@ impl Store {
 
         let mut hits = Vec::with_capacity(ranked.len());
         for (rowid, score) in ranked {
-            if let Ok((mut hit, revision_id, ordinal)) = obs_stmt
+            // Only a row deleted since step 1 is skipped: an interrupt or an
+            // I/O error must fail the page, not shorten it.
+            if let Some((mut hit, revision_id, ordinal)) = obs_stmt
                 .query_row([rowid], |row| {
                     let kind_val: i64 = row.get(2)?;
                     let hit = SearchHit {
@@ -590,6 +660,7 @@ impl Store {
                     };
                     Ok((hit, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?))
                 })
+                .optional()?
             {
                 if hit.observed_at_ms.is_none() {
                     hit.observed_before_ms = self.observed_no_later_than(revision_id, ordinal)?;
@@ -658,10 +729,25 @@ impl Store {
     }
 }
 
-/// Escape user/model text into a safe FTS5 query.
-/// Each word becomes a quoted phrase token. No raw FTS operators pass through;
-/// the only operator Relic itself adds is `*` on the last token when
-/// `last_prefix` is set.
+/// The error a statement fails with once `Store::interruptible`'s `stop`
+/// returned true.
+pub fn is_interrupt(e: &rusqlite::Error) -> bool {
+    e.sqlite_error_code() == Some(ErrorCode::OperationInterrupted)
+}
+
+fn key_path(db: &Path) -> PathBuf {
+    let mut path = db.as_os_str().to_owned();
+    path.push(".key");
+    path.into()
+}
+
+fn writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
+
 fn scrub_pending(tx: &Transaction<'_>) -> Result<bool, rusqlite::Error> {
     tx.query_row("SELECT EXISTS (SELECT 1 FROM schema_meta WHERE key = 'scrub_pending')", [], |r| r.get(0))
 }
@@ -684,6 +770,10 @@ fn parser_contract(kind: SourceKind) -> &'static str {
     }
 }
 
+/// Escape user/model text into a safe FTS5 query.
+/// Each word becomes a quoted phrase token. No raw FTS operators pass through;
+/// the only operator Relic itself adds is `*` on the last token when
+/// `last_prefix` is set.
 fn escape_fts_query(query: &str, last_prefix: bool) -> String {
     let tokens: Vec<&str> = query.split_whitespace().collect();
     let last = tokens.len().saturating_sub(1);
@@ -886,12 +976,12 @@ mod tests {
         ]);
 
         assert!(store.search("gi", 10).unwrap().is_empty());
-        let hits = store.search_recent_prefix("gi", 10).unwrap();
+        let hits = store.search_prefix("gi", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].safe_text, "git push origin main");
         // Earlier words still match whole.
-        assert!(store.search_recent_prefix("gi pu", 10).unwrap().is_empty());
-        assert_eq!(store.search_recent_prefix("git pu", 10).unwrap().len(), 1);
+        assert!(store.search_prefix("gi pu", 10).unwrap().is_empty());
+        assert_eq!(store.search_prefix("git pu", 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -900,8 +990,8 @@ mod tests {
         insert(&mut store, &[make_observation(0, "echo NEAR(a b)")]);
 
         // A stray quote or operator in user input must not become FTS syntax.
-        assert!(store.search_recent_prefix("\"", 10).unwrap().is_empty());
-        assert_eq!(store.search_recent_prefix("NEAR(a", 10).unwrap().len(), 1);
+        assert!(store.search_prefix("\"", 10).unwrap().is_empty());
+        assert_eq!(store.search_prefix("NEAR(a", 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -917,10 +1007,10 @@ mod tests {
 
         let texts = |hits: Vec<SearchHit>| hits.into_iter().map(|h| h.safe_text).collect::<Vec<_>>();
         assert_eq!(
-            texts(store.search_recent_prefix("gi", 10).unwrap()),
+            texts(store.search_prefix("gi", 10).unwrap()),
             ["git push origin main --force", "git commit -m one two three four", "git"]
         );
-        assert_eq!(texts(store.search("git", 1).unwrap()), ["git"]);
+        assert_eq!(texts(store.search_ranked("git", false, 1).unwrap()), ["git"]);
         assert_eq!(texts(store.recent(2).unwrap()), ["git push origin main --force", "ls"]);
     }
 
@@ -1064,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_reader_searches_while_an_import_transaction_is_open() {
+    fn read_only_store_searches_while_an_import_transaction_is_open() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("relic.db");
         let mut store = Store::open(&db).unwrap();
@@ -1077,25 +1167,177 @@ mod tests {
         let mut writing = begin(&mut store, b"/other");
         writing.insert(&make_observation(0, "needle pending")).unwrap();
 
-        let reader = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
-        let found = |reader: &Connection| -> Vec<String> {
-            reader
-                .prepare(
-                    "SELECT o.safe_text FROM observation_fts f JOIN observation o ON o.id = f.rowid
-                     WHERE observation_fts MATCH 'needle' ORDER BY o.id",
-                )
-                .unwrap()
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
+        // Opened while the write lock is held: a writing open would be Busy here.
+        let reader = Store::open_read_only(&db).unwrap();
+        let found = |reader: &Store| -> Vec<String> {
+            reader.search("needle", 10).unwrap().into_iter().map(|h| h.safe_text).collect()
         };
         assert_eq!(found(&reader), ["needle committed"]);
 
         writing.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
-        assert_eq!(found(&reader), ["needle committed", "needle pending"]);
+        assert_eq!(found(&reader), ["needle pending", "needle committed"]);
     }
+
+    fn side_files(db: &Path) -> Vec<PathBuf> {
+        ["-wal", "-shm", "-journal", ".key"]
+            .iter()
+            .map(|suffix| {
+                let mut path = db.as_os_str().to_owned();
+                path.push(suffix);
+                PathBuf::from(path)
+            })
+            .filter(|path| path.exists())
+            .collect()
+    }
+
+    /// Another program's database, an empty file, a file that is not SQLite,
+    /// and a store a pre-release relic wrote (relic's tables, no version).
+    fn not_relics(dir: &Path) -> Vec<PathBuf> {
+        let foreign = dir.join("notes.db");
+        Connection::open(&foreign).unwrap().execute_batch("CREATE TABLE notes(x)").unwrap();
+        let empty = dir.join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        let text = dir.join("text.db");
+        std::fs::write(&text, "not sqlite at all\n".repeat(20)).unwrap();
+        let prototype = dir.join("prototype.db");
+        drop(Store::open(&prototype).unwrap());
+        Connection::open(&prototype)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 0; PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        vec![foreign, empty, text, prototype]
+    }
+
+    #[test]
+    fn a_reader_refuses_a_file_that_is_not_a_store_and_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in not_relics(dir.path()) {
+            let before = std::fs::read(&path).unwrap();
+            let err = Store::open_read_only(&path).err().expect("must refuse");
+            assert!(matches!(&err, StoreError::NotRelic(p) if *p == path), "{err}");
+            assert!(err.to_string().contains("relic import"), "no hint: {err}");
+            assert!(std::fs::read(&path).unwrap() == before, "{} changed", path.display());
+            // The pre-release store is in WAL mode, and reading even its
+            // header creates the -wal and -shm.
+            if !path.ends_with("prototype.db") {
+                assert_eq!(side_files(&path), Vec::<PathBuf>::new());
+            }
+        }
+    }
+
+    #[test]
+    fn a_writer_refuses_another_programs_file_and_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in not_relics(dir.path()) {
+            // An empty file is nobody's: a writer may make it a store.
+            if path.ends_with("empty.db") {
+                continue;
+            }
+            let before = std::fs::read(&path).unwrap();
+            let err = Store::open(&path).err().expect("must refuse");
+            assert!(matches!(&err, StoreError::NotRelic(p) if *p == path), "{err}");
+            assert!(std::fs::read(&path).unwrap() == before, "{} changed", path.display());
+        }
+    }
+
+    #[test]
+    fn both_opens_refuse_another_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        drop(Store::open(&db).unwrap());
+        Connection::open(&db).unwrap().execute_batch("PRAGMA user_version = 99").unwrap();
+        for open in [Store::open, Store::open_read_only] {
+            let err = open(&db).err().expect("must refuse");
+            assert!(matches!(err, StoreError::Version { found: 99, .. }), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_reader_cannot_write_and_a_search_changes_no_byte_of_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let (store, _) = store_with(&db, &["cargo build"]);
+        assert!(store.checkpoint().unwrap());
+        drop(store);
+        let before = std::fs::read(&db).unwrap();
+
+        let reader = Store::open_read_only(&db).unwrap();
+        assert_eq!(reader.search("cargo", 10).unwrap().len(), 1);
+        let err = reader.conn.execute("DELETE FROM observation", []).unwrap_err();
+        assert_eq!(err.sqlite_error_code(), Some(ErrorCode::ReadOnly), "{err}");
+        drop(reader);
+        assert!(std::fs::read(&db).unwrap() == before, "the search wrote to the database");
+    }
+
+    #[test]
+    fn a_reader_refuses_what_it_cannot_write_beside_and_leaves_no_side_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let db = sub.join("relic.db");
+        let (store, _) = store_with(&db, &["cargo build"]);
+        assert!(store.checkpoint().unwrap());
+        // The last connection to close removes the -wal and -shm.
+        drop(store);
+        let clean = side_files(&db);
+
+        mode(&db, 0o444);
+        let err = Store::open_read_only(&db).err().expect("read-only file");
+        assert!(matches!(&err, StoreError::Unwritable(p) if *p == db), "{err}");
+        mode(&db, 0o644);
+
+        mode(&sub, 0o555);
+        let err = Store::open_read_only(&db).err().expect("read-only directory");
+        mode(&sub, 0o755);
+        assert!(matches!(&err, StoreError::Unwritable(p) if *p == sub), "{err}");
+        assert_eq!(side_files(&db), clean);
+    }
+
+    #[test]
+    fn interruptible_stops_a_running_search_and_only_that_one() {
+        let mut store = Store::open_memory().unwrap();
+        let batch: Vec<Observation> = (0..2_000).map(|i| make_observation(i, &format!("git commit {i}"))).collect();
+        insert(&mut store, &batch);
+
+        let err = store.interruptible(|| true, |s| s.search_ranked("git", false, 10)).unwrap_err();
+        assert!(is_interrupt(&err), "{err}");
+        // The handler goes away with the call.
+        assert_eq!(store.search_ranked("git", false, 10).unwrap().len(), 10);
+
+        // An interrupt while the rows are fetched fails the page: it used to
+        // drop the rest and return a short page as if it were complete. Where
+        // the n-th poll lands is SQLite's business, so try each in turn.
+        let limit = 2_000;
+        let mut interrupted = 0;
+        for nth in 0..64 {
+            let polls = std::sync::atomic::AtomicUsize::new(0);
+            let stop = move || polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= nth;
+            match store.interruptible(stop, |s| s.search("git", limit)) {
+                Ok(hits) => assert_eq!(hits.len(), limit, "poll {nth}: a short page passed off as whole"),
+                Err(e) => {
+                    assert!(is_interrupt(&e), "{e}");
+                    interrupted += 1;
+                }
+            }
+        }
+        assert!(interrupted > 1, "no poll landed while the rows were fetched");
+    }
+
+    #[test]
+    fn rank_ties_come_most_recently_imported_first() {
+        let mut store = Store::open_memory().unwrap();
+        let ids = insert(&mut store, &[
+            make_observation(0, "git push"),
+            make_observation(1, "ls"),
+            make_observation(2, "git push"),
+            make_observation(3, "git push"),
+        ]);
+        let got: Vec<i64> = store.search_ranked("push", false, 10).unwrap().iter().map(|h| h.id).collect();
+        assert_eq!(got, [ids[3], ids[2], ids[0]]);
+    }
+
     /// Every byte SQLite keeps for `db`: the file, its WAL and its shared memory.
     fn on_disk(db: &std::path::Path) -> Vec<u8> {
         ["", "-wal", "-shm"]

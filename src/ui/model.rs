@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use crate::app::{EvidenceView, SearchPage};
+use crate::app::{EvidenceView, SearchError, SearchPage};
 
 /// Rows asked of the index per keystroke. The picker and the list both work
 /// on this page; broad queries say "narrow it" instead of growing it.
@@ -88,7 +88,7 @@ pub enum UiAction {
     Tick(Instant),
     SearchDone {
         generation: u64,
-        result: Result<SearchPage, String>,
+        result: Result<SearchPage, SearchError>,
         elapsed: Duration,
     },
     EvidenceLoaded {
@@ -156,6 +156,9 @@ pub struct SearchState {
     /// Query time measured inside the worker, around `app::search` only.
     pub latency: Option<Duration>,
     pub error: Option<String>,
+    /// The newest query ran out of its budget, and `page` is still the one
+    /// for an earlier query (ADR 0007).
+    pub too_broad: bool,
 }
 
 impl SearchState {
@@ -346,7 +349,14 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
             m.dirty = true;
             m.search.pending = false;
             m.search.latency = Some(elapsed);
+            m.search.too_broad = false;
             match result {
+                // Typing through a hot prefix must not blank the pane: the
+                // page stays, and the view says whose page it is.
+                Err(SearchError::TooBroad) if m.search.page.is_some() => {
+                    m.search.too_broad = true;
+                    vec![]
+                }
                 Ok(page) => {
                     m.search.error = None;
                     m.search.selected = 0;
@@ -367,7 +377,7 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
                 Err(e) => {
                     // The old page belongs to a different query; showing it
                     // under "search: failed" would pass it off as this one's.
-                    m.search.error = Some(e);
+                    m.search.error = Some(e.to_string());
                     m.search.page = None;
                     m.search.selected = 0;
                     m.evidence.clear();
@@ -748,6 +758,8 @@ mod tests {
             limit: PAGE_LIMIT,
             truncated: false,
             deferred: None,
+            words_dropped: 0,
+            order: crate::app::Order::RecentlyImported,
             hits: ids
                 .iter()
                 .map(|&id| hit(id, &format!("{query} cmd {id}")))
@@ -915,6 +927,37 @@ mod tests {
     }
 
     #[test]
+    fn a_too_broad_search_keeps_the_previous_page_until_one_finishes() {
+        let too_broad = |m: &mut UiModel| {
+            let generation = m.search.generation;
+            let result = Err(SearchError::TooBroad);
+            update(m, UiAction::SearchDone { generation, result, elapsed: Duration::from_millis(100) })
+        };
+        let mut m = with_results();
+        let shown = m.search.page.as_ref().unwrap().query.clone();
+        m.search.selected = 1;
+        keys(&mut m, "x");
+        assert!(too_broad(&mut m).is_empty());
+        assert_eq!(m.search.page.as_ref().map(|p| p.query.as_str()), Some(shown.as_str()));
+        assert!(m.search.too_broad && !m.search.pending && m.search.error.is_none());
+        assert_eq!(m.search.selected, 1, "the selection on the kept page must not move");
+
+        // The next keystroke's page replaces it and the mark goes.
+        keys(&mut m, "y");
+        let g = m.search.generation;
+        update(&mut m, done(g, page("xy", &[3])));
+        assert!(!m.search.too_broad);
+        assert_eq!(m.search.page.as_ref().unwrap().query, "xy");
+
+        // With no page to keep, it is an error like any other.
+        let mut m = UiModel::new(false);
+        keys(&mut m, "x");
+        too_broad(&mut m);
+        assert!(m.search.page.is_none() && !m.search.too_broad);
+        assert!(m.search.error.as_deref().is_some_and(|e| e.contains("too broad")), "{:?}", m.search.error);
+    }
+
+    #[test]
     fn a_failed_search_drops_the_old_page_and_the_next_edit_clears_the_error() {
         let mut m = with_results();
         update(
@@ -930,7 +973,7 @@ mod tests {
             &mut m,
             UiAction::SearchDone {
                 generation: g,
-                result: Err("database is locked".into()),
+                result: Err(SearchError::Store(rusqlite::Error::InvalidQuery)),
                 elapsed: Duration::from_millis(3),
             },
         );
@@ -940,7 +983,7 @@ mod tests {
         );
         assert!(m.search.selected_hit().is_none());
         assert!(m.evidence.view.is_none() && m.evidence.wanted.is_none());
-        assert_eq!(m.search.error.as_deref(), Some("database is locked"));
+        assert_eq!(m.search.error.as_deref(), Some("Query is not read-only"));
 
         let e = keys(&mut m, "y");
         assert_eq!(searches(&e).len(), 1);

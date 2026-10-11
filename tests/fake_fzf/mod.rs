@@ -68,6 +68,8 @@ pub fn page(ids: &[i64]) -> SearchPage {
         limit: ids.len(),
         truncated: false,
         deferred: None,
+        words_dropped: 0,
+        order: relic::app::Order::RecentlyImported,
         hits: ids
             .iter()
             .map(|&id| PageHit {
