@@ -21,8 +21,6 @@ pub const MIN_HEIGHT: u16 = 10;
 pub const NARROW_WIDTH: u16 = 100;
 const MAX_STEPS_SHOWN: usize = 8;
 
-/// What the importer writes for a redacted secret (see `redact.rs`).
-const REDACTED: &str = "[REDACTED]";
 
 struct Theme {
     title: Style,
@@ -483,16 +481,16 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 /// around them while still showing (and copying as) the literal marker.
 fn safe_spans<'a>(text: &str, t: &Theme) -> Vec<Span<'a>> {
     let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(i) = rest.find(REDACTED) {
-        if i > 0 {
-            out.push(Span::raw(rest[..i].to_string()));
+    let mut pos = 0;
+    for marker in crate::redact::markers(text) {
+        if marker.start > pos {
+            out.push(Span::raw(text[pos..marker.start].to_string()));
         }
-        out.push(Span::styled(REDACTED, t.redacted));
-        rest = &rest[i + REDACTED.len()..];
+        pos = marker.end;
+        out.push(Span::styled(text[marker].to_string(), t.redacted));
     }
-    if !rest.is_empty() {
-        out.push(Span::raw(rest.to_string()));
+    if pos < text.len() {
+        out.push(Span::raw(text[pos..].to_string()));
     }
     out
 }
@@ -776,12 +774,12 @@ mod tests {
         let (row, line) = s
             .lines()
             .enumerate()
-            .filter(|(_, l)| l.contains("API_KEY=[REDACTED]"))
+            .filter(|(_, l)| l.contains("API_KEY=[REDACTED:key]"))
             .last()
             .unwrap();
-        let col = Span::raw(&line[..line.rfind("[REDACTED]").unwrap()]).width() as u16;
+        let col = Span::raw(&line[..line.rfind("[REDACTED:key]").unwrap()]).width() as u16;
         let row = row as u16;
-        for x in col..col + REDACTED.len() as u16 {
+        for x in col..col + "[REDACTED:key]".len() as u16 {
             assert!(
                 cell(&b, x, row).modifier.contains(Modifier::UNDERLINED),
                 "marker cell {x} not distinct"

@@ -499,7 +499,7 @@ fn raw_to_observation(raw: &RawRecord, kind: ObservationKind, redactor: &Redacto
         kind,
         // A time whose milliseconds overflow is absent, not wrapped.
         observed_at_ms: raw.timestamp.and_then(|t| t.checked_mul(1000)),
-        safe_text: redactor.redact(&raw.command),
+        safe_text: redactor.import(&raw.command),
         flags: if raw.lossy { FLAG_LOSSY } else { 0 },
         locator: raw.start.to_le_bytes().to_vec(),
     }
@@ -635,7 +635,7 @@ mod tests {
 
         let hits = store.search("cargo", 10).unwrap();
         assert_eq!(hits.len(), 1);
-        assert!(hits[0].safe_text.contains("[REDACTED]"));
+        assert!(hits[0].safe_text.contains("API_KEY=[REDACTED:key]"));
         assert!(!hits[0].safe_text.contains("sk12345"));
     }
 

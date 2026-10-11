@@ -151,8 +151,8 @@ impl<'a> SourceLock<'a> {
         tx.execute(
             "INSERT INTO source_revision (source_id, dev, ino, size, mtime_ns, ctime_ns,
                 stable_len, provenance, parser_contract, redaction_revision, imported_at_ms)
-             VALUES (?1, 0, 0, 0, 0, 0, 0, 0, ?2, 'r1', ?3)",
-            rusqlite::params![source_id, parser_contract, now_ms],
+             VALUES (?1, 0, 0, 0, 0, 0, 0, 0, ?2, ?3, ?4)",
+            rusqlite::params![source_id, parser_contract, crate::redact::REDACTION_REVISION, now_ms],
         )?;
         let revision_id = tx.last_insert_rowid();
         Ok(RevisionTx { tx, revision_id, next_ordinal: 0 })
