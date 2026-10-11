@@ -53,6 +53,11 @@ const IMPORT_RSS_LIMIT_MIB: f64 = 64.0;
 /// that scaled with the file would read 2.0.
 const RSS_GROWTH_LIMIT: f64 = 1.25;
 const APPEND_P95_LIMIT_MS: f64 = 25.0;
+const IMPORT_100K_P95_LIMIT_MS: f64 = 1000.0;
+const IMPORT_1M_P95_LIMIT_MS: f64 = 10_000.0;
+/// Store bytes over raw source bytes on the 1M fixture, as restated by
+/// ADR 0008 from this harness's own measurement.
+const STORE_RATIO_LIMIT: f64 = 3.0;
 
 fn main() -> ExitCode {
     // `run` returns instead of exiting so its temp directory is always removed.
@@ -191,14 +196,25 @@ fn import_gates(relic: &Path, work: &Path, samples: usize, gates: &mut Vec<Value
         }
     };
 
+    // Seed 77 is the corpus every earlier 1M measurement used.
+    fs::write(&history, relic::fixture::generate_diverse_zsh_history(100_000, 77)).map_err(io)?;
+    let ms = repeat(WARMUPS, samples, || {
+        fresh_db();
+        timed(&mut import())
+    })?;
+    gates.push(p95_gate("import 100k records".into(), ms, IMPORT_100K_P95_LIMIT_MS));
+
     let mut peaks = Vec::new();
-    // 1M last, so its store is the one the append gate grows.
+    // 1M last, so its store is the one measured for size and grown by the append gate.
     for (label, records) in [("2M", 2_000_000), ("1M", 1_000_000)] {
-        // Seed 77 is the corpus every earlier 1M measurement used.
         fs::write(&history, relic::fixture::generate_diverse_zsh_history(records, 77)).map_err(io)?;
+        let mut ms = Vec::new();
         let mib = repeat(0, samples, || {
             fresh_db();
-            peak_rss_mib(&mut import())
+            let t = Instant::now();
+            let mib = peak_rss_mib(&mut import())?;
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            Ok(mib)
         })?;
         let peak = mib.iter().copied().fold(0.0, f64::max);
         let mut g = gate(format!("import peak RSS, {label} records"), "MiB", peak, IMPORT_RSS_LIMIT_MIB);
@@ -206,8 +222,29 @@ fn import_gates(relic: &Path, work: &Path, samples: usize, gates: &mut Vec<Value
         g["samples"] = json!(mib);
         gates.push(g);
         peaks.push(peak);
+        if records == 1_000_000 {
+            // Timed through /usr/bin/time, whose own cost is noise at this scale.
+            gates.push(p95_gate("import 1M records".into(), ms, IMPORT_1M_P95_LIMIT_MS));
+        }
     }
     gates.push(gate("import peak RSS, 2M over 1M".into(), "ratio", peaks[0] / peaks[1], RSS_GROWTH_LIMIT));
+
+    // The import checkpointed, so the WAL is folded in; count it anyway.
+    let store_bytes: u64 = ["", "-wal", "-shm"]
+        .iter()
+        .map(|suffix| {
+            let mut path = db.clone().into_os_string();
+            path.push(suffix);
+            fs::metadata(path).map_or(0, |m| m.len())
+        })
+        .sum();
+    let source_bytes = fs::metadata(&history).map_err(io)?.len();
+    gates.push(gate(
+        "store bytes over source bytes, 1M records".into(),
+        "ratio",
+        store_bytes as f64 / source_bytes as f64,
+        STORE_RATIO_LIMIT,
+    ));
 
     let mut round = 0;
     let ms = repeat(WARMUPS, samples, || {

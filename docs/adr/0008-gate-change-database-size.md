@@ -25,6 +25,7 @@ Shrink first:
 
 New gate:
 - Restated as the measured ratio of store bytes to raw source bytes on the 1M fixture, with production fields actually written. Expected about 3x.
+- Measured after S1 and S2 by the gate harness (macOS arm64, seed-77 1M fixture, production redaction, secure delete on): **2.83x**. The gate is **store bytes < 3.0x raw source bytes**.
 - The restated figure is a gate, not a target: raising it later takes another gate-change ADR.
 
 Justification: no full-detail FTS schema reaches `<2x`, and the variants that come closer break generated phrase queries. Shrinking first deletes unread state and removes the placeholder caveat, so the restated number is real when locked.
