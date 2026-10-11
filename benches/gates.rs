@@ -26,6 +26,9 @@
 //! directory and import each `SAMPLES` times, so a run takes several minutes
 //! and about 1 GiB of temp space at its peak.
 //!
+//! The search gates (ADR 0006, ADR 0007) query the 1M store those imports
+//! leave behind, a fresh process per sample.
+//!
 //! A signal skips cleanup and leaves the stripped copies in the temp directory.
 
 use std::ffi::OsString;
@@ -58,6 +61,12 @@ const IMPORT_1M_P95_LIMIT_MS: f64 = 10_000.0;
 /// Store bytes over raw source bytes on the 1M fixture, as restated by
 /// ADR 0008 from this harness's own measurement.
 const STORE_RATIO_LIMIT: f64 = 3.0;
+const WHOLE_WORD_P95_LIMIT_MS: f64 = 20.0;
+/// What a search that the deadline stops may take past the deadline, as a
+/// fresh process: start-up and the read-only open (3 to 5 ms measured), the
+/// stop itself (under 2 ms after the deadline, measured in-process at 1M) and
+/// scheduling noise.
+const DEADLINE_EPSILON_MS: f64 = 20.0;
 
 fn main() -> ExitCode {
     // `run` returns instead of exiting so its temp directory is always removed.
@@ -254,7 +263,71 @@ fn import_gates(relic: &Path, work: &Path, samples: usize, gates: &mut Vec<Value
         timed(&mut import())
     })?;
     gates.push(p95_gate("append 100 records to a 1M store".into(), ms, APPEND_P95_LIMIT_MS));
+    search_gates(relic, &db, samples, gates)
+}
+
+/// The read-path gates on a 1M store. Whole words must answer in under 20 ms
+/// (ADR 0007). Everything else, whatever it costs unbounded, must end within
+/// the query deadline plus `DEADLINE_EPSILON_MS` (ADR 0006): with a page,
+/// with no match, or stopped as too broad. Which of those is recorded, not
+/// gated; a deadline that did not hold shows as time.
+fn search_gates(relic: &Path, db: &Path, samples: usize, gates: &mut Vec<Value>) -> Result<(), String> {
+    let hot = |n: usize| format!("{}ta", "task/".repeat(n - 1));
+    let git_400 = vec!["git"; 400];
+    let (phrase_51, phrase_16) = (hot(51), hot(relic::app::MAX_WORD_TOKENS));
+    // In the fixture `task` is in 93% of rows and never beside `git`.
+    let whole_words: [&[&str]; 5] = [&["git"], &["task"], &["cargo"], &["git", "commit"], &["cargo", "task"]];
+    let bounded: [(&str, Vec<&str>); 9] = [
+        ("hot prefix `ta*`", vec!["--prefix", "ta"]),
+        ("hot prefix `task*`", vec!["--prefix", "task"]),
+        ("lead word and hot prefix `git tas*`", vec!["--prefix", "git", "tas"]),
+        ("sparse AND `git task`", vec!["git", "task"]),
+        ("sparse AND `docker git*`", vec!["--prefix", "docker", "git"]),
+        ("`task` by rank", vec!["--rank", "task"]),
+        ("400 x `git` by rank", [vec!["--rank"], git_400].concat()),
+        ("one word of 51 hot tokens", vec!["--prefix", &phrase_51]),
+        ("one word of 16 hot tokens", vec!["--prefix", &phrase_16]),
+    ];
+    let deadline_ms = relic::app::QUERY_DEADLINE.as_secs_f64() * 1000.0;
+
+    let mut measure = |name: String, args: &[&str], limit: f64| -> Result<(), String> {
+        let mut outcome = String::new();
+        let ms = repeat(WARMUPS, samples, || {
+            let mut cmd = Command::new(relic);
+            cmd.arg("search").arg("--json").arg("--db").arg(db).args(args);
+            let (ms, how) = timed_search(&mut cmd)?;
+            outcome = how;
+            Ok(ms)
+        })?;
+        let mut g = p95_gate(name, ms, limit);
+        g["outcome"] = json!(outcome);
+        gates.push(g);
+        Ok(())
+    };
+    for words in whole_words {
+        measure(format!("search 1M, whole words `{}`", words.join(" ")), words, WHOLE_WORD_P95_LIMIT_MS)?;
+    }
+    for (name, args) in &bounded {
+        measure(format!("search 1M within the deadline, {name}"), args, deadline_ms + DEADLINE_EPSILON_MS)?;
+    }
     Ok(())
+}
+
+/// Wall time in ms of one `relic search`, and how it ended. Anything but a
+/// page, no match or a stop at the deadline is a harness failure.
+fn timed_search(cmd: &mut Command) -> Result<(f64, String), String> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    let t = Instant::now();
+    let out = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let outcome = match out.status.code() {
+        Some(0) => "page",
+        Some(1) => "no match",
+        Some(2) if stderr.contains("too broad") => "too broad",
+        _ => return Err(format!("{cmd:?} exited with {}: {stderr}", out.status)),
+    };
+    Ok((ms, outcome.into()))
 }
 
 /// `warmups` discarded runs, then `samples` measured ones.
