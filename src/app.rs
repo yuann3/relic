@@ -207,6 +207,11 @@ pub fn search(store: &Store, req: &SearchRequest, budget: &Budget) -> Result<Sea
             deferred = Some(last.to_string());
         }
     }
+    // Symbols alone index to nothing. The page still shows the most recent
+    // commands as the user types them, so it must say they are not matches.
+    if req.mode == MatchMode::PrefixLast && words.is_empty() && words_dropped == 0 && deferred.is_none() {
+        deferred = req.query.split_whitespace().last().map(String::from);
+    }
     let prefix = typing && deferred.is_none();
 
     let query = words.join(" ");
@@ -522,6 +527,10 @@ mod tests {
         let store = store_with(&["echo cafe\u{301}s", "echo cafe"]);
         let page = search(&store, &req("cafe\u{301}s", 10, MatchMode::PrefixLast)).unwrap();
         assert_eq!((texts(&page), page.deferred.as_deref()), (vec!["echo cafe\u{301}s"], None));
+
+        // Nor does a word of symbols: it filters nothing, and the page says so.
+        let page = search(&store, &req("&&", 10, MatchMode::PrefixLast)).unwrap();
+        assert_eq!((page.hits.len(), page.deferred.as_deref()), (2, Some("&&")));
 
         // The unfiltered page a short word gets is never a ranked one.
         let ranked = SearchRequest { order: Order::Rank, ..req("g", 10, MatchMode::PrefixLast) };

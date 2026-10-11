@@ -39,7 +39,7 @@ Status: Accepted · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture]
 - Before anything else, the read-path slice establishes one fact: on bundled SQLite 3.49.1, can a read-only WAL reader get `SQLITE_BUSY` during recovery after a writer crash?
 - If yes, readers keep exactly one bounded retry that leaves a visible trace. There is no backoff loop.
 - The `fix/tui` `WorkerStore` reopen/backoff loop is not carried over. If the answer is yes, the single bounded retry is all that replaces it.
-- Measured by S3 on bundled 3.49.1 (macOS arm64): **yes**. A writer was killed mid-transaction and 16 read-only readers opened at once. With no busy timeout, 15 of 16 got `SQLITE_BUSY_RECOVERY`; with the 250 ms `busy_timeout`, none did, across a 520 MiB leftover WAL that took each reader about 145 ms to recover. Read-only connections cannot checkpoint, so every first reader recovers again until a writer opens. Readers keep the one retry, on the first read of an open, and say so on stderr.
+- Measured by S3 on bundled 3.49.1 (macOS arm64): **yes**. A writer was killed mid-transaction and 16 read-only readers opened at once. With no busy timeout, 15 of 16 got `SQLITE_BUSY_RECOVERY`; with the 250 ms `busy_timeout`, none did, across a 520 MiB leftover WAL that took each reader about 145 ms to recover. A second wave of readers, started once the first had closed, met the same busy (15 of 16 with no timeout), so recovery repeats until a writer opens; its latency was not timed. Readers keep the one retry, on the first read of an open, and say so on stderr.
 
 ## Amends
 
