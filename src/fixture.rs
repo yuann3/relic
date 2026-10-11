@@ -192,6 +192,6 @@ mod tests {
     #[test]
     fn generate_bash_correct_count() {
         let data = generate_bash_history(1000, 42);
-        assert_eq!(crate::source::bash::Parser::new(&data[..]).count(), 1000);
+        assert_eq!(crate::source::bash::Parser::new(&data[..], true).count(), 1000);
     }
 }

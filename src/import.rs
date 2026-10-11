@@ -121,7 +121,6 @@ pub struct History {
     resolved: PathBuf,
     file: fs::File,
     stat: StatHint,
-    detected: Option<SourceKind>,
 }
 
 impl History {
@@ -140,37 +139,39 @@ impl History {
         if !metadata.is_file() {
             return Err(ImportError::NotRegularFile(path.to_path_buf()));
         }
-        let detected = detect(&file, &resolved).map_err(ImportError::Io)?;
-        Ok(Self { path: path.to_path_buf(), resolved, file, stat: stat_hint(&metadata), detected })
+        Ok(Self { path: path.to_path_buf(), resolved, file, stat: stat_hint(&metadata) })
     }
 
-    /// The shell the file's content or name gives away, if either does.
-    pub fn detected(&self) -> Option<SourceKind> {
-        self.detected
+    /// The shell the file gives away: by its first line (zsh extended
+    /// history, or a bash `#<epoch>` marker), else by its name. Only the
+    /// first line, because a `#123` comment or a pasted `: 1:0;x` further
+    /// down an untimed history says nothing about who wrote the file.
+    pub fn detected(&self) -> io::Result<Option<SourceKind>> {
+        let first = first_line(&self.file)?;
+        let name = self.resolved.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        Ok(if source::zsh::is_extended(&first) {
+            Some(SourceKind::Zsh)
+        } else if source::bash::is_marker(&first) {
+            Some(SourceKind::Bash)
+        } else if name.contains("zsh") || name.contains("zhistory") {
+            Some(SourceKind::Zsh)
+        } else if name.contains("bash") {
+            Some(SourceKind::Bash)
+        } else {
+            None
+        })
     }
 }
 
-/// How much of a file is read to tell its shell.
-const DETECT_WINDOW: usize = 65536;
-
-/// Which shell wrote `file`: its content first (a zsh extended-history line
-/// or a bash `#<epoch>` marker near the start), then its name. `None` when
-/// neither says, or when the content says both.
-fn detect(file: &fs::File, resolved: &Path) -> io::Result<Option<SourceKind>> {
-    let mut head = vec![0; DETECT_WINDOW];
+/// The start of `file` up to its first line ending, or as much of it as
+/// either shell's timestamp prefix can occupy.
+fn first_line(file: &fs::File) -> io::Result<Vec<u8>> {
+    let mut head = vec![0; 64];
     let read = file.read_at(&mut head, 0)?;
-    let head = &head[..read];
-    // The parsers decide, so detection cannot disagree with the grammar.
-    let zsh = source::zsh::Parser::new(head).any(|r| r.is_ok_and(|r| r.timestamp.is_some()));
-    let bash = source::bash::Parser::new(head).any(|r| r.is_ok_and(|r| r.timestamp.is_some()));
-    let name = resolved.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-    Ok(match (zsh, bash) {
-        (true, false) => Some(SourceKind::Zsh),
-        (false, true) => Some(SourceKind::Bash),
-        _ if name.contains("zsh") || name.contains("zhistory") => Some(SourceKind::Zsh),
-        _ if name.contains("bash") => Some(SourceKind::Bash),
-        _ => None,
-    })
+    head.truncate(read);
+    let end = head.iter().position(|b| matches!(b, b'\n' | b'\r')).unwrap_or(head.len());
+    head.truncate(end);
+    Ok(head)
 }
 
 /// Import a history file. Unchanged since the last import: nothing is read.
@@ -201,12 +202,15 @@ pub fn import(
     let mut source = store.lock_source(history.resolved.as_os_str().as_bytes())?;
     // Asked beats stored beats detected: a stored kind was either asked for
     // once or detected once, and detection must not flip it later.
-    let (kind, replaced) = match (shell, source.stored_kind(), history.detected) {
-        (Some(asked), Some(stored), _) if asked != stored => {
+    let (kind, replaced) = match (shell, source.stored_kind()) {
+        (Some(asked), Some(stored)) if asked != stored => {
             (asked, Some((stored, source.replace_kind(asked)?)))
         }
-        (Some(kind), ..) | (None, Some(kind), _) | (None, None, Some(kind)) => (kind, None),
-        (None, None, None) => return Err(ImportError::UnknownShell(history.path.clone())),
+        (Some(kind), _) | (None, Some(kind)) => (kind, None),
+        (None, None) => match history.detected().map_err(ImportError::Io)? {
+            Some(kind) => (kind, None),
+            None => return Err(ImportError::UnknownShell(history.path.clone())),
+        },
     };
     let newest = source.newest().cloned();
     if newest.as_ref().is_some_and(|r| r.cursor.stat == stat) {
@@ -253,12 +257,14 @@ pub fn import(
     let (stored, scan) =
         scan(file, from, kind, |records| store_records(&mut revision, kind, records, redactor))?;
     // The hint was taken before reading. If the file changed under the read,
-    // the records stored may not be the bytes on disk now: no guard may vouch
-    // for them, so the next import (which the stale hint forces) aligns.
-    let settled = stat_hint(&file.metadata().map_err(ImportError::Io)?) == stat;
+    // the offsets this import decided on may have pointed into other bytes
+    // by the time it parsed from them. Dropping the revision stores nothing.
+    if stat_hint(&file.metadata().map_err(ImportError::Io)?) != stat {
+        return Err(ImportError::ChangedDuringImport(history.path.clone()));
+    }
     let boundary_guard = match &key {
-        Some(key) if settled => Some(boundary_guard(file, key, scan.stable_len).map_err(ImportError::Io)?),
-        _ => None,
+        Some(key) => Some(boundary_guard(file, key, scan.stable_len).map_err(ImportError::Io)?),
+        None => None,
     };
     let cursor = Cursor { stat, stable_len: scan.stable_len as i64, boundary_guard };
     let revision_id = revision.revision_id();
@@ -311,7 +317,8 @@ fn scan<T>(
             (out, parser.stable_len(), parser.dangling_meta(), parser.incomplete_tail().is_some())
         }
         SourceKind::Bash => {
-            let mut parser = source::bash::Parser::new(reader);
+            let multiline = source::bash::is_marker(&first_line(file).map_err(ImportError::Io)?);
+            let mut parser = source::bash::Parser::new(reader, multiline);
             let out = run(&mut parser.by_ref().map(absolute))?;
             (out, parser.stable_len(), 0, parser.incomplete_tail().is_some())
         }
@@ -508,6 +515,8 @@ pub enum ImportError {
     /// Neither `--shell`, an earlier import, the content nor the name says
     /// which shell wrote the file.
     UnknownShell(PathBuf),
+    /// The file was written to while it was being read; nothing was stored.
+    ChangedDuringImport(PathBuf),
     /// Another import holds the store's write lock.
     Busy,
     Store(StoreError),
@@ -538,6 +547,9 @@ impl std::fmt::Display for ImportError {
                 "{}: cannot tell whether this is a zsh or a bash history; pass --shell zsh or --shell bash",
                 path.display()
             ),
+            Self::ChangedDuringImport(path) => {
+                write!(f, "{}: changed while it was being imported; nothing was stored, try again", path.display())
+            }
             Self::Busy => write!(f, "{}", StoreError::Busy),
             Self::Store(e) => write!(f, "store error: {e}"),
         }
@@ -1438,9 +1450,11 @@ mod tests {
     fn a_file_that_gives_no_shell_away_is_refused_unless_one_is_given() {
         let plain = "echo one\n";
         assert!(matches!(import_as("history", plain, None), Err(ImportError::UnknownShell(_))));
-        // Both grammars' timed lines: the content contradicts itself.
-        let both = ": 1700000000:0;echo one\n#1700000001\necho two\n";
-        assert!(matches!(import_as("history", both, None), Err(ImportError::UnknownShell(_))));
+        // Only the first line counts: a marker-looking comment further down an
+        // untimed history is not evidence of bash.
+        let late = "echo one\n#1700000001\necho two\n";
+        assert!(matches!(import_as("history", late, None), Err(ImportError::UnknownShell(_))));
+        assert_eq!(import_as(".zsh_history", late, None).unwrap().kind, SourceKind::Zsh);
         assert_eq!(import_as("history", plain, Some(SourceKind::Bash)).unwrap().kind, SourceKind::Bash);
     }
 

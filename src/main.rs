@@ -54,7 +54,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
             // The file before the store: an import that fails on the file
             // alone must not leave a database behind.
             let history = History::open(&path)?;
-            if shell.is_none() && history.detected().is_none() && !db.exists() {
+            if shell.is_none() && !db.exists() && history.detected()?.is_none() {
                 return Err(ImportError::UnknownShell(path).into());
             }
             if let Some(dir) = db.parent() {

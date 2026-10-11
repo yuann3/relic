@@ -107,6 +107,11 @@ fn record(bytes: Vec<u8>, start: u64, end: u64, mut lossy: bool) -> RawRecord {
     }
 }
 
+/// Whether a line is in zsh's extended-history format.
+pub fn is_extended(line: &[u8]) -> bool {
+    std::str::from_utf8(line).is_ok_and(|line| split_extended(line).is_some())
+}
+
 /// Split `: <timestamp>:<duration>;<command>`. A field of digits too long
 /// for an i64 is absent rather than a reason to store the prefix as command
 /// text.

@@ -9,12 +9,15 @@ pub const PARSER_CONTRACT: &str = "bash-v2";
 
 /// Streams Bash history records.
 ///
-/// A `#<epoch-seconds>` line (written under HISTTIMEFORMAT) opens a timed
-/// record: every line up to the next marker is one multiline command. A line
-/// with no marker open is one untimed record, since without markers a
-/// multiline command cannot be told from several commands.
+/// A `#<epoch-seconds>` line (written under HISTTIMEFORMAT) times the command
+/// after it. In a file that starts with a marker, every line up to the next
+/// marker is that one multiline command; in any other file only the next
+/// line is, so one stray `#123` comment among untimed commands cannot swallow
+/// everything after it. This is bash's own rule for reading its history. A
+/// line with no marker open is one untimed record.
 pub struct Parser<R> {
     lines: Lines<R>,
+    multiline: bool,
     /// Reused for each physical line: a marker must be recognised even when
     /// the record it ends is already at the cap.
     line: Vec<u8>,
@@ -30,9 +33,12 @@ struct Marker {
 }
 
 impl<R: BufRead> Parser<R> {
-    pub fn new(reader: R) -> Self {
+    /// `multiline`: the file starts with a marker (see [`is_marker`]). Passed
+    /// in because a parse resumed mid-file cannot see the first line.
+    pub fn new(reader: R, multiline: bool) -> Self {
         Self {
             lines: Lines::new(reader, false),
+            multiline,
             line: Vec::new(),
             marker: None,
             stable_len: 0,
@@ -115,6 +121,9 @@ impl<R: BufRead> Parser<R> {
                 bytes.extend_from_slice(&self.line[..self.line.len().min(room)]);
                 if !blank {
                     content_len = bytes.len();
+                    if !self.multiline {
+                        break;
+                    }
                 }
             }
             bytes.truncate(content_len);
@@ -147,11 +156,15 @@ impl<R: BufRead> Iterator for Parser<R> {
 /// `Some` when the line is a `#<digits>` marker; the time inside is absent
 /// when the digits do not fit an i64.
 fn marker_time(bytes: &[u8], line: &Line) -> Option<Option<i64>> {
-    let digits = bytes.strip_prefix(b"#")?;
-    if line.cut || digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+    if line.cut || !is_marker(bytes) {
         return None;
     }
-    Some(std::str::from_utf8(digits).ok()?.parse().ok())
+    Some(std::str::from_utf8(&bytes[1..]).ok()?.parse().ok())
+}
+
+/// Whether a line, without its line ending, is a `#<digits>` marker.
+pub fn is_marker(line: &[u8]) -> bool {
+    line.strip_prefix(b"#").is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
 }
 
 #[cfg(test)]
@@ -161,7 +174,8 @@ mod tests {
     use std::io::BufReader;
 
     fn parse(input: &[u8]) -> Vec<RawRecord> {
-        Parser::new(input).map(Result::unwrap).collect()
+        let first = input.split(|b| *b == b'\n').next().unwrap_or_default();
+        Parser::new(input, is_marker(first)).map(Result::unwrap).collect()
     }
 
     fn commands(input: &[u8]) -> Vec<String> {
@@ -203,25 +217,28 @@ mod tests {
     }
 
     #[test]
-    fn a_marker_is_found_however_late_it_first_appears() {
+    fn a_marker_in_a_file_that_does_not_start_with_one_times_only_the_next_line() {
         let mut input = Vec::new();
         for i in 0..20 {
             input.extend_from_slice(format!("untimed {i}\n").as_bytes());
         }
+        // A stray `#123` comment: everything after it must stay separate.
         input.extend_from_slice(b"#1700000000\nif true\nthen ls\nfi\n");
 
         let records = parse(&input);
-        assert_eq!(records.len(), 21);
+        assert_eq!(records.len(), 23);
         assert_eq!(records[19].timestamp, None);
-        assert_eq!(records[20].timestamp, Some(1_700_000_000));
-        assert_eq!(records[20].command, "if true\nthen ls\nfi");
+        assert_eq!((records[20].timestamp, records[20].command.as_str()), (Some(1_700_000_000), "if true"));
+        assert_eq!((records[21].timestamp, records[21].command.as_str()), (None, "then ls"));
+        assert_eq!((records[22].timestamp, records[22].command.as_str()), (None, "fi"));
+        assert_eq!(records[22].end, input.len() as u64);
     }
 
     #[test]
     fn yields_the_first_record_before_the_source_fails() {
         let input = b"#1700000000\nfirst\n#1700000001\nsecond\n#1700000002\nthird\n";
         // The source dies inside the second record's command.
-        let mut parser = Parser::new(BufReader::with_capacity(8, FailsAfter(&input[..33])));
+        let mut parser = Parser::new(BufReader::with_capacity(8, FailsAfter(&input[..33])), true);
         assert_eq!(parser.next().unwrap().unwrap().command, "first");
         assert!(parser.next().unwrap().is_err());
         assert_eq!(parser.stable_len(), 18);
@@ -231,7 +248,7 @@ mod tests {
     fn nothing_is_yielded_after_the_source_fails_even_if_it_recovers() {
         let input = b"#1700000000\nfirst\n#1700000001\nsecond record\n#1700000002\nthird\n";
         let source = FailsOnce { before: &input[..36], after: &input[36..], failed: false };
-        let mut parser = Parser::new(BufReader::with_capacity(4, source));
+        let mut parser = Parser::new(BufReader::with_capacity(4, source), true);
         assert_eq!(parser.next().unwrap().unwrap().command, "first");
         assert!(parser.next().unwrap().is_err());
         assert!(parser.next().is_none());
@@ -258,7 +275,7 @@ mod tests {
     #[test]
     fn a_record_without_its_newline_is_withheld() {
         for (input, stable_len) in [(&b"#1700000000\ndone\n#1700000001\ncargo bui"[..], 17), (b"done\ncargo bui", 5)] {
-            let mut parser = Parser::new(input);
+            let mut parser = Parser::new(input, true);
             assert_eq!(parser.by_ref().map(|r| r.unwrap().command).collect::<Vec<_>>(), ["done"]);
             assert_eq!(parser.stable_len(), stable_len);
             assert_eq!(parser.incomplete_tail().unwrap().command, "cargo bui");
@@ -267,7 +284,7 @@ mod tests {
 
     #[test]
     fn a_marker_with_no_command_yet_is_withheld() {
-        let mut parser = Parser::new(&b"#1700000000\ndone\n#1700000001\n"[..]);
+        let mut parser = Parser::new(&b"#1700000000\ndone\n#1700000001\n"[..], true);
         assert_eq!(parser.by_ref().count(), 1);
         assert_eq!(parser.stable_len(), 17);
         assert_eq!(parser.incomplete_tail().unwrap().timestamp, Some(1_700_000_001));

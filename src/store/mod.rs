@@ -312,7 +312,15 @@ impl Store {
                 r.get::<_, i64>(0)
             })
             .optional()?
-            .map(|kind| if kind == kind_int(SourceKind::Bash) { SourceKind::Bash } else { SourceKind::Zsh });
+            .map(|kind| {
+                [SourceKind::Zsh, SourceKind::Bash]
+                    .into_iter()
+                    .find(|k| kind_int(*k) == kind)
+                    // Guessing a shell here could delete the source's records
+                    // on the next `--shell`.
+                    .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, kind))
+            })
+            .transpose()?;
         let newest = tx
             .query_row(
                 "SELECT sr.id, sr.dev, sr.ino, sr.size, sr.mtime_ns, sr.ctime_ns,
