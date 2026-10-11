@@ -364,6 +364,104 @@ impl Store {
         self.conn.query_row("SELECT COUNT(*) FROM observation", [], |row| row.get(0))
     }
 
+    /// Re-redact every revision stored under another redaction revision.
+    /// Each becomes a new revision holding `redact` of the old safe text, in
+    /// the same order, and the old one is deleted, so ids cited before this
+    /// no longer resolve (ADR 0003). Returns how many records were rewritten.
+    ///
+    /// The rewrite is one transaction. Scrubbing the freed pages and the WAL
+    /// comes after it: an interruption in between leaves the old text
+    /// unreachable but on disk until the next rescrub or forget.
+    pub fn rescrub(&mut self, current: &str, redact: impl Fn(&str) -> String) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale: Vec<i64> = tx
+            .prepare("SELECT id FROM source_revision WHERE redaction_revision <> ?1 ORDER BY id")?
+            .query_map([current], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let mut rewritten = 0;
+        for old in stale {
+            tx.execute(
+                "INSERT INTO source_revision (source_id, dev, ino, size, mtime_ns, ctime_ns, stable_len,
+                    boundary_guard, provenance, parser_contract, redaction_revision, imported_at_ms)
+                 SELECT source_id, dev, ino, size, mtime_ns, ctime_ns, stable_len,
+                    boundary_guard, provenance, parser_contract, ?2, imported_at_ms
+                 FROM source_revision WHERE id = ?1",
+                rusqlite::params![old, current],
+            )?;
+            let new = tx.last_insert_rowid();
+            // In pages by ordinal, so a million-row revision is never held in
+            // memory and the cursor never reads a table it is inserting into.
+            let mut after = -1i64;
+            loop {
+                // The row as stored, `kind` included: a rescrub must not
+                // rewrite a kind this build does not know.
+                struct Row(i64, i64, Option<i64>, String, i64, Vec<u8>);
+                let page: Vec<Row> = tx
+                    .prepare_cached(
+                        "SELECT ordinal, kind, observed_at_ms, safe_text, flags, locator FROM observation
+                         WHERE revision_id = ?1 AND ordinal > ?2 ORDER BY ordinal LIMIT 1000",
+                    )?
+                    .query_map([old, after], |r| {
+                        Ok(Row(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                let Some(last) = page.last() else { break };
+                after = last.0;
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO observation (revision_id, ordinal, kind, observed_at_ms, safe_text, flags, locator)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?;
+                for Row(ordinal, kind, observed_at_ms, safe_text, flags, locator) in &page {
+                    insert.execute(rusqlite::params![new, ordinal, kind, observed_at_ms, redact(safe_text), flags, locator])?;
+                }
+                rewritten += page.len();
+            }
+            tx.execute("DELETE FROM observation WHERE revision_id = ?1", [old])?;
+            tx.execute("DELETE FROM source_revision WHERE id = ?1", [old])?;
+        }
+        // Every row changed, so the index is rebuilt whole from what is left.
+        tx.execute("INSERT INTO observation_fts (observation_fts) VALUES ('rebuild')", [])?;
+        tx.commit()?;
+        self.scrub_free_space()?;
+        Ok(rewritten)
+    }
+
+    /// Delete these observations for good and say which of them existed.
+    pub fn forget(&mut self, ids: &[i64]) -> Result<Vec<i64>, StoreError> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut forgotten = Vec::new();
+        for id in ids {
+            // The index entry goes first and by its text: see `replace_kind`.
+            let indexed = tx.execute(
+                "INSERT INTO observation_fts (observation_fts, rowid, safe_text)
+                 SELECT 'delete', id, safe_text FROM observation WHERE id = ?1",
+                [id],
+            )?;
+            if indexed == 1 {
+                tx.execute("DELETE FROM observation WHERE id = ?1", [id])?;
+                forgotten.push(*id);
+            }
+        }
+        tx.commit()?;
+        if !forgotten.is_empty() {
+            self.scrub_free_space()?;
+        }
+        Ok(forgotten)
+    }
+
+    /// Deleted rows are zeroed in place (`secure_delete`), but copies of the
+    /// pages they were on can remain in free pages and in the WAL. VACUUM
+    /// rewrites the file without the first; the checkpoint truncates the
+    /// second.
+    fn scrub_free_space(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch("VACUUM")?;
+        self.checkpoint()?;
+        Ok(())
+    }
+
     /// Fold the WAL into the database file and truncate it. `false` when a
     /// reader's open snapshot blocked it: SQLite reports that in the pragma's
     /// result row, not as an error, after waiting out busy_timeout.
@@ -969,4 +1067,93 @@ mod tests {
         writing.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
         assert_eq!(found(&reader), ["needle committed", "needle pending"]);
     }
+    /// Every byte SQLite keeps for `db`: the file, its WAL and its shared memory.
+    fn on_disk(db: &std::path::Path) -> Vec<u8> {
+        ["", "-wal", "-shm"]
+            .iter()
+            .flat_map(|suffix| {
+                let mut path = db.as_os_str().to_owned();
+                path.push(suffix);
+                std::fs::read(path).unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn holds(bytes: &[u8], needle: &str) -> bool {
+        bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    fn store_with(db: &std::path::Path, texts: &[&str]) -> (Store, Vec<i64>) {
+        let mut store = Store::open(db).unwrap();
+        let mut rev = store.lock_source(b"/h").unwrap().new_revision(SourceKind::Zsh).unwrap();
+        let ids = texts.iter().map(|t| rev.insert(&make_observation(0, t)).unwrap()).collect();
+        rev.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
+        (store, ids)
+    }
+
+    #[test]
+    fn a_rescrub_leaves_no_byte_of_the_old_text_and_no_old_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let (mut store, old_ids) = store_with(&db, &["deploy LEAKEDCANARY7 now", "ls -la"]);
+        assert!(holds(&on_disk(&db), "LEAKEDCANARY7"));
+
+        // Stored under the current revision: nothing to do.
+        assert_eq!(store.rescrub(crate::redact::REDACTION_REVISION, str::to_string).unwrap(), 0);
+        assert!(store.get_observation(old_ids[0]).unwrap().is_some());
+
+        let rewritten = store
+            .rescrub("r-next", |text| text.replace("LEAKEDCANARY7", "[REDACTED:secret]"))
+            .unwrap();
+        assert_eq!(rewritten, 2);
+
+        let on_disk = on_disk(&db);
+        assert!(!holds(&on_disk, "LEAKEDCANARY7"), "old text survives in the db, WAL or shm");
+        assert!(!holds(&on_disk, "leakedcanary7"), "old term survives in the search index");
+        assert!(store.search("LEAKEDCANARY7", 10).unwrap().is_empty());
+        let hits = store.search("deploy", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].safe_text, "deploy [REDACTED:secret] now");
+        // A citation made before the rescrub is stale, never a different row.
+        assert!(old_ids.iter().all(|id| store.get_observation(*id).unwrap().is_none()));
+        assert!(hits[0].id > old_ids[1]);
+
+        let revisions: Vec<String> = store
+            .conn
+            .prepare("SELECT redaction_revision FROM source_revision")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(revisions, ["r-next"]);
+        store.conn.execute("INSERT INTO observation_fts (observation_fts) VALUES ('integrity-check')", []).unwrap();
+        // The order within the revision is what it was.
+        let kept = store.get_neighbors(store.get_observation(hits[0].id).unwrap().unwrap().revision_id, 0, 0, 5).unwrap();
+        assert_eq!(kept.iter().map(|o| o.safe_text.as_str()).collect::<Vec<_>>(), ["deploy [REDACTED:secret] now", "ls -la"]);
+    }
+
+    #[test]
+    fn a_forgotten_observation_is_gone_from_disk_and_its_id_is_never_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let (mut store, ids) = store_with(&db, &["echo one", "echo two", "curl LEAKEDCANARY8"]);
+
+        // An id that never existed is not reported as forgotten.
+        assert_eq!(store.forget(&[ids[2], 999]).unwrap(), [ids[2]]);
+
+        let on_disk = on_disk(&db);
+        assert!(!holds(&on_disk, "LEAKEDCANARY8") && !holds(&on_disk, "leakedcanary8"));
+        assert!(store.search("LEAKEDCANARY8", 10).unwrap().is_empty());
+        assert!(store.get_observation(ids[2]).unwrap().is_none());
+        assert_eq!(store.search("echo", 10).unwrap().len(), 2);
+        store.conn.execute("INSERT INTO observation_fts (observation_fts) VALUES ('integrity-check')", []).unwrap();
+
+        // The forgotten row had the highest id; the next row must not take it.
+        let mut rev = store.lock_source(b"/h").unwrap().append(SourceKind::Zsh).unwrap();
+        let next = rev.insert(&make_observation(0, "echo three")).unwrap();
+        rev.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
+        assert!(next > ids[2]);
+    }
+
 }

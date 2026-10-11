@@ -1,5 +1,6 @@
-//! `relic import` as a process: a busy store, relative path spellings, the
-//! shell it reads a file as, and what a failed import leaves behind.
+//! `relic import` and `relic forget` as processes: a busy store, relative path
+//! spellings, the shell a file is read as, what a failed import leaves
+//! behind, rescrub, forgetting, and file modes.
 
 use std::process::Command;
 
@@ -122,4 +123,135 @@ fn an_import_that_fails_on_the_file_leaves_no_database_behind() {
     assert!(stderr.contains("missing: No such file"), "{stderr}");
 
     assert!(!dir.path().join("data").exists());
+}
+
+fn relic(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_relic")).current_dir(dir).args(args).output().unwrap();
+    (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+fn on_disk(dir: &std::path::Path, needle: &str) -> bool {
+    std::fs::read_dir(dir).unwrap().any(|entry| {
+        let bytes = std::fs::read(entry.unwrap().path()).unwrap_or_default();
+        bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+    })
+}
+
+#[test]
+fn an_import_rescrubs_what_older_redaction_rules_left_in_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("data")).unwrap();
+    std::fs::write(dir.path().join(".zsh_history"), ": 1700000000:0;mysql -u root -pOldRulesMissedThis1 shop\n").unwrap();
+    let (code, stderr) = import_in(dir.path(), &[".zsh_history"]);
+    assert_eq!(code, Some(0), "{stderr}");
+
+    // What a store written by rules that missed `-p<password>` looks like.
+    let conn = rusqlite::Connection::open(dir.path().join("data/relic.db")).unwrap();
+    conn.execute_batch(
+        "UPDATE observation SET safe_text = 'mysql -u root -pOldRulesMissedThis1 shop';
+         UPDATE source_revision SET redaction_revision = 'r1';
+         INSERT INTO observation_fts (observation_fts) VALUES ('rebuild');",
+    )
+    .unwrap();
+    drop(conn);
+    assert!(on_disk(&dir.path().join("data"), "OldRulesMissedThis1"));
+
+    // The file is unchanged, and the store is rescrubbed all the same.
+    let (code, stderr) = import_in(dir.path(), &[".zsh_history"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("re-redacted 1 stored commands"), "{stderr}");
+    assert!(stderr.contains("unchanged since last import"), "{stderr}");
+    assert!(!on_disk(&dir.path().join("data"), "OldRulesMissedThis1"));
+    assert!(!on_disk(&dir.path().join("data"), "oldrulesmissedthis1"));
+
+    let conn = rusqlite::Connection::open(dir.path().join("data/relic.db")).unwrap();
+    let (text, revision): (String, String) = conn
+        .query_row(
+            "SELECT o.safe_text, sr.redaction_revision FROM observation o
+             JOIN source_revision sr ON sr.id = o.revision_id",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(text, "mysql -u root -p[REDACTED:password] shop");
+    assert_eq!(revision, relic::redact::REDACTION_REVISION);
+
+    // Once is enough.
+    let (_, stderr) = import_in(dir.path(), &[".zsh_history"]);
+    assert!(!stderr.contains("re-redacted"), "{stderr}");
+}
+
+#[test]
+fn forget_deletes_a_record_for_good_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".zsh_history"), ": 1700000000:0;echo keep\n: 1700000001:0;curl LEAKEDCANARY9\n").unwrap();
+    import_in(dir.path(), &[".zsh_history"]);
+    let id: i64 = rusqlite::Connection::open(dir.path().join("data/relic.db"))
+        .unwrap()
+        .query_row("SELECT id FROM observation WHERE safe_text LIKE '%LEAKEDCANARY9'", [], |r| r.get(0))
+        .unwrap();
+
+    let (code, stderr) = relic(dir.path(), &["forget", &format!("#{id}"), "--db", "data/relic.db"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains(&format!("relic: forgot record #{id}")), "{stderr}");
+    assert!(!on_disk(&dir.path().join("data"), "LEAKEDCANARY9"));
+
+    // Forgetting it again is an error that names it; so is an id never seen.
+    let (code, stderr) = relic(dir.path(), &["forget", &id.to_string(), "--db", "data/relic.db"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains(&format!("no such record: #{id}")), "{stderr}");
+
+    // An unchanged or appended-to file does not bring it back.
+    let (_, stderr) = import_in(dir.path(), &[".zsh_history"]);
+    assert!(stderr.contains("unchanged"), "{stderr}");
+    assert!(!on_disk(&dir.path().join("data"), "LEAKEDCANARY9"));
+}
+
+#[test]
+fn a_write_open_leaves_relics_own_files_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let loosen = |path: &std::path::Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join(".zsh_history"), ": 1700000000:0;echo one\n").unwrap();
+    let import = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+            .current_dir(home.path())
+            .env("XDG_DATA_HOME", home.path().join("share"))
+            .env_remove("RELIC_DB")
+            .args(["import", ".zsh_history"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    // Created fresh: nothing is readable by anyone else, whatever the umask.
+    import();
+    let data = home.path().join("share/relic");
+    let db = data.join("relic.db");
+    assert_eq!((mode(&data), mode(&db), mode(&data.join("relic.db.key"))), (0o700, 0o600, 0o600));
+
+    // A store from before the umask rule: everything world-readable, with a
+    // reader holding the WAL and shm open so they exist to be fixed.
+    let reader = rusqlite::Connection::open(&db).unwrap();
+    reader.query_row("SELECT COUNT(*) FROM observation", [], |r| r.get::<_, i64>(0)).unwrap();
+    loosen(&data, 0o755);
+    for name in ["relic.db", "relic.db-wal", "relic.db-shm"] {
+        loosen(&data.join(name), 0o644);
+    }
+    std::fs::write(home.path().join(".zsh_history"), ": 1700000000:0;echo one\n: 1700000001:0;echo two\n").unwrap();
+    import();
+    assert_eq!(mode(&data), 0o700);
+    for name in ["relic.db", "relic.db-wal", "relic.db-shm"] {
+        assert_eq!(mode(&data.join(name)), 0o600, "{name}");
+    }
+
+    // A database somewhere else: its files are tightened, its directory is not.
+    let other = tempfile::tempdir().unwrap();
+    loosen(other.path(), 0o755);
+    let (code, stderr) = relic(home.path(), &["import", ".zsh_history", "--db", other.path().join("x.db").to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!((mode(other.path()), mode(&other.path().join("x.db"))), (0o755, 0o600));
 }

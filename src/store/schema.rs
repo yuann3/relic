@@ -11,11 +11,17 @@ pub fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
          PRAGMA synchronous = NORMAL;
          PRAGMA temp_store = MEMORY;
          PRAGMA busy_timeout = 250;
-         PRAGMA cache_size = -16384;",
+         PRAGMA cache_size = -16384;
+         PRAGMA secure_delete = ON;",
     )?;
 
     // Schema creation — idempotent via IF NOT EXISTS.
     conn.execute_batch(SCHEMA_SQL)?;
+
+    // Without this FTS5 only tombstones a deleted row and its terms stay in
+    // the index until some later merge: a forgotten secret would still be on
+    // disk. The setting is stored in the index, so once is enough.
+    conn.execute("INSERT INTO observation_fts (observation_fts, rank) VALUES ('secure-delete', 1)", [])?;
 
     // Set version if not present.
     conn.execute(
@@ -61,8 +67,10 @@ CREATE TABLE IF NOT EXISTS source_revision (
     imported_at_ms       INTEGER NOT NULL
 );
 
+-- AUTOINCREMENT: forget and rescrub delete rows, and an id handed out as a
+-- citation must never come back as a different command.
 CREATE TABLE IF NOT EXISTS observation (
-    id                 INTEGER PRIMARY KEY,
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     revision_id        INTEGER NOT NULL REFERENCES source_revision(id),
     ordinal            INTEGER NOT NULL,
     kind               INTEGER NOT NULL,

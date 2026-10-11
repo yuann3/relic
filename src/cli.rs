@@ -13,6 +13,7 @@ USAGE:
     relic search <QUERY>... [--db PATH] [--limit N] [--prefix] [--json | --fzf]
     relic ui [--db PATH]
     relic import <HISTORY_FILE> [--shell zsh|bash] [--db PATH]
+    relic forget <ID>... [--db PATH]
     relic --help | --version
 
 OPTIONS:
@@ -22,6 +23,9 @@ OPTIONS:
     --prefix      Let the last word match as a prefix, as the TUI does
     --json        Print one relic.search/v1 document on stdout
     --fzf         Pick one result with fzf and show its evidence
+    forget        Delete records for good, by the id search --json and the TUI
+                  show. Remove the line from your history file too, or a later
+                  import of a rewritten file can store it again
     --shell       History format for import. Default: what the file was imported
                   as before, else what its content or name shows. A --shell
                   that differs from the stored one replaces that file's records
@@ -34,6 +38,7 @@ pub enum Command {
     Search(SearchArgs),
     Ui { db: Option<PathBuf> },
     Import { path: PathBuf, shell: Option<SourceKind>, db: Option<PathBuf> },
+    Forget { ids: Vec<i64>, db: Option<PathBuf> },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -94,6 +99,25 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             let path = path.ok_or("import needs a history file")?;
             Ok(Command::Import { path, shell, db })
         }
+        "forget" => {
+            let (mut ids, mut db) = (Vec::new(), None);
+            while let Some(a) = args.next().transpose()? {
+                match a.as_str() {
+                    "--db" => db = Some(value(&mut args, "--db")?.into()),
+                    f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
+                    // As the TUI shows it (`#42`) or bare.
+                    id => ids.push(
+                        id.trim_start_matches('#')
+                            .parse()
+                            .map_err(|_| format!("not a record id: {id}"))?,
+                    ),
+                }
+            }
+            if ids.is_empty() {
+                return Err("forget needs at least one record id".into());
+            }
+            Ok(Command::Forget { ids, db })
+        }
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -142,6 +166,13 @@ fn value(
     flag: &str,
 ) -> Result<String, String> {
     args.next().transpose()?.ok_or_else(|| format!("{flag} needs a value"))
+}
+
+/// Whether the database sits in Relic's own data directory, which Relic may
+/// then keep owner-only. A `--db` or `$RELIC_DB` path can be in any directory,
+/// and that directory is not Relic's to change.
+pub fn owns_data_dir(explicit: &Option<PathBuf>) -> bool {
+    explicit.is_none() && std::env::var_os("RELIC_DB").is_none_or(|v| v.is_empty())
 }
 
 /// `--db`, else `$RELIC_DB`, else the XDG data directory.
@@ -223,6 +254,9 @@ mod tests {
         assert!(matches!(p(&["import", "h"]).unwrap(), Command::Import { shell: None, .. }));
         assert!(p(&["import"]).is_err());
         assert!(p(&["import", "h", "--shell", "fish"]).is_err());
+        assert_eq!(p(&["forget", "#42", "7"]).unwrap(), Command::Forget { ids: vec![42, 7], db: None });
+        assert!(p(&["forget"]).is_err());
+        assert!(p(&["forget", "all"]).is_err());
     }
 
     #[test]

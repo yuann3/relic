@@ -851,17 +851,24 @@ fn private_key_blocks(s: &str, spans: &mut Vec<Span>) {
 }
 
 /// Bare tokens: known vendor formats by prefix, JWTs, and a generic
-/// random-looking-string check.
+/// random-looking-string check. Runs last and only over what the structural
+/// detectors left: a value they already took keeps its own kind, and the flag
+/// it is attached to (`-p` in `-pS3cretPw9x…`) is not swallowed with it.
 fn token_runs(s: &str, spans: &mut Vec<Span>) {
     let b = s.as_bytes();
+    let mut taken = vec![false; b.len()];
+    for &(start, end, _) in spans.iter() {
+        taken[start..end].fill(true);
+    }
+    let in_run = |i: usize| is_token_byte(b[i]) && !taken[i];
     let mut i = 0;
     while i < b.len() {
-        if !is_token_byte(b[i]) {
+        if !in_run(i) {
             i += 1;
             continue;
         }
         let start = i;
-        while i < b.len() && is_token_byte(b[i]) {
+        while i < b.len() && in_run(i) {
             i += 1;
         }
         if let Some(end) = jwt_end(b, start, i) {

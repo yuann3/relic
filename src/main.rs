@@ -9,6 +9,10 @@ use relic::picker::PickError;
 use relic::store::{Store, StoreError};
 
 fn main() -> ExitCode {
+    // Before anything is created: the database, its WAL, the key and any file
+    // a later command writes must never be readable by another user.
+    // SAFETY: umask only swaps the process's file mode mask; no thread exists yet.
+    unsafe { libc::umask(0o077) };
     let cmd = match cli::parse(std::env::args_os().skip(1)) {
         Ok(cmd) => cmd,
         Err(e) => {
@@ -49,7 +53,22 @@ fn run(cmd: Command) -> Result<ExitCode> {
         }
         Command::Search(args) => return search(args),
         Command::Ui { db } => ui(&existing_db(db)?)?,
+        Command::Forget { ids, db } => {
+            let owns_dir = cli::owns_data_dir(&db);
+            let db = existing_db(db)?;
+            tighten(&db, owns_dir);
+            let forgotten = Store::open(&db)?.forget(&ids).map_err(|e| e.to_string())?;
+            for id in &forgotten {
+                eprintln!("relic: forgot record #{id}");
+            }
+            let unknown: Vec<String> =
+                ids.iter().filter(|id| !forgotten.contains(id)).map(|id| format!("#{id}")).collect();
+            if !unknown.is_empty() {
+                return Err(format!("no such record: {}", unknown.join(" ")).into());
+            }
+        }
         Command::Import { path, shell, db } => {
+            let owns_dir = cli::owns_data_dir(&db);
             let db = cli::resolve_db(db)?;
             // The file before the store: an import that fails on the file
             // alone must not leave a database behind.
@@ -60,6 +79,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
             if let Some(dir) = db.parent() {
                 std::fs::create_dir_all(dir)?;
             }
+            tighten(&db, owns_dir);
             let r = match import(&db, &history, shell) {
                 Err(ImportError::Busy) => {
                     eprintln!("relic: busy: another import is writing {}; try again", db.display());
@@ -68,6 +88,12 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 r => r?,
             };
             let (name, n) = (path.display(), r.records_stored);
+            if r.rescrubbed > 0 {
+                eprintln!(
+                    "relic: redaction rules changed since they were stored: re-redacted {} stored commands",
+                    r.rescrubbed
+                );
+            }
             if let Some((was, removed)) = r.replaced {
                 eprintln!(
                     "relic: {name}: was imported as {was}; replaced its {removed} stored commands with a {} import",
@@ -103,6 +129,32 @@ fn run(cmd: Command) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Make what a write open touches owner-only: files created before Relic set
+/// its umask, or by another tool, may be readable by others. Only warns: a
+/// store Relic cannot fix is still the user's to use (ADR 0003).
+fn tighten(db: &Path, owns_dir: bool) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let side = |suffix: &str| {
+        let mut path = db.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    let dir = db.parent().filter(|_| owns_dir).map(|dir| (dir.to_path_buf(), 0o700));
+    let files = ["", "-wal", "-shm", ".key"].map(|suffix| (side(suffix), 0o600));
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    for (path, mode) in dir.into_iter().chain(files) {
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if meta.uid() != me {
+            eprintln!("relic: warning: {} is owned by another user", path.display());
+        } else if meta.mode() & 0o077 != 0
+            && let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+        {
+            eprintln!("relic: warning: could not make {} owner-only: {e}", path.display());
+        }
+    }
 }
 
 fn import(

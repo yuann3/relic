@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::{FLAG_LOSSY, Observation, ObservationKind, Provenance};
 use crate::key::{self, InstallationKey};
-use crate::redact::Redactor;
+use crate::redact::{REDACTION_REVISION, Redactor};
 use crate::source::{self, RawRecord};
 use crate::store::{Cursor, RevisionTx, StatHint, Store, StoreError};
 
@@ -54,6 +54,9 @@ pub struct ImportResult {
     /// The source was stored as this other shell: that many records, parsed
     /// by the wrong grammar, were deleted before this import.
     pub replaced: Option<(SourceKind, usize)>,
+    /// Records, in any source, that were stored under older redaction rules
+    /// and were re-redacted before this import looked at the file.
+    pub rescrubbed: usize,
     pub records_stored: usize,
     /// Records the parser yielded, over every pass this import made.
     pub records_parsed: usize,
@@ -77,6 +80,7 @@ impl ImportResult {
         Self {
             kind,
             replaced: None,
+            rescrubbed: 0,
             records_stored: 0,
             records_parsed: 0,
             revision_id: 0,
@@ -196,6 +200,9 @@ pub fn import(
 ) -> Result<ImportResult, ImportError> {
     let History { file, stat, .. } = history;
     let stat = *stat;
+    // First, and for every source: alignment compares stored safe text with
+    // what the current rules make of the file, so both must be current.
+    let rescrubbed = store.rescrub(REDACTION_REVISION, |safe| redactor.redact(safe))?;
     let key_path = store.key_path().map(Path::to_path_buf);
     // Lock before looking: an importer that decided first and then waited for
     // another import of this file would store the file a second time.
@@ -214,7 +221,7 @@ pub fn import(
     };
     let newest = source.newest().cloned();
     if newest.as_ref().is_some_and(|r| r.cursor.stat == stat) {
-        return Ok(ImportResult { replaced, ..ImportResult::unchanged(kind) });
+        return Ok(ImportResult { replaced, rescrubbed, ..ImportResult::unchanged(kind) });
     }
 
     // Under the write lock, so two first imports cannot each write a key.
@@ -272,6 +279,7 @@ pub fn import(
     Ok(ImportResult {
         kind,
         replaced,
+        rescrubbed,
         records_stored: stored.count,
         records_parsed: aligned + stored.count,
         revision_id,
@@ -1212,7 +1220,15 @@ mod tests {
     }
 
     fn stored(store: &Store) -> Vec<StoredObservation> {
-        (1..=store.observation_count().unwrap()).map(|id| store.get_observation(id).unwrap().unwrap()).collect()
+        // Ids are never reused, so after a replacement they do not start at 1.
+        let mut rows: Vec<_> = store
+            .recent(usize::MAX >> 1)
+            .unwrap()
+            .iter()
+            .map(|hit| store.get_observation(hit.id).unwrap().unwrap())
+            .collect();
+        rows.reverse();
+        rows
     }
 
     #[test]
