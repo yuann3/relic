@@ -4,8 +4,9 @@ use std::process::ExitCode;
 
 use relic::app::{self, MatchMode, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
+use relic::import::{History, ImportError, ImportResult, Outcome, SourceKind};
 use relic::picker::PickError;
-use relic::store::Store;
+use relic::store::{Store, StoreError};
 
 fn main() -> ExitCode {
     let cmd = match cli::parse(std::env::args_os().skip(1)) {
@@ -50,24 +51,68 @@ fn run(cmd: Command) -> Result<ExitCode> {
         Command::Ui { db } => ui(&existing_db(db)?)?,
         Command::Import { path, shell, db } => {
             let db = cli::resolve_db(db)?;
+            // The file before the store: an import that fails on the file
+            // alone must not leave a database behind.
+            let history = History::open(&path)?;
+            if shell.is_none() && !db.exists() && history.detected()?.is_none() {
+                return Err(ImportError::UnknownShell(path).into());
+            }
             if let Some(dir) = db.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            let mut store = Store::open(&db)?;
-            let r = relic::import::import_file(
-                &mut store,
-                &path,
-                shell,
-                &relic::redact::Redactor::new(),
-            )?;
-            if r.skipped {
-                eprintln!("{}: unchanged since last import", path.display());
-            } else {
-                eprintln!("{}: stored {} commands in {}", path.display(), r.records_stored, db.display());
+            let r = match import(&db, &history, shell) {
+                Err(ImportError::Busy) => {
+                    eprintln!("relic: busy: another import is writing {}; try again", db.display());
+                    return Ok(ExitCode::from(2));
+                }
+                r => r?,
+            };
+            let (name, n) = (path.display(), r.records_stored);
+            if let Some((was, removed)) = r.replaced {
+                eprintln!(
+                    "relic: {name}: was imported as {was}; replaced its {removed} stored commands with a {} import",
+                    r.kind
+                );
+            }
+            if r.checkpoint_blocked {
+                eprintln!("relic: note: WAL not checkpointed: a reader is active; the next large import retries");
+            }
+            if r.lossy_records > 0 {
+                eprintln!("relic: warning: {name}: {} commands stored lossy (cut, or not decodable)", r.lossy_records);
+            }
+            if r.dangling_meta > 0 {
+                eprintln!("relic: warning: {name}: {} dangling zsh Meta bytes", r.dangling_meta);
+            }
+            if r.incomplete_tail {
+                eprintln!("relic: note: {name}: the last record is incomplete and was not stored");
+            }
+            if let Some(warning) = &r.key_warning {
+                eprintln!("relic: note: {warning}");
+            }
+            match r.outcome {
+                Outcome::Unchanged => eprintln!("{name}: unchanged since last import"),
+                Outcome::First => eprintln!("{name}: stored {n} {} commands in {}", r.kind, db.display()),
+                Outcome::Appended => eprintln!("{name}: added {n} new commands"),
+                Outcome::Aligned => {
+                    eprintln!("{name}: the file was rewritten; added {n} new commands and kept the earlier ones")
+                }
+                Outcome::Superseded => eprintln!(
+                    "{name}: the file was rewritten beyond what relic could align; stored it whole ({n} commands) as a new revision and kept the earlier ones"
+                ),
             }
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn import(
+    db: &Path,
+    history: &History,
+    shell: Option<SourceKind>,
+) -> std::result::Result<ImportResult, ImportError> {
+    // Opening writes too, so a busy store can already refuse here.
+    let mut store = Store::open(db).map_err(StoreError::from)?;
+    relic::import::import(&mut store, history, shell, &relic::redact::Redactor::new())
 }
 
 fn search(args: SearchArgs) -> Result<ExitCode> {

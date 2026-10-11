@@ -22,7 +22,9 @@ OPTIONS:
     --prefix      Let the last word match as a prefix, as the TUI does
     --json        Print one relic.search/v1 document on stdout
     --fzf         Pick one result with fzf and show its evidence
-    --shell       History format for import (default: zsh)
+    --shell       History format for import. Default: what the file was imported
+                  as before, else what its content or name shows. A --shell
+                  that differs from the stored one replaces that file's records
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -31,7 +33,7 @@ pub enum Command {
     Version,
     Search(SearchArgs),
     Ui { db: Option<PathBuf> },
-    Import { path: PathBuf, shell: SourceKind, db: Option<PathBuf> },
+    Import { path: PathBuf, shell: Option<SourceKind>, db: Option<PathBuf> },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -73,16 +75,16 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             Ok(Command::Ui { db })
         }
         "import" => {
-            let (mut path, mut shell, mut db) = (None, SourceKind::Zsh, None);
+            let (mut path, mut shell, mut db) = (None, None, None);
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
                     "--shell" => {
-                        shell = match value(&mut args, "--shell")?.as_str() {
+                        shell = Some(match value(&mut args, "--shell")?.as_str() {
                             "zsh" => SourceKind::Zsh,
                             "bash" => SourceKind::Bash,
                             other => return Err(format!("unknown shell: {other}")),
-                        }
+                        })
                     }
                     f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
                     _ if path.is_none() => path = Some(PathBuf::from(a)),
@@ -216,9 +218,9 @@ mod tests {
         let cmd = p(&["import", "h.txt", "--shell", "bash"]).unwrap();
         assert_eq!(
             cmd,
-            Command::Import { path: "h.txt".into(), shell: SourceKind::Bash, db: None }
+            Command::Import { path: "h.txt".into(), shell: Some(SourceKind::Bash), db: None }
         );
-        assert!(matches!(p(&["import", "h"]).unwrap(), Command::Import { shell: SourceKind::Zsh, .. }));
+        assert!(matches!(p(&["import", "h"]).unwrap(), Command::Import { shell: None, .. }));
         assert!(p(&["import"]).is_err());
         assert!(p(&["import", "h", "--shell", "fish"]).is_err());
     }

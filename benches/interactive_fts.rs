@@ -381,9 +381,8 @@ fn main() {
     println!("\nbaseline objects (MiB): {}", objects.join(", "));
     let avg: String = base
         .query_row(
-            "SELECT printf('safe_text %.1f, safe_hash %.1f, keyed_fingerprint %.1f, provenance %.1f, locator %.1f',
-                 avg(length(safe_text)), avg(length(safe_hash)), avg(length(keyed_fingerprint)),
-                 avg(length(provenance)), avg(length(locator)))
+            "SELECT printf('safe_text %.1f, locator %.1f',
+                 avg(length(safe_text)), avg(length(locator)))
              FROM observation",
             [],
             |r| r.get(0),

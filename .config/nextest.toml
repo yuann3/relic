@@ -1,0 +1,5 @@
+# nextest hides a passing test's output. This test passes without checking
+# anything when zsh is not installed, and says so on stderr: keep that visible.
+[[profile.default.overrides]]
+filter = 'test(cjk_history_written_by_real_zsh_is_searchable)'
+success-output = "immediate"

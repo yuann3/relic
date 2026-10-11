@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::domain::{ObservationKind, StoredObservation};
+use crate::domain::{ObservationKind, Provenance, StoredObservation};
 use crate::store::Store;
 
 pub const SEARCH_SCHEMA: &str = "relic.search/v1";
@@ -124,6 +124,8 @@ pub struct EvidenceView {
     pub timeline: Vec<StoredObservation>,
     /// Inferred upper bounds for the untimed rows above, by observation id.
     pub bounds: HashMap<i64, i64>,
+    /// What the observation's revision says its source file encodes.
+    pub provenance: Provenance,
 }
 
 impl EvidenceView {
@@ -150,7 +152,8 @@ pub fn open_evidence(
             bounds.insert(o.id, ms);
         }
     }
-    Ok(Some(EvidenceView { observation, timeline, bounds }))
+    let provenance = store.revision_provenance(observation.revision_id)?;
+    Ok(Some(EvidenceView { observation, timeline, bounds, provenance }))
 }
 
 pub fn source_label(kind: ObservationKind) -> &'static str {

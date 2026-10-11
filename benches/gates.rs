@@ -22,9 +22,14 @@
 //! down for tens of runs and p95 reads about twice its settled value; `loadavg`
 //! and the min/p50/max beside each p95 are there to show that.
 //!
+//! The import gates (ADR 0002) build 1M- and 2M-record histories in the temp
+//! directory and import each `SAMPLES` times, so a run takes several minutes
+//! and about 1 GiB of temp space at its peak.
+//!
 //! A signal skips cleanup and leaves the stripped copies in the temp directory.
 
 use std::ffi::OsString;
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
@@ -43,6 +48,11 @@ const HELP_P95_LIMIT_MS: f64 = 15.0;
 /// Upper bounds of the 8–12 MiB headless and 12–18 MiB full targets.
 const HEADLESS_LIMIT_MIB: f64 = 12.0;
 const FULL_LIMIT_MIB: f64 = 18.0;
+const IMPORT_RSS_LIMIT_MIB: f64 = 64.0;
+/// "No material growth" from 1M to 2M records (ADR 0002), as a ratio: memory
+/// that scaled with the file would read 2.0.
+const RSS_GROWTH_LIMIT: f64 = 1.25;
+const APPEND_P95_LIMIT_MS: f64 = 25.0;
 
 fn main() -> ExitCode {
     // `run` returns instead of exiting so its temp directory is always removed.
@@ -95,18 +105,14 @@ fn run() -> Result<bool, String> {
 
         gates.push(gate(format!("stripped {build} binary"), "MiB", bytes as f64 / MIB, limit_mib));
 
-        let mut ms = sample(&stripped, &["--help"], samples)?;
-        let raw = ms.clone();
-        ms.sort_by(f64::total_cmp);
-        let mut timed =
-            gate(format!("warm --help, {build}"), "ms", nearest_rank(&ms, 95), HELP_P95_LIMIT_MS);
-        timed["statistic"] = json!("nearest-rank p95");
-        timed["min"] = json!(ms[0]);
-        timed["p50"] = json!(nearest_rank(&ms, 50));
-        timed["max"] = json!(ms[ms.len() - 1]);
-        timed["warmups"] = json!(WARMUPS);
-        timed["samples"] = json!(raw);
-        gates.push(timed);
+        let ms = repeat(WARMUPS, samples, || {
+            let mut cmd = Command::new(&stripped);
+            timed(cmd.arg("--help"))
+        })?;
+        gates.push(p95_gate(format!("warm --help, {build}"), ms, HELP_P95_LIMIT_MS));
+        if build == "headless" {
+            import_gates(&stripped, work.path(), samples, &mut gates)?;
+        }
     }
 
     for g in &gates {
@@ -166,21 +172,113 @@ fn identify(bin: &Path, build: &str) -> Result<String, String> {
     }
 }
 
-/// Wall time in ms of `samples` fresh processes, spawn to exit, after
-/// `WARMUPS` discarded runs.
-fn sample(bin: &Path, args: &[&str], samples: usize) -> Result<Vec<f64>, String> {
-    let run = || {
-        let mut cmd = Command::new(bin);
-        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        let t = Instant::now();
-        // A failing command exits fast; timing it would pass the gate.
-        succeed(&mut cmd)?;
-        Ok(t.elapsed().as_secs_f64() * 1000.0)
+/// The import gates of ADR 0002, on the headless binary: peak RSS of a whole
+/// import at 1M and 2M records, and 100 records appended to a 1M store.
+fn import_gates(relic: &Path, work: &Path, samples: usize, gates: &mut Vec<Value>) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("import fixture: {e}");
+    let history = work.join("zsh_history");
+    let db = work.join("import.db");
+    let import = || {
+        let mut cmd = Command::new(relic);
+        cmd.arg("import").arg(&history).args(["--shell", "zsh", "--db"]).arg(&db);
+        cmd
     };
-    for _ in 0..WARMUPS {
+    let fresh_db = || {
+        for suffix in ["", "-wal", "-shm", ".key"] {
+            let mut path = db.clone().into_os_string();
+            path.push(suffix);
+            let _ = fs::remove_file(path);
+        }
+    };
+
+    let mut peaks = Vec::new();
+    // 1M last, so its store is the one the append gate grows.
+    for (label, records) in [("2M", 2_000_000), ("1M", 1_000_000)] {
+        // Seed 77 is the corpus every earlier 1M measurement used.
+        fs::write(&history, relic::fixture::generate_diverse_zsh_history(records, 77)).map_err(io)?;
+        let mib = repeat(0, samples, || {
+            fresh_db();
+            peak_rss_mib(&mut import())
+        })?;
+        let peak = mib.iter().copied().fold(0.0, f64::max);
+        let mut g = gate(format!("import peak RSS, {label} records"), "MiB", peak, IMPORT_RSS_LIMIT_MIB);
+        g["statistic"] = json!("max");
+        g["samples"] = json!(mib);
+        gates.push(g);
+        peaks.push(peak);
+    }
+    gates.push(gate("import peak RSS, 2M over 1M".into(), "ratio", peaks[0] / peaks[1], RSS_GROWTH_LIMIT));
+
+    let mut round = 0;
+    let ms = repeat(WARMUPS, samples, || {
+        round += 1;
+        let more = relic::fixture::generate_zsh_history(100, round);
+        fs::OpenOptions::new().append(true).open(&history).and_then(|mut f| f.write_all(&more)).map_err(io)?;
+        timed(&mut import())
+    })?;
+    gates.push(p95_gate("append 100 records to a 1M store".into(), ms, APPEND_P95_LIMIT_MS));
+    Ok(())
+}
+
+/// `warmups` discarded runs, then `samples` measured ones.
+fn repeat(
+    warmups: usize,
+    samples: usize,
+    mut run: impl FnMut() -> Result<f64, String>,
+) -> Result<Vec<f64>, String> {
+    for _ in 0..warmups {
         run()?;
     }
     (0..samples).map(|_| run()).collect()
+}
+
+/// Wall time in ms of one fresh process, spawn to exit.
+fn timed(cmd: &mut Command) -> Result<f64, String> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let t = Instant::now();
+    // A failing command exits fast; timing it would pass the gate.
+    succeed(cmd)?;
+    Ok(t.elapsed().as_secs_f64() * 1000.0)
+}
+
+/// Peak resident set of one fresh process, as `/usr/bin/time` reports it
+/// (the measurement ADR 0014 names).
+fn peak_rss_mib(cmd: &mut Command) -> Result<f64, String> {
+    let (flag, label, unit) = if cfg!(target_os = "macos") {
+        ("-l", "maximum resident set size", 1.0)
+    } else {
+        ("-v", "Maximum resident set size (kbytes):", 1024.0)
+    };
+    let out = Command::new("/usr/bin/time")
+        .arg(flag)
+        .arg(cmd.get_program())
+        .args(cmd.get_args())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("/usr/bin/time: {e}"))?;
+    let report = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(format!("{cmd:?} exited with {}: {report}", out.status));
+    }
+    report
+        .lines()
+        .find(|l| l.contains(label))
+        .and_then(|l| l.replace(label, "").trim().parse::<f64>().ok())
+        .map(|n| n * unit / MIB)
+        .ok_or_else(|| format!("no peak RSS in /usr/bin/time output: {report}"))
+}
+
+fn p95_gate(name: String, mut ms: Vec<f64>, limit: f64) -> Value {
+    let raw = ms.clone();
+    ms.sort_by(f64::total_cmp);
+    let mut g = gate(name, "ms", nearest_rank(&ms, 95), limit);
+    g["statistic"] = json!("nearest-rank p95");
+    g["min"] = json!(ms[0]);
+    g["p50"] = json!(nearest_rank(&ms, 50));
+    g["max"] = json!(ms[ms.len() - 1]);
+    g["warmups"] = json!(WARMUPS);
+    g["samples"] = json!(raw);
+    g
 }
 
 /// The ⌈pct/100·N⌉-th smallest of `sorted`, with no interpolation.

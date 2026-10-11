@@ -34,26 +34,31 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 
 CREATE TABLE IF NOT EXISTS source (
     id              INTEGER PRIMARY KEY,
+    -- Random, assigned at first import. The path lives only in private_locator.
     logical_id      BLOB NOT NULL UNIQUE,
     kind            INTEGER NOT NULL,
-    private_locator BLOB NOT NULL,
+    private_locator BLOB NOT NULL UNIQUE,
     parser_contract TEXT NOT NULL,
     enabled         INTEGER NOT NULL CHECK (enabled IN (0,1))
 );
 
+-- A source's newest revision carries its import cursor: the stat hint
+-- (dev..ctime_ns), stable_len and boundary_guard. provenance is the
+-- revision-wide domain::Provenance bit set.
 CREATE TABLE IF NOT EXISTS source_revision (
     id                   INTEGER PRIMARY KEY,
     source_id            INTEGER NOT NULL REFERENCES source(id),
-    revision_key         BLOB NOT NULL UNIQUE,
-    file_identity        BLOB,
-    opened_len           INTEGER NOT NULL,
+    dev                  INTEGER NOT NULL,
+    ino                  INTEGER NOT NULL,
+    size                 INTEGER NOT NULL,
+    mtime_ns             INTEGER NOT NULL,
+    ctime_ns             INTEGER NOT NULL,
     stable_len           INTEGER NOT NULL,
-    boundary_guard       BLOB NOT NULL,
-    snapshot_fingerprint BLOB NOT NULL,
+    boundary_guard       BLOB,
+    provenance           INTEGER NOT NULL,
     parser_contract      TEXT NOT NULL,
     redaction_revision   TEXT NOT NULL,
-    imported_at_ms       INTEGER NOT NULL,
-    complete             INTEGER NOT NULL CHECK (complete IN (0,1))
+    imported_at_ms       INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS observation (
@@ -63,10 +68,7 @@ CREATE TABLE IF NOT EXISTS observation (
     kind               INTEGER NOT NULL,
     observed_at_ms     INTEGER,
     safe_text          TEXT NOT NULL,
-    safe_hash          BLOB NOT NULL,
-    keyed_fingerprint  BLOB NOT NULL,
     flags              INTEGER NOT NULL DEFAULT 0,
-    provenance         BLOB NOT NULL,
     locator            BLOB NOT NULL,
     UNIQUE(revision_id, ordinal)
 );
