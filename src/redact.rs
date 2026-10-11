@@ -344,14 +344,29 @@ impl<'a> Command<'a> {
                         push_value(self.s, start, end, secret, spans);
                         i = end.max(start);
                     }
-                    // A header starts its word or its quote. Further in, a
-                    // colon after such a name is a Rust path (`auth::login`),
-                    // an image tag (`org/auth:v2`) or a jq key, not a header;
-                    // `scheme://` is a URL.
+                    // `Name: value` starts its word or its quote. Further in,
+                    // a colon after such a name is a Rust path
+                    // (`auth::login`), an image tag (`org/auth:v2`) or a jq
+                    // key; `scheme://` is a URL.
                     b':' if !matches!(b.get(i + 1), Some(b'/' | b':'))
                         && (run == w.start || self.q[run - 1] == Q::Open) =>
                     {
-                        i = self.header_value(wi, i + 1, secret, spans);
+                        let after_flag = wi
+                            .checked_sub(1)
+                            .is_some_and(|p| matches!(self.text(&self.words[p]), "-H" | "--header"));
+                        if after_flag || is_header_name(name) {
+                            i = self.header_value(wi, i + 1, secret, spans);
+                        } else if i + 2 < w.end && b[i + 1] == b' ' {
+                            // Not a header, so only the YAML shape counts:
+                            // `"db_password: hunter2"`, one token after the
+                            // space. `auth:latest` is a tag and
+                            // `"password: reset flow"` is prose.
+                            let end = self.value_end(i + 2, w.end, b"");
+                            if !self.s[i + 2..end].contains([' ', '\t', '\n']) {
+                                push_value(self.s, i + 2, end, secret, spans);
+                            }
+                            i = end.max(i + 1);
+                        }
                     }
                     // A JSON member: `"password":"x"`, quotes escaped or not.
                     b'"' | b'\\' => {
@@ -393,10 +408,6 @@ impl<'a> Command<'a> {
             return end;
         }
         // Unquoted `-H Authorization: Basic xyz` puts the value in later words.
-        // Only after a header flag: `grep -n token: values.yaml` has no value.
-        if !wi.checked_sub(1).is_some_and(|p| matches!(self.text(&self.words[p]), "-H" | "--header")) {
-            return end;
-        }
         let mut i = wi;
         while let Some(next) = self.value_word(i) {
             i += 1;
@@ -553,12 +564,13 @@ impl<'a> Command<'a> {
             if !matches!(self.text(&self.words[first]), "echo" | "printf") {
                 continue;
             }
-            let args: Vec<&Word> = self.words[first + 1..=feeder_end]
+            // Each argument on its own, so a redirect among them is kept.
+            for arg in self.words[first + 1..=feeder_end]
                 .iter()
                 .skip_while(|a| self.text(a).starts_with('-'))
-                .collect();
-            if let (Some(from), Some(to)) = (args.first(), args.last()) {
-                push_value(self.s, from.start, to.end, (Strength::Strong, Kind::Password), spans);
+                .filter(|a| !a.redirect)
+            {
+                push_value(self.s, arg.start, arg.end, (Strength::Strong, Kind::Password), spans);
             }
         }
     }
@@ -575,12 +587,19 @@ impl<'a> Command<'a> {
             if text.starts_with("--") {
                 continue;
             }
+            // These take a value: the rest of the word (`-uSteve`, which is
+            // not `-S`) or the next one.
+            if let Some(value) = ["-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-r", "-t"]
+                .iter()
+                .find_map(|f| text.strip_prefix(f))
+            {
+                if value.is_empty() {
+                    flags.next();
+                }
+                continue;
+            }
             if text.contains('S') {
                 return true;
-            }
-            // These take the next word as their value.
-            if matches!(text, "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-R" | "-T" | "-U" | "-r" | "-t") {
-                flags.next();
             }
         }
         false
@@ -613,7 +632,13 @@ impl<'a> Command<'a> {
         let w = &self.words[i];
         let text = self.text(w);
         let name_start = text.bytes().rposition(|c| !is_name_byte(c)).map_or(0, |p| p + 1);
-        if let Some(secret) = secret_name(text[name_start..].trim_start_matches(['-', '.']))
+        let name = text[name_start..].trim_start_matches(['-', '.']);
+        // A setting is `section.key` or `snake_key`; `set-credentials` is a
+        // subcommand. git's `user.signingkey` holds a public key id.
+        if name.contains('-') || name.to_ascii_lowercase().ends_with("signingkey") {
+            return;
+        }
+        if let Some(secret) = secret_name(name)
             && let Some(v) = self.value_word(i)
         {
             push_value(self.s, v.start, v.end, secret, spans);
@@ -666,7 +691,7 @@ const TOOL_FLAGS: &[ToolFlag] = &[
     tf(&["openssl"], "-k", false, true),
     // `gh variable set --body` is not a secret; `gh secret set --body` is.
     ToolFlag { subcommand: Some("secret"), kind: Kind::Secret, ..tf(&["gh"], "--body", true, true) },
-    ToolFlag { subcommand: Some("secret"), kind: Kind::Secret, ..tf(&["gh"], "-b", false, true) },
+    ToolFlag { subcommand: Some("secret"), kind: Kind::Secret, ..tf(&["gh"], "-b", true, true) },
 ];
 
 /// Name bytes for variables, flags, properties and header names.
@@ -770,6 +795,13 @@ fn name_words(name: &str) -> Vec<String> {
     out
 }
 
+/// Header names that carry a credential wherever they appear. Any other
+/// secret-sounding name is a header only after `-H`.
+fn is_header_name(name: &str) -> bool {
+    ["authorization", "proxy-authorization", "cookie"].iter().any(|h| name.eq_ignore_ascii_case(h))
+        || name.get(..2).is_some_and(|x| x.eq_ignore_ascii_case("x-"))
+}
+
 fn is_auth_scheme(word: &str) -> bool {
     ["basic", "bearer", "token", "digest", "negotiate", "ntlm", "bot", "apikey"]
         .iter()
@@ -828,9 +860,10 @@ fn is_reference(v: &str) -> bool {
 /// `"name": "value"` or `"name": 42`, with the quotes backslash-escaped when
 /// the JSON sits inside a double-quoted shell word.
 fn json_value(b: &[u8], at: usize, limit: usize) -> Option<(usize, usize)> {
+    // The position after a quote at `i`, and whether it was `\"`.
     let quote = |i: usize| match (b.get(i), b.get(i + 1)) {
-        (Some(b'"'), _) => Some(i + 1),
-        (Some(b'\\'), Some(b'"')) => Some(i + 2),
+        (Some(b'"'), _) => Some((i + 1, false)),
+        (Some(b'\\'), Some(b'"')) => Some((i + 2, true)),
         _ => None,
     };
     let spaces = |mut i: usize| {
@@ -839,15 +872,20 @@ fn json_value(b: &[u8], at: usize, limit: usize) -> Option<(usize, usize)> {
         }
         i
     };
-    let colon = spaces(quote(at)?);
+    let colon = spaces(quote(at)?.0);
     if colon >= limit || b[colon] != b':' {
         return None;
     }
     let start = spaces(colon + 1);
     match quote(start) {
-        Some(inner) => {
-            let close = (inner..limit).find(|&i| b[i] == b'"')?;
-            Some((inner, if b[close - 1] == b'\\' { close - 1 } else { close }))
+        Some((inner, escaped)) => {
+            // The closing quote is written as the opening one was. One with
+            // more backslashes before it is a quote inside the value.
+            let backslashes = |i: usize| b[inner..i].iter().rev().take_while(|&&c| c == b'\\').count();
+            let close = (inner..limit).find(|&i| {
+                b[i] == b'"' && if escaped { backslashes(i) == 1 } else { backslashes(i) % 2 == 0 }
+            })?;
+            Some((inner, close - usize::from(escaped)))
         }
         None => Some((start, (start..limit).find(|&i| b",} \t\n'\"".contains(&b[i])).unwrap_or(limit))),
     }
@@ -1140,7 +1178,7 @@ mod tests {
         ("PGPASSWORD=x psql -c 'select \"[REDACTED]\"'", "PGPASSWORD=[REDACTED:password] psql -c 'select \"[REDACTED]\"'"),
         // Rules ADR 0003 added over the first corpus, with their must-keep twins.
         ("echo hunter2 | sudo -S apt update", "echo [REDACTED:password] | sudo -S apt update"),
-        ("printf '%s\\n' 'my pass' | sudo -S -k systemctl restart nginx", "printf [REDACTED:password] | sudo -S -k systemctl restart nginx"),
+        ("printf '%s\\n' 'my pass' | sudo -S -k systemctl restart nginx", "printf [REDACTED:password] [REDACTED:password] | sudo -S -k systemctl restart nginx"),
         ("sudo -S whoami <<< hunter2", "sudo -S whoami <<< [REDACTED:password]"),
         ("echo hello | sudo tee /etc/motd", "echo hello | sudo tee /etc/motd"),
         ("echo done | grep d", "echo done | grep d"),
@@ -1187,6 +1225,21 @@ mod tests {
         ("psql \"host=db password=hunter2 dbname=app\"", "psql \"host=db password=[REDACTED:password] dbname=app\""),
         ("ssh host \"DB_PASSWORD=x ./deploy.sh --all\"", "ssh host \"DB_PASSWORD=[REDACTED:password] ./deploy.sh --all\""),
         ("git commit -m \"set password=foo and fix the bug\"", "git commit -m \"set password=[REDACTED:password] and fix the bug\""),
+        // Found in the second review.
+        ("curl -d '{\"password\":\"hun\\\"ter2\"}' https://x", "curl -d '{\"password\":\"[REDACTED:password]\"}' https://x"),
+        ("curl -d \"{\\\"password\\\":\\\"hun\\\\\\\"ter2\\\"}\" https://x", "curl -d \"{\\\"password\\\":\\\"[REDACTED:password]\\\"}\" https://x"),
+        ("gh secret set FOO -b\"hunter2\"", "gh secret set FOO -b[REDACTED:secret]"),
+        ("docker pull auth:latest", "docker pull auth:latest"),
+        ("npm run auth:login", "npm run auth:login"),
+        ("rake secret:rotate", "rake secret:rotate"),
+        ("git commit -m \"password: reset flow\"", "git commit -m \"password: reset flow\""),
+        ("echo \"db_password: hunter2\" >> config.yml", "echo \"db_password: [REDACTED:password]\" >> config.yml"),
+        ("kubectl config set-credentials cluster-admin --token=abc", "kubectl config set-credentials cluster-admin --token=[REDACTED:token]"),
+        ("git config --global user.signingkey 3AA5C34371567BD2", "git config --global user.signingkey 3AA5C34371567BD2"),
+        ("git config user.password hunter2", "git config user.password [REDACTED:password]"),
+        ("echo hunter2 | sudo -uSteve whoami", "echo hunter2 | sudo -uSteve whoami"),
+        ("echo hunter2 | sudo -uSteve -S whoami", "echo [REDACTED:password] | sudo -uSteve -S whoami"),
+        ("echo hunter2 > /tmp/x | sudo -S ls", "echo [REDACTED:password] > /tmp/x | sudo -S ls"),
     ];
 
     #[test]
@@ -1272,6 +1325,8 @@ mod tests {
                 format!("password={text}"),
                 format!("curl -H 'Authorization: {text}' https://u:{text}@h"),
                 format!("git config {text} x [REDACTED:key]{text}"),
+                format!("token: {text} 'password: {text}' {{\"secret\":\"{text}\"}}"),
+                format!("echo {text} > {text} | sudo -S {text}"),
                 text,
             ] {
                 let safe = r.import(&input);

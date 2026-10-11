@@ -379,11 +379,11 @@ impl Store {
             .query_map([current], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         if stale.is_empty() {
-            let pending: bool =
-                tx.query_row("SELECT EXISTS (SELECT 1 FROM schema_meta WHERE key = 'scrub_pending')", [], |r| r.get(0))?;
+            let pending = scrub_pending(&tx)?;
             drop(tx);
-            return Ok((0, !pending || self.scrub_free_space()?));
+            return Ok((0, !pending || self.scrub_free_space(false)?));
         }
+        mark_scrub_pending(&tx)?;
         let mut rewritten = 0;
         for old in stale {
             tx.execute(
@@ -428,7 +428,8 @@ impl Store {
         // Every row changed, so the index is rebuilt whole from what is left.
         tx.execute("INSERT INTO observation_fts (observation_fts) VALUES ('rebuild')", [])?;
         tx.commit()?;
-        Ok((rewritten, self.scrub_free_space()?))
+        // Every row was rewritten, so half the file is free pages: compact it.
+        Ok((rewritten, self.scrub_free_space(true)?))
     }
 
     /// Delete these observations for good and say which of them existed, and
@@ -448,29 +449,38 @@ impl Store {
                 forgotten.push(*id);
             }
         }
+        if !forgotten.is_empty() {
+            mark_scrub_pending(&tx)?;
+        }
+        // A scrub an earlier run could not finish is finished by this one,
+        // even when it has nothing left to forget.
+        let pending = scrub_pending(&tx)?;
         tx.commit()?;
-        let scrubbed = forgotten.is_empty() || self.scrub_free_space()?;
-        Ok((forgotten, scrubbed))
+        Ok((forgotten, !pending || self.scrub_free_space(false)?))
     }
 
-    /// Deleted rows are zeroed in place (`secure_delete`), but copies of the
-    /// pages they were on can remain in free pages and in the WAL. VACUUM
-    /// rewrites the file without the first; the checkpoint truncates the
-    /// second. `false` when a reader's open snapshot kept the WAL: that is
-    /// recorded, so the next rescrub or forget finishes the job.
-    fn scrub_free_space(&self) -> Result<bool, StoreError> {
-        self.conn.execute_batch("VACUUM")?;
-        let truncated = self.checkpoint()?;
-        self.conn.execute(
-            if truncated {
-                "DELETE FROM schema_meta WHERE key = 'scrub_pending'"
-            } else {
-                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('scrub_pending', '1')"
-            },
-            [],
-        )?;
-        // The note above went through the WAL as well.
-        Ok(truncated && self.checkpoint()?)
+    /// Get deleted text off the disk. `secure_delete` already zeroed it in
+    /// the database file; what is left are the page images in the WAL, which
+    /// the checkpoint truncates. `false` when a reader's open snapshot kept
+    /// the WAL. The delete itself recorded that a scrub is owed, in its own
+    /// transaction, so a scrub that is blocked or fails is finished by the
+    /// next rescrub or forget.
+    ///
+    /// `compact` also rewrites the file without its free pages. The copy is
+    /// built on disk, not in memory as `temp_store` would have it, and with
+    /// a 2 MiB page cache: VACUUM fills whatever cache it is given, and at
+    /// the usual 16 MiB a 1M-record rescrub peaked at 72 MiB, over the 64 MiB
+    /// budget. With these it peaks at 52 MiB, set by the rewrite before it.
+    fn scrub_free_space(&self, compact: bool) -> Result<bool, StoreError> {
+        if compact {
+            self.conn.execute_batch("PRAGMA temp_store = FILE; PRAGMA cache_size = -2048; VACUUM; PRAGMA cache_size = -16384; PRAGMA temp_store = MEMORY;")?;
+        }
+        if !self.checkpoint()? {
+            return Ok(false);
+        }
+        self.conn.execute("DELETE FROM schema_meta WHERE key = 'scrub_pending'", [])?;
+        // Clearing the note went through the WAL as well.
+        Ok(self.checkpoint()?)
     }
 
     /// Fold the WAL into the database file and truncate it. `false` when a
@@ -652,6 +662,14 @@ impl Store {
 /// Each word becomes a quoted phrase token. No raw FTS operators pass through;
 /// the only operator Relic itself adds is `*` on the last token when
 /// `last_prefix` is set.
+fn scrub_pending(tx: &Transaction<'_>) -> Result<bool, rusqlite::Error> {
+    tx.query_row("SELECT EXISTS (SELECT 1 FROM schema_meta WHERE key = 'scrub_pending')", [], |r| r.get(0))
+}
+
+fn mark_scrub_pending(tx: &Transaction<'_>) -> Result<usize, rusqlite::Error> {
+    tx.execute("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('scrub_pending', '1')", [])
+}
+
 fn kind_int(kind: SourceKind) -> i64 {
     match kind {
         SourceKind::Zsh => 1,
@@ -1181,10 +1199,16 @@ mod tests {
         assert_eq!(store.forget(&[ids[1]]).unwrap(), (vec![ids[1]], false));
         assert!(holds(&on_disk(&db), "LEAKEDCANARY6"), "the reader's snapshot should still pin the old pages");
 
+        // Still blocked: the same forget again has nothing to delete and
+        // must not claim the bytes are gone.
+        assert_eq!(store.forget(&[ids[1]]).unwrap(), (vec![], false));
+
         reader.execute_batch("COMMIT").unwrap();
-        // Nothing stale to rewrite, but the unfinished scrub is picked up.
-        assert_eq!(store.rescrub(crate::redact::REDACTION_REVISION, str::to_string).unwrap(), (0, true));
+        // The same forget once more: nothing to delete, but it finishes the scrub.
+        assert_eq!(store.forget(&[ids[1]]).unwrap(), (vec![], true));
         assert!(!holds(&on_disk(&db), "LEAKEDCANARY6"));
+        // An import would have finished it too, and now finds nothing owed.
+        assert_eq!(store.rescrub(crate::redact::REDACTION_REVISION, str::to_string).unwrap(), (0, true));
         // And only once.
         let pending: i64 = store
             .conn
