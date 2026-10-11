@@ -98,7 +98,7 @@ impl Redactor {
         cmd.flag_values(&mut spans);
         cmd.piped_passwords(&mut spans);
         url_passwords(input, &mut spans);
-        bearer_tokens(input, &mut spans);
+        bearer_tokens(&cmd, &mut spans);
         private_key_blocks(input, &mut spans);
         token_runs(input, &mut spans);
         splice(input, spans)
@@ -177,6 +177,9 @@ struct Word {
     start: usize,
     end: usize,
     segment: usize,
+    /// The target of `<`, `>` or `>>`: a file, never one of the command's
+    /// arguments. Not set after `<<<`, whose word is the input itself.
+    redirect: bool,
 }
 
 /// A command split the way the shell would split it, close enough to find
@@ -250,22 +253,28 @@ impl<'a> Command<'a> {
         let mut words = Vec::new();
         let mut segment = 0;
         let mut start = None;
+        // `<` or `>` seen since the last word, and how many `<` in a row.
+        let (mut redirect, mut less) = (false, 0);
         for (i, &c) in b.iter().enumerate() {
             let plain = q[i] == Q::Plain;
             let sep = plain && (c.is_ascii_whitespace() || b";|&()<>".contains(&c));
             if sep {
                 if let Some(st) = start.take() {
-                    words.push(Word { start: st, end: i, segment });
+                    words.push(Word { start: st, end: i, segment, redirect: redirect && less != 3 });
+                    (redirect, less) = (false, 0);
                 }
+                redirect |= matches!(c, b'<' | b'>');
+                less = if c == b'<' { less + 1 } else if c == b'>' { 0 } else { less };
                 if b"\n;|&()".contains(&c) {
                     segment += 1;
+                    (redirect, less) = (false, 0);
                 }
             } else if start.is_none() {
                 start = Some(i);
             }
         }
         if let Some(st) = start {
-            words.push(Word { start: st, end: b.len(), segment });
+            words.push(Word { start: st, end: b.len(), segment, redirect: redirect && less != 3 });
         }
         Self { s, q, words }
     }
@@ -277,20 +286,19 @@ impl<'a> Command<'a> {
     /// The word after `i` in the same simple command, if it is not a flag.
     fn value_word(&self, i: usize) -> Option<&Word> {
         let next = self.words.get(i + 1)?;
-        (next.segment == self.words[i].segment && !self.text(next).starts_with('-'))
+        (next.segment == self.words[i].segment && !next.redirect && !self.text(next).starts_with('-'))
             .then_some(next)
     }
 
     /// Where a value starting at `start` ends. A value that opens a quote
     /// runs to the end of the word, quotes and all. A value inside a quote
-    /// opened before its name (`"user=a&password=b"`) ends at that quote, or
-    /// at `&` between query parameters.
-    fn value_end(&self, start: usize, word_end: usize, stop_at_amp: bool) -> usize {
+    /// opened before its name ends at that quote, or at one of `stop`: `&`
+    /// between query parameters (`"user=a&password=b"`), a space between
+    /// assignments (`"host=db password=x dbname=app"`).
+    fn value_end(&self, start: usize, word_end: usize, stop: &[u8]) -> usize {
         match self.q[start] {
             Q::Single | Q::Double => (start..word_end)
-                .find(|&i| {
-                    self.q[i] == Q::Close || (stop_at_amp && self.s.as_bytes()[i] == b'&')
-                })
+                .find(|&i| self.q[i] == Q::Close || stop.contains(&self.s.as_bytes()[i]))
                 .unwrap_or(word_end),
             Q::Close => start,
             _ => word_end,
@@ -320,7 +328,7 @@ impl<'a> Command<'a> {
                 let Some(secret) = secret_name(name) else {
                     // `--signing-key=<base64>`: see `flag_values`.
                     if b[i] == b'=' && bare_key_flag(&self.s[run..i]) {
-                        let end = self.value_end(i + 1, w.end, false);
+                        let end = self.value_end(i + 1, w.end, b"");
                         push_random(self.s, i + 1, end, spans);
                     }
                     continue;
@@ -329,16 +337,28 @@ impl<'a> Command<'a> {
                     b'=' => {
                         let start = i + 1;
                         let end = if start < w.end {
-                            self.value_end(start, w.end, true)
+                            self.value_end(start, w.end, b"& \t\n")
                         } else {
                             start
                         };
                         push_value(self.s, start, end, secret, spans);
                         i = end.max(start);
                     }
-                    // `scheme://` is a URL, not a header.
-                    b':' if b.get(i + 1) != Some(&b'/') => {
+                    // A header starts its word or its quote. Further in, a
+                    // colon after such a name is a Rust path (`auth::login`),
+                    // an image tag (`org/auth:v2`) or a jq key, not a header;
+                    // `scheme://` is a URL.
+                    b':' if !matches!(b.get(i + 1), Some(b'/' | b':'))
+                        && (run == w.start || self.q[run - 1] == Q::Open) =>
+                    {
                         i = self.header_value(wi, i + 1, secret, spans);
+                    }
+                    // A JSON member: `"password":"x"`, quotes escaped or not.
+                    b'"' | b'\\' => {
+                        if let Some((start, end)) = json_value(b, i, w.end) {
+                            push_value(self.s, start, end, secret, spans);
+                            i = end;
+                        }
                     }
                     _ => {}
                 }
@@ -353,7 +373,7 @@ impl<'a> Command<'a> {
         let w = &self.words[wi];
         let b = self.s.as_bytes();
         let end = if after_colon < w.end {
-            self.value_end(after_colon, w.end, false)
+            self.value_end(after_colon, w.end, b"")
         } else {
             after_colon
         };
@@ -373,6 +393,10 @@ impl<'a> Command<'a> {
             return end;
         }
         // Unquoted `-H Authorization: Basic xyz` puts the value in later words.
+        // Only after a header flag: `grep -n token: values.yaml` has no value.
+        if !wi.checked_sub(1).is_some_and(|p| matches!(self.text(&self.words[p]), "-H" | "--header")) {
+            return end;
+        }
         let mut i = wi;
         while let Some(next) = self.value_word(i) {
             i += 1;
@@ -470,7 +494,7 @@ impl<'a> Command<'a> {
             let quoted = self.q[v.start] == Q::Open;
             let start = v.start + usize::from(quoted);
             if self.s[start..v.end].starts_with("pass:") {
-                let end = self.value_end(start, v.end, false);
+                let end = self.value_end(start, v.end, b"");
                 push_value(self.s, start + 5, end, (Strength::Strong, Kind::Password), spans);
             }
         }
@@ -489,7 +513,7 @@ impl<'a> Command<'a> {
         let args: Vec<&Word> = self.words[i + 1..]
             .iter()
             .take_while(|next| next.segment == w.segment)
-            .filter(|next| !self.text(next).starts_with('-'))
+            .filter(|next| !next.redirect && !self.text(next).starts_with('-'))
             .collect();
         // `-n` prints instead of writing a file, so there is one argument fewer.
         if let Some(password) = args.last()
@@ -505,12 +529,7 @@ impl<'a> Command<'a> {
         let b = self.s.as_bytes();
         for (i, w) in self.words.iter().enumerate() {
             let segment = |j: usize| self.words[j].segment == w.segment;
-            let reads_stdin = self.text(w) == "sudo"
-                && self.words[i + 1..]
-                    .iter()
-                    .take_while(|f| f.segment == w.segment && self.text(f).starts_with('-'))
-                    .any(|f| !self.text(f).starts_with("--") && self.text(f).contains('S'));
-            if !reads_stdin {
+            if self.text(w) != "sudo" || !self.sudo_reads_stdin(i) {
                 continue;
             }
             // A here-string after it in the same command.
@@ -542,6 +561,29 @@ impl<'a> Command<'a> {
                 push_value(self.s, from.start, to.end, (Strength::Strong, Kind::Password), spans);
             }
         }
+    }
+
+    /// Whether the `sudo` at word `i` has `-S` among its own flags. They end
+    /// at the command it runs, whose `-S` means something else (`ls -S`).
+    fn sudo_reads_stdin(&self, i: usize) -> bool {
+        let mut flags = self.words[i + 1..].iter().take_while(|f| f.segment == self.words[i].segment);
+        while let Some(f) = flags.next() {
+            let text = self.text(f);
+            if !text.starts_with('-') {
+                return false;
+            }
+            if text.starts_with("--") {
+                continue;
+            }
+            if text.contains('S') {
+                return true;
+            }
+            // These take the next word as their value.
+            if matches!(text, "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-R" | "-T" | "-U" | "-r" | "-t") {
+                flags.next();
+            }
+        }
+        false
     }
 
     /// Whether a word before `i` in the same simple command names one of the
@@ -754,7 +796,12 @@ fn obviously_not_secret(raw: &str, strength: Strength) -> bool {
             .iter()
             .any(|b| v.eq_ignore_ascii_case(b))
         || is_reference(v)
-        || ["/", "~/", "./", "../"].iter().any(|p| v.starts_with(p))
+        || ["~/", "./", "../"].iter().any(|p| v.starts_with(p))
+        // A path, unless it could be base64 and reads as random: base64
+        // starts with `/` one time in 64, and a secret must not get through
+        // by doing so. A `.`, `_` or `-` anywhere rules base64 out.
+        || (v.starts_with('/')
+            && !(v.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'+' | b'=')) && looks_random(v)))
         || (strength == Strength::Weak && v.bytes().all(|c| c.is_ascii_digit()))
 }
 
@@ -775,6 +822,35 @@ fn is_reference(v: &str) -> bool {
         || v.strip_prefix('$').is_some_and(|n| {
             !n.is_empty() && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
         })
+}
+
+/// The value of a JSON member whose name ends just before `at`:
+/// `"name": "value"` or `"name": 42`, with the quotes backslash-escaped when
+/// the JSON sits inside a double-quoted shell word.
+fn json_value(b: &[u8], at: usize, limit: usize) -> Option<(usize, usize)> {
+    let quote = |i: usize| match (b.get(i), b.get(i + 1)) {
+        (Some(b'"'), _) => Some(i + 1),
+        (Some(b'\\'), Some(b'"')) => Some(i + 2),
+        _ => None,
+    };
+    let spaces = |mut i: usize| {
+        while i < limit && matches!(b[i], b' ' | b'\t') {
+            i += 1;
+        }
+        i
+    };
+    let colon = spaces(quote(at)?);
+    if colon >= limit || b[colon] != b':' {
+        return None;
+    }
+    let start = spaces(colon + 1);
+    match quote(start) {
+        Some(inner) => {
+            let close = (inner..limit).find(|&i| b[i] == b'"')?;
+            Some((inner, if b[close - 1] == b'\\' { close - 1 } else { close }))
+        }
+        None => Some((start, (start..limit).find(|&i| b",} \t\n'\"".contains(&b[i])).unwrap_or(limit))),
+    }
 }
 
 /// `scheme://user:PASSWORD@host`. Only the password goes; the user and host
@@ -800,7 +876,8 @@ fn url_passwords(s: &str, spans: &mut Vec<Span>) {
 
 /// `Bearer <token>` outside a recognised header (`--header "Bearer x"`,
 /// `Authorization:Bearer` split by the shell), however short the token.
-fn bearer_tokens(s: &str, spans: &mut Vec<Span>) {
+fn bearer_tokens(cmd: &Command, spans: &mut Vec<Span>) {
+    let s = cmd.s;
     let b = s.as_bytes();
     let lower = s.to_ascii_lowercase();
     let mut from = 0;
@@ -815,6 +892,11 @@ fn bearer_tokens(s: &str, spans: &mut Vec<Span>) {
             v += 1;
         }
         if v == from || v >= b.len() {
+            continue;
+        }
+        // A quote right after `Bearer ` that ends the string it sits in
+        // (`grep "Bearer " src/`) closes; only an opening one holds a token.
+        if matches!(b[v], b'\'' | b'"') && cmd.q[v] != Q::Open {
             continue;
         }
         let (start, stop): (usize, &[u8]) = if matches!(b[v], b'\'' | b'"') {
@@ -1082,6 +1164,29 @@ mod tests {
         ("echo typed [REDACTED:password] here", "echo typed [REDACTED:literal:password] here"),
         ("PGPASSWORD=x psql -c 'select \"[REDACTED:token]\"'", "PGPASSWORD=[REDACTED:password] psql -c 'select \"[REDACTED:literal:token]\"'"),
         ("cat k | grep -----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----", "cat k | grep -----BEGIN OPENSSH PRIVATE KEY-----[REDACTED:key]-----END OPENSSH PRIVATE KEY-----"),
+        // Found in review: carriers the first rules missed.
+        ("curl -d '{\"username\":\"bob\",\"password\":\"hunter2\"}' https://api/login", "curl -d '{\"username\":\"bob\",\"password\":\"[REDACTED:password]\"}' https://api/login"),
+        ("curl -d \"{\\\"api_key\\\": \\\"abc123def\\\"}\" x.test", "curl -d \"{\\\"api_key\\\": \\\"[REDACTED:key]\\\"}\" x.test"),
+        ("curl -d '{\"max_token\": 4096, \"token\": 12345678}' x.test", "curl -d '{\"max_token\": 4096, \"token\": 12345678}' x.test"),
+        ("htpasswd -nb admin hunter2 >> /etc/nginx/.htpasswd", "htpasswd -nb admin [REDACTED:password] >> /etc/nginx/.htpasswd"),
+        ("htpasswd -b .htpasswd admin hunter2 > out.log", "htpasswd -b .htpasswd admin [REDACTED:password] > out.log"),
+        ("gh auth login --with-token < mytoken.txt", "gh auth login --with-token < mytoken.txt"),
+        ("mysql -u root --password < dump.sql", "mysql -u root --password < dump.sql"),
+        ("echo hunter2 | sudo -u root -S ls", "echo [REDACTED:password] | sudo -u root -S ls"),
+        ("echo big | sudo ls -S /var", "echo big | sudo ls -S /var"),
+        ("AWS_SECRET_ACCESS_KEY=/wJalrXUtnFEMI/K7MDENG/bPxRfiCY aws s3 ls", "AWS_SECRET_ACCESS_KEY=[REDACTED:key] aws s3 ls"),
+        ("GOOGLE_APPLICATION_CREDENTIALS=/Users/me/Keys2/Prod.json gcloud auth list", "GOOGLE_APPLICATION_CREDENTIALS=/Users/me/Keys2/Prod.json gcloud auth list"),
+        // Found in review: ordinary commands the first rules damaged.
+        ("cargo test auth::login", "cargo test auth::login"),
+        ("cargo test token::tests::parses", "cargo test token::tests::parses"),
+        ("docker pull myorg/auth:v2", "docker pull myorg/auth:v2"),
+        ("jq '{token: .x}' f.json", "jq '{token: .x}' f.json"),
+        ("grep -rn \"password:\" config/", "grep -rn \"password:\" config/"),
+        ("grep -n token: values.yaml", "grep -n token: values.yaml"),
+        ("grep -r \"Bearer \" src/", "grep -r \"Bearer \" src/"),
+        ("psql \"host=db password=hunter2 dbname=app\"", "psql \"host=db password=[REDACTED:password] dbname=app\""),
+        ("ssh host \"DB_PASSWORD=x ./deploy.sh --all\"", "ssh host \"DB_PASSWORD=[REDACTED:password] ./deploy.sh --all\""),
+        ("git commit -m \"set password=foo and fix the bug\"", "git commit -m \"set password=[REDACTED:password] and fix the bug\""),
     ];
 
     #[test]

@@ -370,16 +370,19 @@ impl Store {
     /// no longer resolve (ADR 0003). Returns how many records were rewritten.
     ///
     /// The rewrite is one transaction. Scrubbing the freed pages and the WAL
-    /// comes after it: an interruption in between leaves the old text
-    /// unreachable but on disk until the next rescrub or forget.
-    pub fn rescrub(&mut self, current: &str, redact: impl Fn(&str) -> String) -> Result<usize, StoreError> {
+    /// comes after it; the second value is false when that could not finish,
+    /// in which case the next rescrub or forget tries again.
+    pub fn rescrub(&mut self, current: &str, redact: impl Fn(&str) -> String) -> Result<(usize, bool), StoreError> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stale: Vec<i64> = tx
             .prepare("SELECT id FROM source_revision WHERE redaction_revision <> ?1 ORDER BY id")?
             .query_map([current], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         if stale.is_empty() {
-            return Ok(0);
+            let pending: bool =
+                tx.query_row("SELECT EXISTS (SELECT 1 FROM schema_meta WHERE key = 'scrub_pending')", [], |r| r.get(0))?;
+            drop(tx);
+            return Ok((0, !pending || self.scrub_free_space()?));
         }
         let mut rewritten = 0;
         for old in stale {
@@ -425,12 +428,12 @@ impl Store {
         // Every row changed, so the index is rebuilt whole from what is left.
         tx.execute("INSERT INTO observation_fts (observation_fts) VALUES ('rebuild')", [])?;
         tx.commit()?;
-        self.scrub_free_space()?;
-        Ok(rewritten)
+        Ok((rewritten, self.scrub_free_space()?))
     }
 
-    /// Delete these observations for good and say which of them existed.
-    pub fn forget(&mut self, ids: &[i64]) -> Result<Vec<i64>, StoreError> {
+    /// Delete these observations for good and say which of them existed, and
+    /// whether their bytes are off the disk too (see `rescrub`).
+    pub fn forget(&mut self, ids: &[i64]) -> Result<(Vec<i64>, bool), StoreError> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut forgotten = Vec::new();
         for id in ids {
@@ -446,20 +449,28 @@ impl Store {
             }
         }
         tx.commit()?;
-        if !forgotten.is_empty() {
-            self.scrub_free_space()?;
-        }
-        Ok(forgotten)
+        let scrubbed = forgotten.is_empty() || self.scrub_free_space()?;
+        Ok((forgotten, scrubbed))
     }
 
     /// Deleted rows are zeroed in place (`secure_delete`), but copies of the
     /// pages they were on can remain in free pages and in the WAL. VACUUM
     /// rewrites the file without the first; the checkpoint truncates the
-    /// second.
-    fn scrub_free_space(&self) -> Result<(), StoreError> {
+    /// second. `false` when a reader's open snapshot kept the WAL: that is
+    /// recorded, so the next rescrub or forget finishes the job.
+    fn scrub_free_space(&self) -> Result<bool, StoreError> {
         self.conn.execute_batch("VACUUM")?;
-        self.checkpoint()?;
-        Ok(())
+        let truncated = self.checkpoint()?;
+        self.conn.execute(
+            if truncated {
+                "DELETE FROM schema_meta WHERE key = 'scrub_pending'"
+            } else {
+                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('scrub_pending', '1')"
+            },
+            [],
+        )?;
+        // The note above went through the WAL as well.
+        Ok(truncated && self.checkpoint()?)
     }
 
     /// Fold the WAL into the database file and truncate it. `false` when a
@@ -1099,13 +1110,13 @@ mod tests {
         assert!(holds(&on_disk(&db), "LEAKEDCANARY7"));
 
         // Stored under the current revision: nothing to do.
-        assert_eq!(store.rescrub(crate::redact::REDACTION_REVISION, str::to_string).unwrap(), 0);
+        assert_eq!(store.rescrub(crate::redact::REDACTION_REVISION, str::to_string).unwrap(), (0, true));
         assert!(store.get_observation(old_ids[0]).unwrap().is_some());
 
         let rewritten = store
             .rescrub("r-next", |text| text.replace("LEAKEDCANARY7", "[REDACTED:secret]"))
             .unwrap();
-        assert_eq!(rewritten, 2);
+        assert_eq!(rewritten, (2, true));
 
         let on_disk = on_disk(&db);
         assert!(!holds(&on_disk, "LEAKEDCANARY7"), "old text survives in the db, WAL or shm");
@@ -1140,7 +1151,7 @@ mod tests {
         let (mut store, ids) = store_with(&db, &["echo one", "echo two", "curl LEAKEDCANARY8"]);
 
         // An id that never existed is not reported as forgotten.
-        assert_eq!(store.forget(&[ids[2], 999]).unwrap(), [ids[2]]);
+        assert_eq!(store.forget(&[ids[2], 999]).unwrap(), (vec![ids[2]], true));
 
         let on_disk = on_disk(&db);
         assert!(!holds(&on_disk, "LEAKEDCANARY8") && !holds(&on_disk, "leakedcanary8"));
@@ -1154,6 +1165,32 @@ mod tests {
         let next = rev.insert(&make_observation(0, "echo three")).unwrap();
         rev.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
         assert!(next > ids[2]);
+    }
+
+    #[test]
+    fn a_scrub_a_reader_blocked_is_reported_and_finished_by_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let (mut store, ids) = store_with(&db, &["echo one", "curl LEAKEDCANARY6"]);
+
+        // A reader mid-query, as the TUI is while it is open.
+        let reader = rusqlite::Connection::open(&db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader.query_row("SELECT COUNT(*) FROM observation", [], |r| r.get::<_, i64>(0)).unwrap();
+
+        assert_eq!(store.forget(&[ids[1]]).unwrap(), (vec![ids[1]], false));
+        assert!(holds(&on_disk(&db), "LEAKEDCANARY6"), "the reader's snapshot should still pin the old pages");
+
+        reader.execute_batch("COMMIT").unwrap();
+        // Nothing stale to rewrite, but the unfinished scrub is picked up.
+        assert_eq!(store.rescrub(crate::redact::REDACTION_REVISION, str::to_string).unwrap(), (0, true));
+        assert!(!holds(&on_disk(&db), "LEAKEDCANARY6"));
+        // And only once.
+        let pending: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_meta WHERE key = 'scrub_pending'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
     }
 
 }

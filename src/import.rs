@@ -57,6 +57,10 @@ pub struct ImportResult {
     /// Records, in any source, that were stored under older redaction rules
     /// and were re-redacted before this import looked at the file.
     pub rescrubbed: usize,
+    /// A reader kept the WAL from being truncated after a rescrub or forget,
+    /// so text removed from the store is still on disk; the next import or
+    /// forget tries again.
+    pub scrub_blocked: bool,
     pub records_stored: usize,
     /// Records the parser yielded, over every pass this import made.
     pub records_parsed: usize,
@@ -81,6 +85,7 @@ impl ImportResult {
             kind,
             replaced: None,
             rescrubbed: 0,
+            scrub_blocked: false,
             records_stored: 0,
             records_parsed: 0,
             revision_id: 0,
@@ -201,8 +206,11 @@ pub fn import(
     let History { file, stat, .. } = history;
     let stat = *stat;
     // First, and for every source: alignment compares stored safe text with
-    // what the current rules make of the file, so both must be current.
-    let rescrubbed = store.rescrub(REDACTION_REVISION, |safe| redactor.redact(safe))?;
+    // what the current rules make of the file. A rescrub brings the stored
+    // side as close as it can, working from safe text: where older rules
+    // redacted something the current ones keep, the two still differ and
+    // that source's next rewrite supersedes instead of aligning.
+    let (rescrubbed, scrubbed) = store.rescrub(REDACTION_REVISION, |safe| redactor.redact(safe))?;
     let key_path = store.key_path().map(Path::to_path_buf);
     // Lock before looking: an importer that decided first and then waited for
     // another import of this file would store the file a second time.
@@ -221,7 +229,7 @@ pub fn import(
     };
     let newest = source.newest().cloned();
     if newest.as_ref().is_some_and(|r| r.cursor.stat == stat) {
-        return Ok(ImportResult { replaced, rescrubbed, ..ImportResult::unchanged(kind) });
+        return Ok(ImportResult { replaced, rescrubbed, scrub_blocked: !scrubbed, ..ImportResult::unchanged(kind) });
     }
 
     // Under the write lock, so two first imports cannot each write a key.
@@ -280,6 +288,7 @@ pub fn import(
         kind,
         replaced,
         rescrubbed,
+        scrub_blocked: !scrubbed,
         records_stored: stored.count,
         records_parsed: aligned + stored.count,
         revision_id,

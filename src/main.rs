@@ -57,9 +57,12 @@ fn run(cmd: Command) -> Result<ExitCode> {
             let owns_dir = cli::owns_data_dir(&db);
             let db = existing_db(db)?;
             tighten(&db, owns_dir);
-            let forgotten = Store::open(&db)?.forget(&ids).map_err(|e| e.to_string())?;
+            let (forgotten, scrubbed) = Store::open(&db)?.forget(&ids).map_err(|e| e.to_string())?;
             for id in &forgotten {
                 eprintln!("relic: forgot record #{id}");
+            }
+            if !scrubbed {
+                eprintln!("{SCRUB_BLOCKED}");
             }
             let unknown: Vec<String> =
                 ids.iter().filter(|id| !forgotten.contains(id)).map(|id| format!("#{id}")).collect();
@@ -100,6 +103,9 @@ fn run(cmd: Command) -> Result<ExitCode> {
                     r.kind
                 );
             }
+            if r.scrub_blocked {
+                eprintln!("{SCRUB_BLOCKED}");
+            }
             if r.checkpoint_blocked {
                 eprintln!("relic: note: WAL not checkpointed: a reader is active; the next large import retries");
             }
@@ -130,6 +136,9 @@ fn run(cmd: Command) -> Result<ExitCode> {
     }
     Ok(ExitCode::SUCCESS)
 }
+
+const SCRUB_BLOCKED: &str = "relic: warning: another relic is reading the store, so the removed text is still \
+    on disk in its WAL; close it and run any import or forget to finish";
 
 /// Make what a write open touches owner-only: files created before Relic set
 /// its umask, or by another tool, may be readable by others. Only warns: a
