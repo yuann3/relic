@@ -291,16 +291,16 @@ fn search_gates(relic: &Path, db: &Path, samples: usize, gates: &mut Vec<Value>)
     let deadline_ms = relic::app::QUERY_DEADLINE.as_secs_f64() * 1000.0;
 
     let mut measure = |name: String, args: &[&str], limit: f64| -> Result<(), String> {
-        let mut outcome = String::new();
+        let mut outcomes = std::collections::BTreeSet::new();
         let ms = repeat(WARMUPS, samples, || {
             let mut cmd = Command::new(relic);
             cmd.arg("search").arg("--json").arg("--db").arg(db).args(args);
             let (ms, how) = timed_search(&mut cmd)?;
-            outcome = how;
+            outcomes.insert(how);
             Ok(ms)
         })?;
         let mut g = p95_gate(name, ms, limit);
-        g["outcome"] = json!(outcome);
+        g["outcomes"] = json!(outcomes);
         gates.push(g);
         Ok(())
     };

@@ -24,6 +24,8 @@ fn main() -> ExitCode {
         Ok(code) => code,
         // `relic search … | head` closing the pipe early is not a failure.
         Err(e) if broken_pipe(e.as_ref()) => ExitCode::SUCCESS,
+        // Whichever command met the busy store: "could not look", not "found nothing".
+        Err(e) if matches!(e.downcast_ref(), Some(StoreError::Busy)) => could_not_look(e.as_ref()),
         Err(e) => {
             eprintln!("relic: {e}");
             ExitCode::FAILURE
@@ -176,10 +178,7 @@ fn import(
 }
 
 fn search(args: SearchArgs) -> Result<ExitCode> {
-    let store = match Store::open_read_only(&existing_db(args.db)?) {
-        Err(e @ StoreError::Busy) => return Ok(could_not_look(&e)),
-        store => store?,
-    };
+    let store = Store::open_read_only(&existing_db(args.db)?)?;
     let mode = if args.prefix { MatchMode::PrefixLast } else { MatchMode::Words };
     let order = if args.rank { Order::Rank } else { Order::RecentlyImported };
     // fzf is for narrowing a broad page; 20 rows would defeat it.

@@ -151,17 +151,23 @@ impl SearchPage {
     }
 }
 
-/// Runs of letters and digits are what the unicode61 tokenizer indexes: "-m"
-/// has one, and "é" plus a combining mark is still one character of one.
+/// What the unicode61 tokenizer keeps inside one token: letters, digits, and
+/// the combining diacritics it folds away, so a decomposed "é" is one
+/// character of its word and not a break in it.
+fn in_token(c: char) -> bool {
+    c.is_alphanumeric() || ('\u{0300}'..='\u{036F}').contains(&c)
+}
+
+/// The tokens FTS5 makes of `word`: "-m" has one, "src/main.rs" three.
 fn tokens(word: &str) -> impl Iterator<Item = &str> {
-    word.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty())
+    word.split(|c| !in_token(c)).filter(|t| t.chars().any(char::is_alphanumeric))
 }
 
 /// Splits `word` before its last token: "src/main.r" is ("src/main.", "r").
 fn split_last_token(word: &str) -> (&str, &str) {
     let after = |(i, c): (usize, char)| i + c.len_utf8();
     let end = word.char_indices().rev().find(|(_, c)| c.is_alphanumeric()).map_or(0, after);
-    let start = word[..end].char_indices().rev().find(|(_, c)| !c.is_alphanumeric()).map_or(0, after);
+    let start = word[..end].char_indices().rev().find(|(_, c)| !in_token(*c)).map_or(0, after);
     word.split_at(start)
 }
 
@@ -205,12 +211,17 @@ pub fn search(store: &Store, req: &SearchRequest, budget: &Budget) -> Result<Sea
 
     let query = words.join(" ");
     // Ask for one extra row so the page can say whether it was cut off.
-    let run = |store: &Store| match (words.is_empty(), &req.mode, req.order) {
-        (true, MatchMode::Words, _) => Ok(vec![]),
-        (true, MatchMode::PrefixLast, _) => store.recent(limit + 1),
-        (false, _, Order::Rank) => store.search_ranked(&query, prefix, limit + 1),
-        (false, _, Order::RecentlyImported) if prefix => store.search_prefix(&query, limit + 1),
-        (false, _, Order::RecentlyImported) => store.search(&query, limit + 1),
+    // With nothing to filter by yet, a typing surface shows the most recent
+    // commands. Not when words were typed and dropped: those rows would pass
+    // for matches of a query that was never run.
+    let unfiltered = words.is_empty() && req.mode == MatchMode::PrefixLast && words_dropped == 0;
+    let order = if unfiltered { Order::RecentlyImported } else { req.order };
+    let run = |store: &Store| match (words.is_empty(), order) {
+        (true, _) if unfiltered => store.recent(limit + 1),
+        (true, _) => Ok(vec![]),
+        (false, Order::Rank) => store.search_ranked(&query, prefix, limit + 1),
+        (false, Order::RecentlyImported) if prefix => store.search_prefix(&query, limit + 1),
+        (false, Order::RecentlyImported) => store.search(&query, limit + 1),
     };
     let stop = {
         let budget = budget.clone();
@@ -230,7 +241,7 @@ pub fn search(store: &Store, req: &SearchRequest, budget: &Budget) -> Result<Sea
         truncated,
         deferred,
         words_dropped,
-        order: req.order,
+        order,
         hits: hits
             .into_iter()
             .map(|h| PageHit {
@@ -506,6 +517,16 @@ mod tests {
         let page = search(&store, &req("main.rs", 10, MatchMode::PrefixLast)).unwrap();
         assert_eq!((texts(&page), page.deferred.as_deref()), (vec!["vim src/main.rs"], None));
 
+        // A decomposed accent is inside its word, as FTS5 has it: "cafés"
+        // typed as e + U+0301 does not end in a one-letter "s".
+        let store = store_with(&["echo cafe\u{301}s", "echo cafe"]);
+        let page = search(&store, &req("cafe\u{301}s", 10, MatchMode::PrefixLast)).unwrap();
+        assert_eq!((texts(&page), page.deferred.as_deref()), (vec!["echo cafe\u{301}s"], None));
+
+        // The unfiltered page a short word gets is never a ranked one.
+        let ranked = SearchRequest { order: Order::Rank, ..req("g", 10, MatchMode::PrefixLast) };
+        assert_eq!(search(&store, &ranked).unwrap().order, Order::RecentlyImported);
+
         // A trailing symbol neither filters nor makes "git" a prefix.
         let store = store_with(&["gitk --all", "git log"]);
         let page = search(&store, &req("git 🚀", 10, MatchMode::PrefixLast)).unwrap();
@@ -533,6 +554,10 @@ mod tests {
         let path = vec!["nomatch"; MAX_WORD_TOKENS].join("/");
         let page = search(&store, &req(&format!("git {path}"), 10, MatchMode::Words)).unwrap();
         assert_eq!((page.hits.len(), page.words_dropped), (0, 0));
+
+        // When every word was dropped, the most recent commands are not its matches.
+        let page = search(&store, &req(&phrase, 10, MatchMode::PrefixLast)).unwrap();
+        assert_eq!((page.hits.len(), page.words_dropped), (0, 1));
 
         // Symbols index to nothing, so they are no word to drop.
         let page = search(&store, &req("git -- 🚀", 10, MatchMode::Words)).unwrap();

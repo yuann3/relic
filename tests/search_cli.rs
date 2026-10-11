@@ -117,6 +117,13 @@ fn a_store_that_stays_locked_gets_one_traced_retry_then_exit_2() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert_eq!(stderr.matches("trying once more").count(), 1, "{stderr}");
     assert!(stderr.contains("relic: busy: "), "{stderr}");
+    // Busy is exit 2 from every command that meets it.
+    for other in [&["ui"][..], &["forget", "1"]] {
+        let out = relic(other, &db);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{other:?}: {stderr}");
+        assert!(stderr.contains("relic: busy: "), "{other:?}: {stderr}");
+    }
 
     drop(holder);
     assert_eq!(texts(&page(&relic(&["search", "cargo", "--json"], &db))), ["cargo build"]);

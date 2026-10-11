@@ -12,29 +12,28 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// through the API, which reads nothing: the version check comes first.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// The version the file at `path` claims (0 for a file no Relic stamped),
-/// and whether it holds nothing at all. One statement, so one snapshot: a
-/// first import committing between two reads would look like a foreign file.
-pub fn stored_version(conn: &Connection, path: &Path) -> Result<(i64, bool), StoreError> {
+/// Whether the file at `path` is this build's store: `Ok(false)` when it
+/// holds nothing at all, which only a writer may turn into one. A version
+/// alone is no identity (other programs stamp 1 too), so Relic's own index
+/// table has to be there. One statement, so one snapshot: a first import
+/// committing between two reads would look like a foreign file.
+pub fn is_store(conn: &Connection, path: &Path) -> Result<bool, StoreError> {
     let read = conn.query_row(
-        "SELECT user_version, (SELECT COUNT(*) FROM sqlite_master) = 0 FROM pragma_user_version",
+        "SELECT user_version,
+                (SELECT COUNT(*) FROM sqlite_master),
+                (SELECT COUNT(*) FROM sqlite_master WHERE name = 'observation_fts')
+         FROM pragma_user_version",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
     );
+    let not_relic = || StoreError::NotRelic(path.to_path_buf());
     match read {
-        Err(e) if e.sqlite_error_code() == Some(ErrorCode::NotADatabase) => {
-            Err(StoreError::NotRelic(path.to_path_buf()))
-        }
-        read => Ok(read?),
-    }
-}
-
-/// Refuse any version but this build's.
-pub fn check_version(version: i64, path: &Path) -> Result<(), StoreError> {
-    match version {
-        v if v == i64::from(SCHEMA_VERSION) => Ok(()),
-        0 => Err(StoreError::NotRelic(path.to_path_buf())),
-        found => Err(StoreError::Version { path: path.to_path_buf(), found }),
+        Err(e) if e.sqlite_error_code() == Some(ErrorCode::NotADatabase) => Err(not_relic()),
+        Err(e) => Err(e.into()),
+        Ok((_, 0, _)) => Ok(false),
+        Ok((_, _, 0)) | Ok((0, _, _)) => Err(not_relic()),
+        Ok((v, _, _)) if v == i64::from(SCHEMA_VERSION) => Ok(true),
+        Ok((found, _, _)) => Err(StoreError::Version { path: path.to_path_buf(), found }),
     }
 }
 
@@ -43,10 +42,7 @@ pub fn initialize(conn: &Connection, path: &Path) -> Result<(), StoreError> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     // Decided before anything writes: `journal_mode = WAL` alone would
     // convert a file that is another program's.
-    let (version, empty) = stored_version(conn, path)?;
-    if !empty {
-        check_version(version, path)?;
-    }
+    let empty = !is_store(conn, path)?;
 
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;

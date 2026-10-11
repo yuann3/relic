@@ -39,7 +39,7 @@ Query budget:
 
 - S1c (read path) owns all of this, together with the read-only open ([0005](0005-evidence-store-transactions-and-read-only-open.md)).
 - CLI tests pin that default `relic search --json` returns hits in descending rowid order, that `--rank` orders by `rank, rowid DESC`, and that a query over 12 words reports `words_dropped`.
-- Acceptance proof: a 1M-fixture bench in the gate harness ([0014](0014-performance-contract.md)) in which the single-word 51-token hot phrase and a 400×`git` `--rank` query each return `TooBroad` or `Cancelled` within the budget plus a stated epsilon.
+- Acceptance proof: a 1M-fixture bench in the gate harness ([0014](0014-performance-contract.md)) in which the single-word 51-token hot phrase and a 400×`git` `--rank` query each end within the budget plus a stated epsilon. As built, the caps answer both before the deadline is needed (the word is dropped; 400 words become 12), so the bench also runs the worst queries the caps let through, which do stop as `TooBroad`.
 - D1's 1.2 s finding stays open until that bench passes.
 - If the interrupt does not land inside a single FTS5 merge, the worst case is the longest single merge (about 20–40 ms at 1M, linear in history size). S1c records which holds.
 - The deadline is what bounds unindexed hot-prefix and sparse-AND keystrokes under the amended warm-FTS gate ([0007](0007-gate-change-warm-fts-hot-prefixes.md)).

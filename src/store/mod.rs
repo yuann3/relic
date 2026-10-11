@@ -24,6 +24,9 @@ pub enum StoreError {
     NotRelic(PathBuf),
     /// A store written under another schema version.
     Version { path: PathBuf, found: i64 },
+    /// An empty file: a store a first import has not finished creating, or
+    /// nothing yet. Only a writer may fill it.
+    NoStoreYet(PathBuf),
     /// A reader needs to create the WAL's side files, and this file or
     /// directory would not let it.
     Unwritable(PathBuf),
@@ -55,6 +58,11 @@ impl std::fmt::Display for StoreError {
                 f,
                 "{} is store version {found} and this relic reads version {SCHEMA_VERSION}. Use the \
                  relic that wrote it, or move it away and run `relic import` again",
+                path.display()
+            ),
+            Self::NoStoreYet(path) => write!(
+                f,
+                "no store yet at {}: run `relic import`, or try again if an import is creating it",
                 path.display()
             ),
             Self::Unwritable(path) => write!(
@@ -309,8 +317,10 @@ impl Store {
         // cannot, SQLite fails with "unable to open database file"; beside a
         // read-only database it leaves read-only side files that block the
         // next import. Refuse both before SQLite touches anything.
-        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        for needed in [path, dir] {
+        // SQLite puts them beside what a symlink points at, not beside the link.
+        let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let dir = real.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        for needed in [real.as_path(), dir] {
             if !writable(needed) {
                 return Err(StoreError::Unwritable(needed.to_path_buf()));
             }
@@ -322,14 +332,16 @@ impl Store {
         // is recovering after a crashed write: measured on bundled SQLite
         // 3.49.1, that is SQLITE_BUSY_RECOVERY once busy_timeout runs out.
         // One retry, said out loud, and no loop (ADR 0005).
-        let (version, _) = match schema::stored_version(&conn, path) {
+        let is_store = match schema::is_store(&conn, path) {
             Err(StoreError::Busy) => {
                 eprintln!("relic: note: the store was busy, as it is while another relic recovers it; trying once more");
-                schema::stored_version(&conn, path)?
+                schema::is_store(&conn, path)?
             }
-            version => version?,
+            is_store => is_store?,
         };
-        schema::check_version(version, path)?;
+        if !is_store {
+            return Err(StoreError::NoStoreYet(path.to_path_buf()));
+        }
         schema::configure_reader(&conn)?;
         Ok(Self { conn, key_path: Some(key_path(path)) })
     }
@@ -1205,7 +1217,10 @@ mod tests {
             .unwrap()
             .execute_batch("PRAGMA user_version = 0; PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
-        vec![foreign, empty, text, prototype]
+        // A version is no identity: plenty of programs stamp 1.
+        let stamped = dir.join("stamped.db");
+        Connection::open(&stamped).unwrap().execute_batch("CREATE TABLE notes(x); PRAGMA user_version = 1").unwrap();
+        vec![foreign, empty, text, prototype, stamped]
     }
 
     #[test]
@@ -1214,7 +1229,13 @@ mod tests {
         for path in not_relics(dir.path()) {
             let before = std::fs::read(&path).unwrap();
             let err = Store::open_read_only(&path).err().expect("must refuse");
-            assert!(matches!(&err, StoreError::NotRelic(p) if *p == path), "{err}");
+            // An empty file may be a store an import is creating right now:
+            // "move it away" would be the wrong advice.
+            if path.ends_with("empty.db") {
+                assert!(matches!(&err, StoreError::NoStoreYet(p) if *p == path), "{err}");
+            } else {
+                assert!(matches!(&err, StoreError::NotRelic(p) if *p == path), "{err}");
+            }
             assert!(err.to_string().contains("relic import"), "no hint: {err}");
             assert!(std::fs::read(&path).unwrap() == before, "{} changed", path.display());
             // The pre-release store is in WAL mode, and reading even its
@@ -1285,14 +1306,24 @@ mod tests {
 
         mode(&db, 0o444);
         let err = Store::open_read_only(&db).err().expect("read-only file");
-        assert!(matches!(&err, StoreError::Unwritable(p) if *p == db), "{err}");
+        assert!(matches!(&err, StoreError::Unwritable(p) if *p == db.canonicalize().unwrap()), "{err}");
         mode(&db, 0o644);
 
         mode(&sub, 0o555);
         let err = Store::open_read_only(&db).err().expect("read-only directory");
         mode(&sub, 0o755);
-        assert!(matches!(&err, StoreError::Unwritable(p) if *p == sub), "{err}");
+        let real_sub = sub.canonicalize().unwrap();
+        assert!(matches!(&err, StoreError::Unwritable(p) if *p == real_sub), "{err}");
         assert_eq!(side_files(&db), clean);
+
+        // Through a symlink it is the target's directory that counts.
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        mode(&sub, 0o555);
+        let err = Store::open_read_only(&link).err().expect("link into a read-only directory");
+        mode(&sub, 0o755);
+        assert!(matches!(&err, StoreError::Unwritable(p) if *p == real_sub), "{err}");
+        assert_eq!(Store::open_read_only(&link).unwrap().search("cargo", 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -1308,21 +1339,22 @@ mod tests {
 
         // An interrupt while the rows are fetched fails the page: it used to
         // drop the rest and return a short page as if it were complete. Where
-        // the n-th poll lands is SQLite's business, so try each in turn.
+        // the n-th poll lands is SQLite's business, so try every one of them.
         let limit = 2_000;
-        let mut interrupted = 0;
-        for nth in 0..64 {
-            let polls = std::sync::atomic::AtomicUsize::new(0);
-            let stop = move || polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= nth;
-            match store.interruptible(stop, |s| s.search("git", limit)) {
-                Ok(hits) => assert_eq!(hits.len(), limit, "poll {nth}: a short page passed off as whole"),
-                Err(e) => {
-                    assert!(is_interrupt(&e), "{e}");
-                    interrupted += 1;
-                }
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = |nth: usize| {
+            let polls = polls.clone();
+            polls.store(0, std::sync::atomic::Ordering::Relaxed);
+            move || polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= nth
+        };
+        assert_eq!(store.interruptible(count(usize::MAX), |s| s.search("git", limit)).unwrap().len(), limit);
+        let total = polls.load(std::sync::atomic::Ordering::Relaxed);
+        for nth in 0..total {
+            match store.interruptible(count(nth), |s| s.search("git", limit)) {
+                Ok(hits) => assert_eq!(hits.len(), limit, "poll {nth} of {total}: a short page passed off as whole"),
+                Err(e) => assert!(is_interrupt(&e), "{e}"),
             }
         }
-        assert!(interrupted > 1, "no poll landed while the rows were fetched");
     }
 
     #[test]
