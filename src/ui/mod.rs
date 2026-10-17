@@ -25,7 +25,7 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 
 use crate::app::{self, Budget, MatchMode, Order, SearchRequest};
-use crate::picker::{self, PickError};
+use crate::picker::{self, Pick, PickError};
 use crate::store::Store;
 use model::{PAGE_LIMIT, PickOutcome, UiAction, UiEffect, UiModel, update};
 use term::{InputReader, TerminalGuard};
@@ -274,10 +274,10 @@ where
     }
 }
 
-fn pick_outcome(r: std::result::Result<Option<i64>, PickError>) -> PickOutcome {
+fn pick_outcome(r: std::result::Result<Pick, PickError>) -> PickOutcome {
     match r {
-        Ok(Some(id)) => PickOutcome::Picked(id),
-        Ok(None) => PickOutcome::Cancelled,
+        Ok(Pick::Chosen(id)) => PickOutcome::Picked(id),
+        Ok(Pick::NoMatch | Pick::Cancelled) => PickOutcome::Cancelled,
         Err(e @ PickError::Unavailable) => PickOutcome::Failed(e.to_string()),
         Err(e @ PickError::TooOld { .. }) => {
             PickOutcome::Failed(format!("{e}; using indexed search"))
@@ -635,7 +635,7 @@ mod tests {
             };
             assert!(msg.contains(want), "{msg}");
         }
-        assert_eq!(pick_outcome(Ok(None)), PickOutcome::Cancelled);
-        assert_eq!(pick_outcome(Ok(Some(9))), PickOutcome::Picked(9));
+        assert_eq!(pick_outcome(Ok(Pick::Cancelled)), PickOutcome::Cancelled);
+        assert_eq!(pick_outcome(Ok(Pick::Chosen(9))), PickOutcome::Picked(9));
     }
 }

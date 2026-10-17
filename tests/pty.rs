@@ -441,6 +441,26 @@ mod tui {
         );
     }
 
+    /// `search --fzf` keeps fzf's own answers apart: a pick is 0, Enter
+    /// with nothing matching is 1, and a cancel is 130 (ADR 0011).
+    #[test]
+    fn search_fzf_exits_0_on_a_pick_1_on_no_match_and_130_on_cancel() {
+        let _s = serial();
+        let fx = Fixture::new();
+        for (body, code) in [
+            ("cat > /dev/null; printf '1\\t\\0'", 0),
+            ("cat > /dev/null; exit 1", 1),
+            ("cat > /dev/null; exit 130", 130),
+        ] {
+            let fzf = FakeFzf::new(body);
+            let path = path_with(fzf.dir.path());
+            let args = ["search", "fixture", "--fzf", "--db"].map(OsStr::new);
+            let mut s = Session::spawn_args(&[&args[..], &[fx.db.as_os_str()]].concat(), &[("PATH", &path)]);
+            s.assert_exit_code(code);
+            fzf.assert_reaped();
+        }
+    }
+
     #[test]
     fn fzf_missing_resumes() {
         let _s = serial();

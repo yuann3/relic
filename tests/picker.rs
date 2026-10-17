@@ -5,9 +5,9 @@ mod fake_fzf;
 use std::time::Duration;
 
 use fake_fzf::{FakeFzf, page};
-use relic::picker::{PickError, pick_with};
+use relic::picker::{Pick, PickError, pick_with};
 
-fn protocol_error(r: Result<Option<i64>, PickError>) -> String {
+fn protocol_error(r: Result<Pick, PickError>) -> String {
     match r {
         Err(PickError::Protocol(m)) => m,
         other => panic!("expected a protocol error, got {other:?}"),
@@ -18,7 +18,7 @@ fn protocol_error(r: Result<Option<i64>, PickError>) -> String {
 fn returns_the_selected_page_member() {
     let fzf =
         FakeFzf::new("cat > \"$D/stdin\"; printf '12\\t2023-11-14 22:13\\tzsh\\tanything\\0'");
-    assert_eq!(pick_with(&page(&[11, 12, 13]), &fzf.path).unwrap(), Some(12));
+    assert_eq!(pick_with(&page(&[11, 12, 13]), &fzf.path).unwrap(), Pick::Chosen(12));
     fzf.assert_reaped();
 }
 
@@ -54,7 +54,7 @@ fn records_are_nul_framed_sanitized_and_capped() {
     p.hits[1].observed_at_ms = None;
     p.hits[2].text = "€".repeat(1000); // 3 bytes each: the cap falls mid-char
     p.hits[3].text = "plain".into();
-    assert_eq!(pick_with(&p, &fzf.path).unwrap(), None);
+    assert_eq!(pick_with(&p, &fzf.path).unwrap(), Pick::Cancelled);
 
     let stdin = fzf.read("stdin");
     assert_eq!(stdin.last(), Some(&0));
@@ -73,10 +73,10 @@ fn records_are_nul_framed_sanitized_and_capped() {
 }
 
 #[test]
-fn cancel_and_no_match_are_not_errors() {
-    for code in [130, 1] {
+fn cancel_and_no_match_are_distinct_and_not_errors() {
+    for (code, want) in [(130, Pick::Cancelled), (1, Pick::NoMatch)] {
         let fzf = FakeFzf::new(&format!("exit {code}"));
-        assert_eq!(pick_with(&page(&[1]), &fzf.path).unwrap(), None, "exit {code}");
+        assert_eq!(pick_with(&page(&[1]), &fzf.path).unwrap(), want, "exit {code}");
         fzf.assert_reaped();
     }
 }
@@ -119,7 +119,7 @@ fn early_exit_without_reading_stdin_still_selects() {
     }
     assert_eq!(
         fake_fzf::within(Duration::from_secs(10), move || pick_with(&p, &fzf.path)).unwrap(),
-        Some(4999)
+        Pick::Chosen(4999)
     );
 }
 
@@ -156,7 +156,7 @@ fn version_gate() {
     ] {
         let fzf = FakeFzf::with_version(version, "printf '1\\t\\0'");
         match pick_with(&page(&[1]), &fzf.path) {
-            Ok(Some(1)) if ok => {}
+            Ok(Pick::Chosen(1)) if ok => {}
             Err(PickError::TooOld { found, minimum }) if !ok => {
                 assert_eq!(minimum, "0.27.2");
                 assert_eq!(

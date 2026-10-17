@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use relic::app::{self, Budget, MatchMode, Order, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
 use relic::import::{History, ImportError, ImportResult, Outcome, SourceKind};
-use relic::picker::PickError;
+use relic::picker::{Pick, PickError};
 use relic::store::Store;
 
 fn main() -> ExitCode {
@@ -201,8 +201,9 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
             }
             page_notes(&page);
             let id = match relic::picker::pick(&page) {
-                Ok(Some(id)) => id,
-                Ok(None) => return Ok(ExitCode::from(130)),
+                Ok(Pick::Chosen(id)) => id,
+                Ok(Pick::NoMatch) => return Ok(ExitCode::FAILURE),
+                Ok(Pick::Cancelled) => return Ok(ExitCode::from(130)),
                 // The picker is optional: indexed results are still complete.
                 Err(e @ (PickError::Unavailable | PickError::TooOld { .. })) => {
                     eprintln!("relic: {e}");

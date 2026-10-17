@@ -121,6 +121,15 @@ impl Session {
     }
 
     pub fn spawn_with(db: &Path, env: &[(&str, &OsStr)], hup: Hup) -> Self {
+        Self::start(&["ui".as_ref(), "--db".as_ref(), db.as_os_str()], env, hup)
+    }
+
+    /// `relic <args>` on the terminal, with the environment of [`Self::spawn`].
+    pub fn spawn_args(args: &[&OsStr], env: &[(&str, &OsStr)]) -> Self {
+        Self::start(args, env, Hup::Forward)
+    }
+
+    fn start(args: &[&OsStr], env: &[(&str, &OsStr)], hup: Hup) -> Self {
         let (master, slave) = open_pty(ROWS, COLS);
         let before = termios(slave.as_raw_fd()).expect("tcgetattr before launch");
         let home = std::env::temp_dir();
@@ -135,7 +144,7 @@ impl Session {
         }
         let proc = Supervised::start(
             env!("CARGO_BIN_EXE_relic").as_ref(),
-            &["ui".as_ref(), "--db".as_ref(), db.as_os_str()],
+            args,
             &vars,
             slave.as_raw_fd(),
             master.as_raw_fd(),

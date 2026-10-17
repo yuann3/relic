@@ -90,15 +90,25 @@ impl From<std::io::Error> for PickError {
     }
 }
 
-/// Let the user pick one hit with the `fzf` on PATH. `Ok(None)` means they
-/// cancelled or nothing matched.
-pub fn pick(page: &SearchPage) -> Result<Option<i64>, PickError> {
+/// What the user did in fzf. No match and cancel stay apart, as fzf keeps
+/// them: a script must tell "nothing matched" from "the user gave up".
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pick {
+    Chosen(i64),
+    /// Enter with nothing matching: fzf's exit 1.
+    NoMatch,
+    /// Esc or Ctrl-C: fzf's exit 130.
+    Cancelled,
+}
+
+/// Let the user pick one hit with the `fzf` on PATH.
+pub fn pick(page: &SearchPage) -> Result<Pick, PickError> {
     let fzf = find_on_path(std::env::var_os("PATH").as_deref()).ok_or(PickError::Unavailable)?;
     pick_with(page, &fzf)
 }
 
 /// [`pick`] with an explicit fzf binary.
-pub fn pick_with(page: &SearchPage, fzf: &Path) -> Result<Option<i64>, PickError> {
+pub fn pick_with(page: &SearchPage, fzf: &Path) -> Result<Pick, PickError> {
     check_version(fzf)?;
     let records = encode(&page.hits);
     let child = command(fzf)
@@ -136,9 +146,9 @@ pub fn pick_with(page: &SearchPage, fzf: &Path) -> Result<Option<i64>, PickError
         _ => {}
     }
     match status.code() {
-        Some(0) => parse_selection(&out, page).map(Some),
-        // 1: Enter with no match. 130: Esc or CTRL-C.
-        Some(1 | 130) => Ok(None),
+        Some(0) => parse_selection(&out, page).map(Pick::Chosen),
+        Some(1) => Ok(Pick::NoMatch),
+        Some(130) => Ok(Pick::Cancelled),
         _ => Err(PickError::Protocol(format!("fzf exited with {status}"))),
     }
 }
