@@ -76,6 +76,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             let mut db = None;
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
+                    "-h" | "--help" => return Ok(Command::Help),
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
                     _ => return Err(format!("unexpected argument for ui: {a}")),
                 }
@@ -86,6 +87,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             let (mut path, mut shell, mut db) = (None, None, None);
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
+                    "-h" | "--help" => return Ok(Command::Help),
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
                     "--shell" => {
                         shell = Some(match value(&mut args, "--shell")?.as_str() {
@@ -106,6 +108,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             let (mut ids, mut db) = (Vec::new(), None);
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
+                    "-h" | "--help" => return Ok(Command::Help),
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
                     f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
                     // As the TUI shows it (`#42`) or bare.
@@ -135,6 +138,7 @@ fn parse_search(
         match a.as_str() {
             _ if options_done => words.push(a),
             "--" => options_done = true,
+            "-h" | "--help" => return Ok(Command::Help),
             "--db" => db = Some(value(&mut args, "--db")?.into()),
             "--limit" => {
                 let n: usize = value(&mut args, "--limit")?
@@ -220,6 +224,24 @@ mod tests {
         assert_eq!(p(&["-h"]).unwrap(), Command::Help);
         assert_eq!(p(&["--help"]).unwrap(), Command::Help);
         assert_eq!(p(&["--version"]).unwrap(), Command::Version);
+    }
+
+    #[test]
+    fn subcommands_accept_help_flags() {
+        for args in [
+            &["ui", "--help"][..],
+            &["ui", "--db", "x.db", "-h"],
+            &["import", "--help"],
+            &["import", "h.txt", "-h"],
+            &["forget", "--help"],
+            &["forget", "7", "-h"],
+            &["search", "--help"],
+            &["search", "git", "-h", "--db", "x.db"],
+        ] {
+            assert_eq!(p(args), Ok(Command::Help), "{args:?}");
+        }
+        // After `--` it is a query word like any other.
+        assert_eq!(search(&["search", "--", "-h"]).query, "-h");
     }
 
     #[test]
