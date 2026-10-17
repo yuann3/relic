@@ -196,8 +196,11 @@ fn resolve_db_from(
     if let Some(p) = explicit.or_else(|| nonempty("RELIC_DB").map(PathBuf::from)) {
         return Ok(p);
     }
+    // The XDG spec says to ignore a relative value; honouring it would put the
+    // database wherever the command happened to run.
     let data = nonempty("XDG_DATA_HOME")
         .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
         .or_else(|| nonempty("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .ok_or("cannot locate a database: pass --db or set RELIC_DB")?;
     Ok(data.join("relic").join("relic.db"))
@@ -302,5 +305,8 @@ mod tests {
             PathBuf::from("/h/.local/share/relic/relic.db")
         );
         assert!(resolve_db_from(None, env(&[])).is_err());
+        let relative = env(&[("XDG_DATA_HOME", "rel"), ("HOME", "/h")]);
+        assert_eq!(resolve_db_from(None, relative).unwrap(), PathBuf::from("/h/.local/share/relic/relic.db"));
+        assert!(resolve_db_from(None, env(&[("XDG_DATA_HOME", "rel")])).is_err());
     }
 }
