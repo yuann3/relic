@@ -6,13 +6,19 @@ use std::path::PathBuf;
 
 use crate::import::SourceKind;
 
-pub const USAGE: &str = "\
+// `concat!` takes only literals, so the `ui` line is spliced in by a macro:
+// a headless build must not advertise a command it cannot run.
+macro_rules! usage {
+    ($ui:literal) => {
+        concat!(
+            "\
 relic — recall what you did in the terminal, with evidence
 
 USAGE:
     relic search <QUERY>... [--db PATH] [--limit N] [--prefix] [--rank] [--json | --fzf]
-    relic ui [--db PATH]
-    relic import <HISTORY_FILE> [--shell zsh|bash] [--db PATH]
+",
+            $ui,
+            "    relic import <HISTORY_FILE> [--shell zsh|bash] [--db PATH]
     relic forget <ID>... [--db PATH]
     relic --help | --version
 
@@ -31,7 +37,23 @@ OPTIONS:
     --shell       History format for import. Default: what the file was imported
                   as before, else what its content or name shows. A --shell
                   that differs from the stored one replaces that file's records
-";
+
+EXIT STATUS:
+    0             Success; search found a match
+    1             Search found no match, or nothing matched in fzf
+    2             Error, including bad arguments, a busy store and a query
+                  with nothing to search for
+    130           The fzf picker was cancelled
+    128+n         Killed by signal n
+"
+        )
+    };
+}
+
+#[cfg(feature = "tui")]
+pub const USAGE: &str = usage!("    relic ui [--db PATH]\n");
+#[cfg(not(feature = "tui"))]
+pub const USAGE: &str = usage!("");
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -227,6 +249,11 @@ mod tests {
         assert_eq!(p(&["-h"]).unwrap(), Command::Help);
         assert_eq!(p(&["--help"]).unwrap(), Command::Help);
         assert_eq!(p(&["--version"]).unwrap(), Command::Version);
+    }
+
+    #[test]
+    fn usage_lists_ui_only_when_built_with_it() {
+        assert_eq!(USAGE.contains("relic ui"), cfg!(feature = "tui"));
     }
 
     #[test]
