@@ -760,6 +760,7 @@ mod tests {
             deferred: None,
             words_dropped: 0,
             order: crate::app::Order::RecentlyImported,
+            filtered: true,
             hits: ids
                 .iter()
                 .map(|&id| hit(id, &format!("{query} cmd {id}")))

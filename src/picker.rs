@@ -289,6 +289,7 @@ mod tests {
             deferred: None,
             words_dropped: 0,
             order: app::Order::RecentlyImported,
+            filtered: true,
             hits,
         }
     }

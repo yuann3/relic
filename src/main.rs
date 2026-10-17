@@ -183,6 +183,16 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
     let limit = args.limit.unwrap_or(default_limit);
     let req = SearchRequest { query: args.query, limit, mode, order };
     let page = app::search(&store, &req, &Budget::start())?;
+    // Recent commands are what a typing surface shows; to a script they would
+    // pass for matches. A query that searched nothing is a usage error.
+    if !page.filtered {
+        page_notes(&page);
+        return Err(format!(
+            "nothing to search for in \"{}\": search matches words of letters or digits",
+            app::display_line(&page.query)
+        )
+        .into());
+    }
     let mut out = std::io::stdout().lock();
     match args.output {
         Output::Json => {

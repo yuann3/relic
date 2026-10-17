@@ -71,6 +71,35 @@ fn words_past_the_cap_are_ignored_and_the_page_says_how_many() {
     assert_eq!(whole["words_dropped"], 0);
 }
 
+/// Exit 0 is a match, 1 is no match, and a query that searches no word is a
+/// usage error: never the recent commands passed off as matches (ADR 0011).
+#[test]
+fn exit_status_tells_a_match_from_no_match_from_a_query_with_nothing_to_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store_with(dir.path(), &["git push", "gh pr list"]);
+    let long_word = ["a"; 17].join("/");
+    let cases: &[(&[&str], i32)] = &[
+        (&["search", "git"], 0),
+        (&["search", "--prefix", "git", "p"], 0),
+        (&["search", "nomatch"], 1),
+        (&["search", "--json", "nomatch"], 1),
+        (&["search", "&&"], 2),
+        (&["search", "--json", "&&"], 2),
+        (&["search", "--prefix", "g"], 2),
+        (&["search", "--prefix", "&&"], 2),
+        (&["search", &long_word], 2),
+    ];
+    for &(args, code) in cases {
+        let out = relic(args, &db);
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(code), "{args:?}: {stderr}");
+        if code == 2 {
+            assert!(stdout.is_empty(), "{args:?} printed rows: {stdout}");
+            assert!(stderr.contains("nothing to search for"), "{args:?}: {stderr}");
+        }
+    }
+}
+
 #[test]
 fn search_reads_while_an_import_holds_the_write_lock() {
     let dir = tempfile::tempdir().unwrap();
