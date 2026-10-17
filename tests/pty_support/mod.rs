@@ -265,6 +265,22 @@ impl Session {
         }
     }
 
+    /// Waits until the job is stopped (Ctrl-Z), as `ps` reports it.
+    pub fn wait_stopped(&mut self) {
+        let pid = self.pid().to_string();
+        while Instant::now() < self.deadline {
+            let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid]).output().unwrap();
+            if String::from_utf8_lossy(&out.stdout).trim_start().starts_with('T') {
+                return;
+            }
+            if let Some(s) = self.try_exit() {
+                panic!("relic exited with {s} instead of stopping\n{}", self.with(dump));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("relic did not stop before the deadline\n{}", self.with(dump));
+    }
+
     /// The child is still running after `period`.
     pub fn assert_alive_for(&mut self, period: Duration) {
         let end = Instant::now() + period;
@@ -288,7 +304,13 @@ impl Session {
     /// bracketed paste off after it was last enabled. Call after exit.
     pub fn assert_restored(&self) {
         assert!(self.exited.is_some(), "check restoration after exit");
-        let now = termios(self.slave.as_raw_fd()).expect("tcgetattr after exit");
+        self.assert_given_back();
+    }
+
+    /// The terminal as [`Self::assert_restored`] wants it, while relic is
+    /// still alive: suspended, or running another program.
+    pub fn assert_given_back(&self) {
+        let now = termios(self.slave.as_raw_fd()).expect("tcgetattr");
         let b = &self.before;
         let lost: Vec<&str> = [
             (libc::ICANON, "ICANON"),

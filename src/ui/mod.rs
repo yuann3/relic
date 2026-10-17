@@ -281,6 +281,22 @@ where
                 }
                 vec![]
             }
+            UiEffect::Suspend => {
+                // The fzf hand-off, with the shell as the program that
+                // takes the terminal (ADR 0011).
+                self.input.pause();
+                guard.restore()?;
+                // SAFETY: SIG_DFL stops the whole process here; the shell's
+                // `fg` continues it after the raise.
+                unsafe {
+                    libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+                    libc::raise(libc::SIGTSTP);
+                }
+                guard.resume()?;
+                redraw_all(&mut self.terminal)?;
+                self.input.resume();
+                vec![UiAction::Resize]
+            }
             UiEffect::Exit => unreachable!("handled by the loop"),
         })
     }

@@ -143,6 +143,8 @@ pub enum UiEffect {
     CancelRecall {
         op: u64,
     },
+    /// Ctrl-Z: give the terminal back and stop until the shell's `fg`.
+    Suspend,
     Exit,
 }
 
@@ -443,6 +445,11 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
 }
 
 fn on_key(m: &mut UiModel, key: Key) -> Vec<UiEffect> {
+    // Raw mode turns off the tty's own Ctrl-Z, so it arrives as a key and
+    // must suspend from anywhere, as it would without the TUI.
+    if key == Key::Ctrl('z') {
+        return vec![UiEffect::Suspend];
+    }
     match m.modal {
         Some(Modal::Help) => {
             if matches!(key, Key::Esc | Key::Char('?' | 'q')) {
@@ -1401,6 +1408,7 @@ mod tests {
             Key::Ctrl('r'),
             Key::Ctrl('f'),
             Key::Ctrl('u'),
+            Key::Ctrl('z'),
             Key::Up,
             Key::Down,
             Key::Enter,
@@ -1434,6 +1442,7 @@ mod tests {
                 let is_y = matches!(action, UiAction::Key(Key::Char('y' | 'Y')));
                 let picker_key = matches!(action, UiAction::Key(Key::Ctrl('f')))
                     || (matches!(action, UiAction::Key(Key::Char('f'))) && m.focus != Focus::Query);
+                let suspend_key = matches!(action, UiAction::Key(Key::Ctrl('z')));
                 for e in update(&mut m, action) {
                     match e {
                         UiEffect::StartRecall { op, .. } => {
@@ -1445,6 +1454,7 @@ mod tests {
                             ops.push(op);
                         }
                         UiEffect::OpenPicker(_) => assert!(picker_key, "run {run} step {step}"),
+                        UiEffect::Suspend => assert!(suspend_key, "run {run} step {step}"),
                         UiEffect::Search { .. }
                         | UiEffect::OpenEvidence { .. }
                         | UiEffect::CancelRecall { .. }

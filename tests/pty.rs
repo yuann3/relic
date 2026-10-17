@@ -93,6 +93,28 @@ mod tui {
         quits_cleanly(s, b"\x1b");
     }
 
+    /// Ctrl-Z gives the shell its terminal back and stops relic; `fg`
+    /// (SIGCONT to the foreground job) brings the workspace back whole.
+    #[test]
+    fn ctrl_z_suspends_and_fg_redraws_the_whole_workspace() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let mut s = ready(&fx, &[]);
+        s.send(b"\x1a");
+        s.wait_stopped();
+        s.assert_given_back();
+        s.with(|o| assert!(!o.screen.in_alt(), "{}", pty_support::dump(o)));
+        // Re-entering the alternate screen blanks it: only a full redraw
+        // brings the rows back.
+        s.signal(libc::SIGCONT);
+        s.wait_screen("fixture-cmd-40");
+        s.with(|o| assert!(o.screen.in_alt(), "{}", pty_support::dump(o)));
+        // Typing works again: the reader was resumed.
+        s.send(b"zz");
+        s.wait_screen("> zz ");
+        quits_cleanly(s, b"\x1b");
+    }
+
     #[test]
     fn double_ctrl_c_quits() {
         let _s = serial();

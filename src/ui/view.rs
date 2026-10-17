@@ -441,6 +441,7 @@ fn help(frame: &mut Frame, t: &Theme, area: Rect) {
         ("r  or ^R", "start (asks first) or cancel a recall"),
         ("Esc", "close dialog, cancel recall, back, then quit"),
         ("^C ^C", "cancel or clear; twice within 1 s quits"),
+        ("^Z", "suspend to the shell; fg comes back"),
         ("q", "quit when not typing"),
     ];
     let lines: Vec<Line> = rows
