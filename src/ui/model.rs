@@ -458,15 +458,15 @@ fn on_key(m: &mut UiModel, key: Key) -> Vec<UiEffect> {
             return vec![];
         }
         Some(Modal::ConfirmRecall) => {
-            return match key {
-                Key::Char('y' | 'Y') => start_recall(m),
-                Key::Char('n' | 'N') | Key::Esc => {
-                    m.modal = None;
-                    m.notice = Some("recall not started".into());
-                    vec![]
-                }
-                _ => vec![],
-            };
+            // Anything but y is a no: a dialog that ignored other keys stayed
+            // open while the user typed on, so the 'y' of "ruby", whose 'r'
+            // opened it, gave consent.
+            if matches!(key, Key::Char('y' | 'Y')) {
+                return start_recall(m);
+            }
+            m.modal = None;
+            m.notice = Some("recall not started".into());
+            return vec![];
         }
         None => {}
     }
@@ -1173,15 +1173,24 @@ mod tests {
         let e = update(&mut m, UiAction::Key(Key::Char('r')));
         assert!(e.is_empty());
         assert_eq!(m.modal, Some(Modal::ConfirmRecall));
-        // Keys other than y/n/Esc do nothing while the budget is on screen.
-        for k in [Key::Enter, Key::Char('r'), Key::Down, Key::Char('q')] {
+        // Any key but y declines, and is spent on declining: typing "ruby"
+        // in a pane never starts a recall.
+        for k in [Key::Esc, Key::Char('n'), Key::Enter, Key::Down, Key::Char('u')] {
+            if m.modal.is_none() {
+                update(&mut m, UiAction::Key(Key::Char('r')));
+            }
+            assert_eq!(m.modal, Some(Modal::ConfirmRecall), "{k:?}");
             assert!(update(&mut m, UiAction::Key(k)).is_empty(), "{k:?}");
-            assert_eq!(m.modal, Some(Modal::ConfirmRecall));
+            assert_eq!(m.modal, None, "{k:?}");
+            assert_eq!(m.notice.as_deref(), Some("recall not started"), "{k:?}");
         }
-        let e = update(&mut m, UiAction::Key(Key::Esc));
-        assert!(e.is_empty());
-        assert_eq!(m.modal, None);
+        for c in "ruby".chars() {
+            m.focus = Focus::Results;
+            let e = update(&mut m, UiAction::Key(Key::Char(c)));
+            assert!(!e.iter().any(|e| matches!(e, UiEffect::StartRecall { .. })), "{c}");
+        }
         assert!(!m.recall.running());
+        m.focus = Focus::Results;
 
         update(&mut m, UiAction::Key(Key::Ctrl('r')));
         let e = update(&mut m, UiAction::Key(Key::Char('y')));
@@ -1195,7 +1204,8 @@ mod tests {
         else {
             panic!("{e:?}")
         };
-        assert_eq!((op, query.as_str(), cite), (1, "git", 10));
+        // The keys after the "r" were query text: "git" became "gitby".
+        assert_eq!((op, query.as_str(), cite), (1, "gitby", 10));
         assert_eq!(m.recall.status, RecallStatus::Running);
     }
 
