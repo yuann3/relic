@@ -387,6 +387,8 @@ fn translate_one(ev: Event, now: Instant) -> Option<UiAction> {
             let ctrl = modifiers.contains(KeyModifiers::CONTROL);
             let key = match code {
                 KeyCode::Char('c') if ctrl => return Some(UiAction::Interrupt(now)),
+                // ^H is the terminal's other Backspace (byte 0x08).
+                KeyCode::Char('h' | 'H') if ctrl => Key::Backspace,
                 KeyCode::Char(c) if ctrl => Key::Ctrl(c.to_ascii_lowercase()),
                 KeyCode::Char(c) => Key::Char(c),
                 KeyCode::Up => Key::Up,
@@ -490,6 +492,8 @@ mod tests {
                 Some(Key::Char('Q')),
             ),
             (key(KeyCode::Char('n'), ctrl), Some(Key::Ctrl('n'))),
+            (key(KeyCode::Char('h'), ctrl), Some(Key::Backspace)),
+            (key(KeyCode::Backspace, none), Some(Key::Backspace)),
             (
                 key(KeyCode::Char('F'), ctrl | KeyModifiers::SHIFT),
                 Some(Key::Ctrl('f')),
