@@ -7,6 +7,7 @@ use relic::cli::{self, Command, Output, SearchArgs};
 use relic::import::{History, ImportError, ImportResult, Outcome, SourceKind};
 use relic::picker::{Pick, PickError};
 use relic::store::Store;
+use serde::Serialize;
 
 fn main() -> ExitCode {
     // Before anything is created: the database, its WAL, the key and any file
@@ -197,7 +198,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
     let mut out = std::io::stdout().lock();
     match args.output {
         Output::Json => {
-            serde_json::to_writer(&mut out, &page)?;
+            page.serialize(&mut serde_json::Serializer::with_formatter(&mut out, TerminalSafe))?;
             writeln!(out)?;
         }
         Output::Text => print_page(&mut out, &page)?,
@@ -246,6 +247,28 @@ fn could_not_look(e: &dyn std::error::Error) -> ExitCode {
 /// A path as it may reach the terminal.
 fn shown(path: &Path) -> String {
     app::display_line(&path.display().to_string())
+}
+
+/// serde_json escapes only what JSON requires, so C1 controls, bidi overrides
+/// and line separators would reach a terminal that shows the output raw.
+/// Escaping whatever `display_char` neutralizes keeps the decoded text exact.
+struct TerminalSafe;
+
+impl serde_json::ser::Formatter for TerminalSafe {
+    fn write_string_fragment<W: ?Sized + Write>(&mut self, w: &mut W, fragment: &str) -> std::io::Result<()> {
+        let mut start = 0;
+        for (i, c) in fragment.char_indices() {
+            if app::display_char(c) == c {
+                continue;
+            }
+            w.write_all(&fragment.as_bytes()[start..i])?;
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                write!(w, "\\u{unit:04x}")?;
+            }
+            start = i + c.len_utf8();
+        }
+        w.write_all(&fragment.as_bytes()[start..])
+    }
 }
 
 fn print_page(out: &mut impl Write, page: &app::SearchPage) -> Result<()> {

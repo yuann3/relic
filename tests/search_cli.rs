@@ -71,6 +71,20 @@ fn words_past_the_cap_are_ignored_and_the_page_says_how_many() {
     assert_eq!(whole["words_dropped"], 0);
 }
 
+/// JSON escapes only what it must, so `--json` escapes what a terminal would
+/// act on as well; the decoded text is still exactly what was stored.
+#[test]
+fn json_escapes_controls_a_terminal_would_act_on_and_keeps_the_text_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let hostile = "echo a\u{85}b\u{202e}c\u{2028}d\u{e0041}e café";
+    let db = store_with(dir.path(), &[hostile]);
+    let out = relic(&["search", "--json", "echo"], &db);
+    let raw = String::from_utf8(out.stdout.clone()).unwrap();
+    assert!(!raw.contains(['\u{85}', '\u{202e}', '\u{2028}', '\u{e0041}']), "{raw}");
+    assert!(raw.contains(r"\u0085") && raw.contains(r"\udb40\udc41") && raw.contains("café"), "{raw}");
+    assert_eq!(texts(&page(&out)), [hostile]);
+}
+
 /// Exit 0 is a match, 1 is no match, and a query that searches no word is a
 /// usage error: never the recent commands passed off as matches (ADR 0011).
 #[test]
