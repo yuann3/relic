@@ -16,7 +16,8 @@ fn main() -> ExitCode {
     let cmd = match cli::parse(std::env::args_os().skip(1)) {
         Ok(cmd) => cmd,
         Err(e) => {
-            eprintln!("relic: {e}\n\n{}", cli::USAGE);
+            // Parse errors quote argv, which is as hostile as history text.
+            eprintln!("relic: {}\n\n{}", app::display_line(&e), cli::USAGE);
             return ExitCode::from(2);
         }
     };
@@ -84,12 +85,12 @@ fn run(cmd: Command) -> Result<ExitCode> {
             tighten(&db, owns_dir);
             let r = match import(&db, &history, shell) {
                 Err(ImportError::Busy) => {
-                    eprintln!("relic: busy: another import is writing {}; try again", db.display());
+                    eprintln!("relic: busy: another import is writing {}; try again", shown(&db));
                     return Ok(ExitCode::from(2));
                 }
                 r => r?,
             };
-            let (name, n) = (path.display(), r.records_stored);
+            let (name, n) = (shown(&path), r.records_stored);
             if r.rescrubbed > 0 {
                 eprintln!(
                     "relic: redaction rules changed since they were stored: re-redacted {} stored commands",
@@ -118,11 +119,11 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 eprintln!("relic: note: {name}: the last record is incomplete and was not stored");
             }
             if let Some(warning) = &r.key_warning {
-                eprintln!("relic: note: {warning}");
+                eprintln!("relic: note: {}", app::display_line(warning));
             }
             match r.outcome {
                 Outcome::Unchanged => eprintln!("{name}: unchanged since last import"),
-                Outcome::First => eprintln!("{name}: stored {n} {} commands in {}", r.kind, db.display()),
+                Outcome::First => eprintln!("{name}: stored {n} {} commands in {}", r.kind, shown(&db)),
                 Outcome::Appended => eprintln!("{name}: added {n} new commands"),
                 Outcome::Aligned => {
                     eprintln!("{name}: the file was rewritten; added {n} new commands and kept the earlier ones")
@@ -156,11 +157,11 @@ fn tighten(db: &Path, owns_dir: bool) {
     for (path, mode) in dir.into_iter().chain(files) {
         let Ok(meta) = std::fs::metadata(&path) else { continue };
         if meta.uid() != me {
-            eprintln!("relic: warning: {} is owned by another user", path.display());
+            eprintln!("relic: warning: {} is owned by another user", shown(&path));
         } else if meta.mode() & 0o077 != 0
             && let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
         {
-            eprintln!("relic: warning: could not make {} owner-only: {e}", path.display());
+            eprintln!("relic: warning: could not make {} owner-only: {e}", shown(&path));
         }
     }
 }
@@ -237,8 +238,14 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
 
 /// "Could not look" is not "nothing found": exit 2, not 1 (ADR 0011).
 fn could_not_look(e: &dyn std::error::Error) -> ExitCode {
-    eprintln!("relic: {e}");
+    // Errors carry paths and argv; neither may drive the terminal.
+    eprintln!("relic: {}", app::display_line(&e.to_string()));
     ExitCode::from(2)
+}
+
+/// A path as it may reach the terminal.
+fn shown(path: &Path) -> String {
+    app::display_line(&path.display().to_string())
 }
 
 fn print_page(out: &mut impl Write, page: &app::SearchPage) -> Result<()> {
