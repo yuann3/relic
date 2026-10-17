@@ -23,7 +23,7 @@ mod headless {
         let _s = serial();
         let fx = Fixture::new();
         let mut s = Session::spawn(&fx.db, &[]);
-        s.assert_exit_code(1);
+        s.assert_exit_code(2);
         s.assert_restored();
         s.with(|o| {
             assert!(

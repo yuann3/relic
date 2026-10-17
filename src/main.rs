@@ -2,11 +2,11 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use relic::app::{self, Budget, MatchMode, Order, SearchError, SearchRequest};
+use relic::app::{self, Budget, MatchMode, Order, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
 use relic::import::{History, ImportError, ImportResult, Outcome, SourceKind};
 use relic::picker::PickError;
-use relic::store::{Store, StoreError};
+use relic::store::Store;
 
 fn main() -> ExitCode {
     // Before anything is created: the database, its WAL, the key and any file
@@ -24,12 +24,8 @@ fn main() -> ExitCode {
         Ok(code) => code,
         // `relic search … | head` closing the pipe early is not a failure.
         Err(e) if broken_pipe(e.as_ref()) => ExitCode::SUCCESS,
-        // Whichever command met the busy store: "could not look", not "found nothing".
-        Err(e) if matches!(e.downcast_ref(), Some(StoreError::Busy)) => could_not_look(e.as_ref()),
-        Err(e) => {
-            eprintln!("relic: {e}");
-            ExitCode::FAILURE
-        }
+        // Exit 1 is "found nothing"; any error is "could not look" (ADR 0011).
+        Err(e) => could_not_look(e.as_ref()),
     }
 }
 
@@ -45,13 +41,14 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn run(cmd: Command) -> Result<ExitCode> {
     match cmd {
-        Command::Help => print!("{}", cli::USAGE),
+        // `print!` panics on a closed pipe; a write error reaches `broken_pipe`.
+        Command::Help => std::io::stdout().lock().write_all(cli::USAGE.as_bytes())?,
         Command::Version => {
             // The gate harness reads the build from here: nothing else tells a
             // headless, full or debug binary apart from outside.
             let build = if cfg!(feature = "tui") { "tui" } else { "headless" };
             let debug = if cfg!(debug_assertions) { ", debug" } else { "" };
-            println!("relic {} ({build}{debug})", env!("CARGO_PKG_VERSION"));
+            writeln!(std::io::stdout().lock(), "relic {} ({build}{debug})", env!("CARGO_PKG_VERSION"))?;
         }
         Command::Search(args) => return search(args),
         Command::Ui { db } => ui(&existing_db(db)?)?,
@@ -185,10 +182,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
     let default_limit = if args.output == Output::Fzf { app::MAX_PAGE } else { 20 };
     let limit = args.limit.unwrap_or(default_limit);
     let req = SearchRequest { query: args.query, limit, mode, order };
-    let page = match app::search(&store, &req, &Budget::start()) {
-        Err(e @ (SearchError::TooBroad | SearchError::Cancelled)) => return Ok(could_not_look(&e)),
-        page => page?,
-    };
+    let page = app::search(&store, &req, &Budget::start())?;
     let mut out = std::io::stdout().lock();
     match args.output {
         Output::Json => {
