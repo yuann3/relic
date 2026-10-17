@@ -30,6 +30,8 @@ use crate::store::Store;
 use model::{PAGE_LIMIT, PickOutcome, UiAction, UiEffect, UiModel, update};
 use term::{InputReader, TerminalGuard};
 
+pub(crate) use term::emergency_restore;
+
 /// Quiet period before a keystroke becomes a query. Zero: with newest-first
 /// FTS every keystroke costs under 8 ms, the newest-wins mailbox already
 /// coalesces bursts, and a 75 ms timed wait measured ~115 ms on macOS
@@ -55,6 +57,7 @@ pub fn run(db: &Path) -> Result<()> {
     let mono = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
 
+    crate::signal::install();
     let mut guard = TerminalGuard::enter()?;
     // Spawned only once the terminal is ours, so a failed entry has no
     // thread to stop.
@@ -63,7 +66,10 @@ pub fn run(db: &Path) -> Result<()> {
         let (mb, tx) = (Arc::clone(&mailbox), tx.clone());
         std::thread::Builder::new()
             .name("relic-search".into())
-            .spawn(move || search_worker(&worker_store, &mb, &tx, debounce()))?
+            .spawn(move || {
+                crate::signal::block_in_this_thread();
+                search_worker(&worker_store, &mb, &tx, debounce())
+            })?
     };
     let outcome = (|| {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;

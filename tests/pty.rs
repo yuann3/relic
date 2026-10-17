@@ -43,8 +43,8 @@ mod tui {
     use std::time::Duration;
 
     use super::pty_support::{
-        self, COLS, DEADLINE, ENTER_ALT, Fixture, Hup, LEAVE_ALT, Output, ROWS, Session, path_with,
-        serial, wait_gone,
+        self, COLS, DEADLINE, ENTER_ALT, Fixture, Hup, LEAVE_ALT, Output, RELIC, ROWS, Session,
+        path_with, serial, wait_gone,
     };
 
     use super::fake_fzf::FakeFzf;
@@ -250,6 +250,79 @@ mod tui {
             "{}",
             pty_support::describe(status)
         );
+    }
+
+    /// A fatal signal sent to relic alone (`kill`, `timeout`, a supervisor)
+    /// leaves the terminal as it was and relic dead of that signal.
+    #[test]
+    fn a_fatal_signal_restores_the_terminal_and_exits_by_that_signal() {
+        let _s = serial();
+        let fx = Fixture::new();
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            let mut s = ready(&fx, &[]);
+            s.signal(sig);
+            let status = s.wait_exit();
+            assert_eq!(status.signal(), Some(sig), "{}", pty_support::describe(status));
+            s.assert_restored();
+        }
+    }
+
+    /// An fzf that ignores SIGTERM and leaves the tty raw: relic kills it
+    /// and still gives the shell back the terminal it had.
+    const STUBBORN_PICKER: &str = "cat > /dev/null\n\
+        trap '' TERM\n\
+        stty raw -echo < /dev/tty\n\
+        printf 'FAKE-FZF-READY\\r\\n' > /dev/tty\n\
+        IFS= read -r line < /dev/tty";
+
+    fn signal_while_fzf_runs(mut s: Session, fzf: &FakeFzf) {
+        s.wait_for("the fake fzf to wait on /dev/tty", |o| o.contains("FAKE-FZF-READY"));
+        s.signal(libc::SIGTERM);
+        let status = s.wait_exit();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{}", pty_support::describe(status));
+        s.assert_restored();
+        let pids = String::from_utf8(fzf.read("pids")).unwrap();
+        for p in pids.lines() {
+            let p: libc::pid_t = p.parse().unwrap();
+            assert!(wait_gone(p, Duration::from_secs(1)), "fake fzf pid {p} outlived relic");
+        }
+    }
+
+    #[test]
+    fn a_fatal_signal_while_fzf_runs_in_the_tui_stops_fzf_and_restores() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let fzf = FakeFzf::new(STUBBORN_PICKER);
+        let path = path_with(fzf.dir.path());
+        let s = ready(&fx, &[("PATH", &path)]);
+        s.send(b"\x06");
+        signal_while_fzf_runs(s, &fzf);
+    }
+
+    #[test]
+    fn a_fatal_signal_while_search_fzf_runs_stops_fzf_and_restores() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let fzf = FakeFzf::new(STUBBORN_PICKER);
+        let path = path_with(fzf.dir.path());
+        let args = ["search", "fixture", "--fzf", "--db"].map(OsStr::new);
+        let s = Session::spawn_args(&[&args[..], &[fx.db.as_os_str()]].concat(), &[("PATH", &path)]);
+        signal_while_fzf_runs(s, &fzf);
+    }
+
+    /// A signal the user's shell left ignored (`nohup`, `trap '' TERM`)
+    /// stays ignored.
+    #[test]
+    fn an_inherited_ignored_signal_stays_ignored() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let script = "trap '' TERM; exec \"$0\" ui --db \"$1\"";
+        let args = ["-c".as_ref(), script.as_ref(), RELIC.as_ref(), fx.db.as_os_str()];
+        let mut s = Session::spawn_program("/bin/sh".as_ref(), &args, &[]);
+        s.wait_ready();
+        s.signal(libc::SIGTERM);
+        s.assert_alive_for(Duration::from_millis(300));
+        quits_cleanly(s, b"\x1b");
     }
 
     /// The same disconnect under `nohup`: no signal, so relic must notice

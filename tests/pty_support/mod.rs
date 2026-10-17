@@ -47,6 +47,8 @@ pub fn serial() -> MutexGuard<'static, ()> {
 
 /// A small history imported through relic's own importer, newest last:
 /// `fixture-cmd-01` .. `fixture-cmd-40`.
+pub const RELIC: &str = env!("CARGO_BIN_EXE_relic");
+
 pub struct Fixture {
     _dir: tempfile::TempDir,
     pub db: PathBuf,
@@ -121,15 +123,21 @@ impl Session {
     }
 
     pub fn spawn_with(db: &Path, env: &[(&str, &OsStr)], hup: Hup) -> Self {
-        Self::start(&["ui".as_ref(), "--db".as_ref(), db.as_os_str()], env, hup)
+        Self::start(RELIC.as_ref(), &["ui".as_ref(), "--db".as_ref(), db.as_os_str()], env, hup)
     }
 
     /// `relic <args>` on the terminal, with the environment of [`Self::spawn`].
     pub fn spawn_args(args: &[&OsStr], env: &[(&str, &OsStr)]) -> Self {
-        Self::start(args, env, Hup::Forward)
+        Self::start(RELIC.as_ref(), args, env, Hup::Forward)
     }
 
-    fn start(args: &[&OsStr], env: &[(&str, &OsStr)], hup: Hup) -> Self {
+    /// `program <args>`, for a wrapper that sets something up and then
+    /// execs [`RELIC`] in the same process.
+    pub fn spawn_program(program: &OsStr, args: &[&OsStr], env: &[(&str, &OsStr)]) -> Self {
+        Self::start(program, args, env, Hup::Forward)
+    }
+
+    fn start(program: &OsStr, args: &[&OsStr], env: &[(&str, &OsStr)], hup: Hup) -> Self {
         let (master, slave) = open_pty(ROWS, COLS);
         let before = termios(slave.as_raw_fd()).expect("tcgetattr before launch");
         let home = std::env::temp_dir();
@@ -143,7 +151,7 @@ impl Session {
             vars.push((k.as_ref(), v));
         }
         let proc = Supervised::start(
-            env!("CARGO_BIN_EXE_relic").as_ref(),
+            program,
             args,
             &vars,
             slave.as_raw_fd(),

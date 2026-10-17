@@ -212,6 +212,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
             page_notes(&page);
+            relic::signal::install();
             let id = match relic::picker::pick(&page) {
                 Ok(Pick::Chosen(id)) => id,
                 Ok(Pick::NoMatch) => return Ok(ExitCode::FAILURE),

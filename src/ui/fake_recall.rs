@@ -20,7 +20,10 @@ pub fn spawn(
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name(format!("relic-recall-{op}"))
-        .spawn(move || script(op, &query, cite, &cancel, &tx))
+        .spawn(move || {
+            crate::signal::block_in_this_thread();
+            script(op, &query, cite, &cancel, &tx)
+        })
 }
 
 fn script(op: u64, query: &str, cite: i64, cancel: &AtomicBool, tx: &SyncSender<UiAction>) {

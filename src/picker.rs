@@ -117,13 +117,17 @@ pub fn pick_with(page: &SearchPage, fzf: &Path) -> Result<Pick, PickError> {
         .stdout(Stdio::piped())
         .spawn()
         .map_err(spawn_error)?;
+    crate::signal::set_child(child.id() as libc::pid_t);
     let mut child = Reaped(child);
     let mut stdin = child.0.stdin.take().expect("stdin is piped");
     let mut stdout = child.0.stdout.take().expect("stdout is piped");
 
     // Feeding stdin from this thread while fzf blocks on a full stdout pipe
     // (or never reads) would deadlock; a writer thread keeps both moving.
-    let writer = std::thread::spawn(move || stdin.write_all(&records));
+    let writer = std::thread::spawn(move || {
+        crate::signal::block_in_this_thread();
+        stdin.write_all(&records)
+    });
 
     let mut out = Vec::new();
     let read = (&mut stdout).take(OUTPUT_MAX as u64 + 1).read_to_end(&mut out);
@@ -133,7 +137,9 @@ pub fn pick_with(page: &SearchPage, fzf: &Path) -> Result<Pick, PickError> {
         // Stop a child that is still talking; we are not listening any more.
         let _ = child.0.kill();
     }
-    let status = child.0.wait()?;
+    let status = child.0.wait();
+    crate::signal::set_child(0);
+    let status = status?;
     let written = writer.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 
     read?;
@@ -163,6 +169,7 @@ impl Drop for Reaped {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+        crate::signal::set_child(0);
     }
 }
 

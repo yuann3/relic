@@ -177,7 +177,7 @@ fn install_panic_hook() {
 /// Runs inside the panic hook, possibly while another frame holds stdout's
 /// lock or crossterm's raw-mode mutex, so it takes neither: raw `write(2)`
 /// of the reset sequences and `tcsetattr` with the termios saved at entry.
-fn emergency_restore() {
+pub(crate) fn emergency_restore() {
     #[cfg(unix)]
     {
         let write = |bytes: &[u8]| {
@@ -248,7 +248,10 @@ impl InputReader {
         let g = Arc::clone(&gate);
         let handle = std::thread::Builder::new()
             .name("relic-input".into())
-            .spawn(move || read_loop(&g, &tx, &mut next))
+            .spawn(move || {
+                crate::signal::block_in_this_thread();
+                read_loop(&g, &tx, &mut next)
+            })
             .expect("spawn input thread");
         Self {
             gate,
