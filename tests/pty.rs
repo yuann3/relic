@@ -129,8 +129,10 @@ mod tui {
         let mut s = ready(&fx, &[]);
         s.send(b"\x03");
         s.wait_screen("press Ctrl-C again within 1 s to quit");
+        // The notice goes when the window closes, with no key pressed.
+        s.wait_for("the notice to expire", |o| !o.screen.text().contains("Ctrl-C again"));
         // Past the 1 s window a second press is a first press again.
-        s.assert_alive_for(Duration::from_millis(1300));
+        s.assert_alive_for(Duration::from_millis(300));
         s.send(b"\x03");
         s.assert_alive_for(Duration::from_millis(300));
         quits_cleanly(s, b"\x1b");

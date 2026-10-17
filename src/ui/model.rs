@@ -14,6 +14,7 @@ pub const PAGE_LIMIT: usize = 200;
 /// Bounds the query so a huge paste cannot become a huge FTS expression.
 pub const QUERY_MAX_CHARS: usize = 256;
 pub const DOUBLE_INTERRUPT: Duration = Duration::from_secs(1);
+const INTERRUPT_HINT: &str = "press Ctrl-C again within 1 s to quit";
 
 /// Budget the confirmation promises. The fake recall stays inside it so the
 /// meter reads like the real one will.
@@ -302,6 +303,12 @@ impl UiModel {
             last_interrupt: None,
         }
     }
+
+    /// When the double-Ctrl-C window closes, so the runtime wakes to take
+    /// its notice down.
+    pub fn interrupt_expires(&self) -> Option<Instant> {
+        self.last_interrupt.map(|t| t + DOUBLE_INTERRUPT)
+    }
 }
 
 pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
@@ -337,6 +344,14 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
             if m.recall.running() {
                 m.recall.now = Some(now);
                 m.dirty = true;
+            }
+            // The double-Ctrl-C window closed: its notice would now lie.
+            if m.interrupt_expires().is_some_and(|end| now >= end) {
+                m.last_interrupt = None;
+                if m.notice.as_deref().is_some_and(|n| n.ends_with(INTERRUPT_HINT)) {
+                    m.notice = None;
+                    m.dirty = true;
+                }
             }
             vec![]
         }
@@ -540,7 +555,7 @@ fn on_interrupt(m: &mut UiModel, at: Instant) -> Vec<UiEffect> {
         return vec![UiEffect::Exit];
     }
     m.last_interrupt = Some(at);
-    let hint = "press Ctrl-C again within 1 s to quit";
+    let hint = INTERRUPT_HINT;
     let effects = if let Some(op) = m.recall.active {
         let e = cancel_recall(m, op);
         m.notice = Some(format!("recall cancelled; {hint}"));

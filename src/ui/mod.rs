@@ -180,23 +180,32 @@ where
             }
 
             if queue.is_empty() {
-                let action = if m.recall.running() {
-                    let now = Instant::now();
-                    if now >= next_tick {
-                        next_tick = now + PROGRESS_TICK;
-                        UiAction::Tick(now)
-                    } else {
-                        match rx.recv_timeout(next_tick - now) {
-                            Ok(a) => a,
-                            Err(RecvTimeoutError::Timeout) => continue,
-                            Err(RecvTimeoutError::Disconnected) => return Ok(()),
-                        }
-                    }
-                } else {
-                    // Idle: block until something happens. No frame timer.
-                    match rx.recv() {
+                // Wake for the progress meter while a recall runs, and once
+                // when the double-Ctrl-C window closes. Otherwise block until
+                // something happens: no frame timer.
+                let wake = [m.recall.running().then_some(next_tick), m.interrupt_expires()]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                let action = match wake {
+                    None => match rx.recv() {
                         Ok(a) => a,
                         Err(_) => return Ok(()),
+                    },
+                    Some(at) => {
+                        let now = Instant::now();
+                        if now >= at {
+                            if now >= next_tick {
+                                next_tick = now + PROGRESS_TICK;
+                            }
+                            UiAction::Tick(now)
+                        } else {
+                            match rx.recv_timeout(at - now) {
+                                Ok(a) => a,
+                                Err(RecvTimeoutError::Timeout) => continue,
+                                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                            }
+                        }
                     }
                 };
                 queue.push_back(action);
