@@ -80,6 +80,19 @@ mod tui {
         quits_cleanly(s, b"\tq");
     }
 
+    /// Esc and a letter that reach relic in one read are still two keys:
+    /// Esc leaves the results pane and the letter is query text.
+    #[test]
+    fn esc_then_a_letter_in_one_read_is_both_keys() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let mut s = ready(&fx, &[]);
+        s.send(b"\t");
+        s.send(b"\x1bw");
+        s.wait_screen("> w ");
+        quits_cleanly(s, b"\x1b");
+    }
+
     #[test]
     fn double_ctrl_c_quits() {
         let _s = serial();
