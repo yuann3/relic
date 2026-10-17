@@ -67,7 +67,7 @@ pub fn run(db: &Path) -> Result<()> {
     };
     let outcome = (|| {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        terminal.clear()?;
+        redraw_all(&mut terminal)?;
         let input = InputReader::spawn(tx.clone());
         let mut rt = Runtime {
             store,
@@ -95,6 +95,14 @@ pub fn run(db: &Path) -> Result<()> {
     outcome?;
     restored?;
     Ok(())
+}
+
+/// Takes the terminal's current size and repaints every cell on the next
+/// draw. Not `Terminal::clear`: it asks the terminal for the cursor position
+/// and stalls 2 s, then fails, on one that does not answer (ADR 0011).
+fn redraw_all<B: Backend>(terminal: &mut Terminal<B>) -> std::result::Result<(), B::Error> {
+    let size = terminal.size()?;
+    terminal.resize(ratatui::layout::Rect::from((ratatui::layout::Position::ORIGIN, size)))
 }
 
 /// Closes the mailbox and joins the search worker. The receiver goes first:
@@ -244,10 +252,8 @@ where
                 guard.restore()?;
                 let picked = picker::pick(&page);
                 guard.resume()?;
-                // The size may have changed while fzf ran; autoresize picks
-                // it up, and clear forces every cell to be redrawn.
-                self.terminal.autoresize()?;
-                self.terminal.clear()?;
+                // The size may have changed while fzf ran.
+                redraw_all(&mut self.terminal)?;
                 self.input.resume();
                 vec![UiAction::PickerReturned(pick_outcome(picked))]
             }

@@ -3,7 +3,8 @@
 //! Ratatui writes only changed cells between cursor moves, so the raw byte
 //! stream does not contain the frame's text in order; this grid does.
 //! Colors and attributes are parsed and dropped. Every char is one cell
-//! (the fixture is ASCII; box drawing is single width).
+//! (the fixture is ASCII; box drawing is single width). It never answers a
+//! query, as some terminals do not: relic must not wait on one (ADR 0011).
 
 pub struct Screen {
     rows: usize,
@@ -16,8 +17,6 @@ pub struct Screen {
     saved: (usize, usize),
     state: State,
     utf8: Vec<u8>,
-    /// Answers owed to the program, as a real terminal would send them.
-    replies: Vec<u8>,
 }
 
 enum State {
@@ -44,7 +43,6 @@ impl Screen {
             saved: (0, 0),
             state: State::Ground,
             utf8: Vec::new(),
-            replies: Vec::new(),
         }
     }
 
@@ -59,13 +57,6 @@ impl Screen {
             .map(|r| r.iter().collect::<String>().trim_end().to_string())
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    /// Ratatui's `Terminal::clear` asks for the cursor position (DSR) and
-    /// gives up with an error after 2 s without an answer, so the harness
-    /// must answer like a terminal.
-    pub fn take_replies(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.replies)
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -229,10 +220,6 @@ impl Screen {
                     _ => line.fill(' '),
                 }
             }
-            (false, b'n') if nums.first() == Some(&6) => {
-                let reply = format!("\x1b[{};{}R", self.row + 1, self.col.min(cols - 1) + 1);
-                self.replies.extend_from_slice(reply.as_bytes());
-            }
             (false, b's') => self.saved = (self.row, self.col),
             (false, b'u') => (self.row, self.col) = self.saved,
             (true, b'h' | b'l') if nums.contains(&1049) => {
@@ -271,7 +258,5 @@ mod tests {
         assert_eq!(s.text(), "shell$\n\n");
         s.feed(b"\r\nl2\r\nl3\r\nl4");
         assert_eq!(s.text(), "l2\nl3\nl4", "scrolls at the bottom");
-        s.feed(b"\x1b[2;5H\x1b[6n");
-        assert_eq!(s.take_replies(), b"\x1b[2;5R");
     }
 }

@@ -460,14 +460,10 @@ fn read_master(fd: RawFd, shared: &Shared, stop: &AtomicBool) {
             }
             return;
         }
-        let replies = {
-            let mut out = shared.out.lock().unwrap();
-            out.raw.extend_from_slice(&buf[..n as usize]);
-            out.screen.feed(&buf[..n as usize]);
-            shared.cv.notify_all();
-            out.screen.take_replies()
-        };
-        write_all(fd, &replies);
+        let mut out = shared.out.lock().unwrap();
+        out.raw.extend_from_slice(&buf[..n as usize]);
+        out.screen.feed(&buf[..n as usize]);
+        shared.cv.notify_all();
     }
 }
 

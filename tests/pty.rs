@@ -364,6 +364,9 @@ mod tui {
             let first = position(o, ENTER_ALT, 0).unwrap();
             let again = position(o, ENTER_ALT, first + 1).unwrap();
             assert!(first < left && left < ran && ran < again, "{shown}");
+            // Neither startup nor the resume asked where the cursor is: a
+            // terminal that does not answer would stall them 2 s.
+            assert_eq!(o.count(b"\x1b[6n"), 0, "{shown}");
         });
         fzf.assert_reaped();
         quits_cleanly(s, b"q");
