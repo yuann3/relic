@@ -66,34 +66,39 @@ pub fn execute_search(
     budget: &Budget,
     notes: &mut Vec<String>,
 ) -> Result<HandleId, ExecError> {
-    let query = match search.match_mode {
-        MatchMode::Any => search.terms.join(" OR "),
-        MatchMode::All => search.terms.join(" "),
+    // The shared search has no OR: a word matches whole and every word must
+    // match. So `any` is one search per term, merged newest first.
+    let queries = match search.match_mode {
+        MatchMode::Any => search.terms.clone(),
+        MatchMode::All => vec![search.terms.join(" ")],
     };
-
-    // Through the shared use case, so the model's searches run under the
-    // same word cap and deadline as the user's (ADR 0006).
-    let req = SearchRequest {
-        query,
-        limit: search.limit as usize,
-        mode: app::MatchMode::Words,
-        order: Order::RecentlyImported,
-    };
-    let page = match app::search(store, &req, budget) {
-        Ok(page) => page,
-        // A step result, not a failed investigation: the root sees an empty
-        // set and why, and can plan rarer terms (#26 handoff).
-        Err(e @ app::SearchError::TooBroad) => {
-            notes.push(format!("{}: {e}", search.op_id));
-            return Ok(registry.insert_evidence_set(Vec::new()));
+    let limit = search.limit as usize;
+    let mut hits = Vec::new();
+    for query in queries {
+        // Through the shared use case, so the model's searches run under the
+        // same word cap and deadline as the user's (ADR 0006). One budget for
+        // all the terms: the step as a whole has the deadline.
+        let req = SearchRequest { query, limit, mode: app::MatchMode::Words, order: Order::RecentlyImported };
+        match app::search(store, &req, budget) {
+            Ok(page) => hits.extend(page.hits),
+            // A step result, not a failed investigation: the root sees an
+            // empty set and why, and can plan rarer terms (#26 handoff).
+            Err(e @ app::SearchError::TooBroad) => {
+                notes.push(format!("{}: {e}", search.op_id));
+                return Ok(registry.insert_evidence_set(Vec::new()));
+            }
+            Err(app::SearchError::Cancelled) => return Err(ExecError::Cancelled),
+            Err(e) => return Err(ExecError::Search(e)),
         }
-        Err(app::SearchError::Cancelled) => return Err(ExecError::Cancelled),
-        Err(e) => return Err(ExecError::Search(e)),
-    };
+    }
+    // Row id order is import order, the order each page already has.
+    hits.sort_by_key(|h| std::cmp::Reverse(h.id));
+    hits.dedup_by_key(|h| h.id);
+    hits.truncate(limit);
 
     // Fetch full StoredObservation for each hit.
-    let mut observations = Vec::with_capacity(page.hits.len());
-    for hit in &page.hits {
+    let mut observations = Vec::with_capacity(hits.len());
+    for hit in &hits {
         if let Some(obs) = store.get_observation(hit.id).map_err(ExecError::Store)? {
             observations.push(obs);
         }
@@ -393,6 +398,23 @@ mod tests {
 
         let obs = registry.get_observations(&hid).unwrap();
         assert!(obs.iter().all(|o| o.safe_text.contains("cargo")));
+    }
+
+    #[test]
+    fn search_any_matches_either_term_and_all_needs_both() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = seed_store(&mut store);
+        insert_commands(&mut store, rev_id, &["cargo build", "git push", "cargo git-hook", "docker ps", "git or cargo"]);
+        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let mut run = |match_mode, limit| {
+            let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into(), "git".into()], match_mode, limit };
+            let hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
+            registry.get_observations(&hid).unwrap().iter().map(|o| o.safe_text.clone()).collect::<Vec<_>>()
+        };
+        // Newest first, each once, and not only rows with the word "or".
+        assert_eq!(run(MatchMode::Any, 10), ["git or cargo", "cargo git-hook", "git push", "cargo build"]);
+        assert_eq!(run(MatchMode::Any, 2), ["git or cargo", "cargo git-hook"]);
+        assert_eq!(run(MatchMode::All, 10), ["git or cargo", "cargo git-hook"]);
     }
 
     #[test]
