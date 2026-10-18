@@ -5,7 +5,7 @@ use crate::rlm::evidence::{HandleId, HandleRegistry};
 use crate::rlm::executor::{self, ExecError};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary, ModelError};
 use crate::rlm::protocol::*;
-use crate::rlm::validate::{self, ValidationError};
+use crate::rlm::validate::{self, Op, ValidationError};
 use crate::store::Store;
 
 /// Terminal result of an investigation.
@@ -197,7 +197,7 @@ pub fn run_investigation(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_op(
-    op: &PlanOpV1,
+    op: &Op,
     store: &Store,
     registry: &mut HandleRegistry,
     plan_outputs: &HashMap<String, HandleId>,
@@ -207,7 +207,7 @@ fn execute_op(
     last_inspection: &mut Option<EvidencePacket>,
 ) -> Result<Option<(String, HandleId)>, CoordinatorError> {
     match op {
-        PlanOpV1::Search(s) => {
+        Op::Search(s) => {
             // Reserve rows.
             ledger
                 .reserve(&Reservation {
@@ -230,7 +230,7 @@ fn execute_op(
             Ok(Some((s.op_id.clone(), hid)))
         }
 
-        PlanOpV1::Expand(e) => {
+        Op::Expand(e) => {
             ledger
                 .reserve(&Reservation {
                     rows_returned: e.limit as u64,
@@ -251,7 +251,7 @@ fn execute_op(
             Ok(Some((e.op_id.clone(), hid)))
         }
 
-        PlanOpV1::Assess(a) => {
+        Op::Assess(a) => {
             // Reserve child calls.
             let batch_count =
                 (a.max_items as u16).div_ceil(a.batch_size as u16);
@@ -270,7 +270,7 @@ fn execute_op(
             Ok(Some((a.op_id.clone(), hid)))
         }
 
-        PlanOpV1::Inspect(i) => {
+        Op::Inspect(i) => {
             let source_hid = executor::resolve_input(&i.input, plan_outputs)
                 .map_err(CoordinatorError::Execution)?;
 
@@ -312,8 +312,8 @@ fn execute_op(
             Ok(None) // Inspect doesn't produce a handle — it produces a root observation.
         }
 
-        // Relate, Combine, Select — not implemented in prototype.
-        _ => Ok(None),
+        // Select is not implemented in the prototype.
+        Op::Select(_) => Ok(None),
     }
 }
 

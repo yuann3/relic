@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 pub enum PlanOpV1 {
     Search(SearchV1),
     Expand(ExpandV1),
-    Relate(RelateV1),
-    Combine(CombineV1),
+    // Named so that admission can say they are not built (ADR 0009); their
+    // fields are ignored, never read.
+    Relate,
+    Combine,
     Assess(AssessV1),
     Select(SelectV1),
     Inspect(InspectV1),
@@ -50,42 +52,6 @@ pub struct ExpandV1 {
 pub enum ExpandScope {
     SameSource,
     SameSession,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct RelateV1 {
-    pub op_id: String,
-    pub input: InputRefV1,
-    pub relation: Relation,
-    pub per_seed: u32,
-    pub limit: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Relation {
-    SameSession,
-    SameCwdTime,
-    GitState,
-    SameRepo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct CombineV1 {
-    pub op_id: String,
-    pub inputs: Vec<InputRefV1>,
-    pub mode: CombineMode,
-    pub limit: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum CombineMode {
-    Union,
-    Intersection,
-    Difference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -301,24 +267,6 @@ mod tests {
         let json = r#"{"op":"expand","op_id":"e1","input":{"output":"s1"},"scope":"same_source","before":5,"after":10,"limit":100}"#;
         let op: PlanOpV1 = serde_json::from_str(json).unwrap();
         assert!(matches!(&op, PlanOpV1::Expand(e) if e.op_id == "e1" && e.before == 5 && e.after == 10));
-        let rt: PlanOpV1 = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
-        assert_eq!(op, rt);
-    }
-
-    #[test]
-    fn relate_op_round_trips() {
-        let json = r#"{"op":"relate","op_id":"r1","input":{"output":"e1"},"relation":"git_state","per_seed":2,"limit":80}"#;
-        let op: PlanOpV1 = serde_json::from_str(json).unwrap();
-        assert!(matches!(&op, PlanOpV1::Relate(r) if r.relation == Relation::GitState));
-        let rt: PlanOpV1 = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
-        assert_eq!(op, rt);
-    }
-
-    #[test]
-    fn combine_op_round_trips() {
-        let json = r#"{"op":"combine","op_id":"c1","inputs":[{"output":"s1"},{"output":"s2"}],"mode":"union","limit":200}"#;
-        let op: PlanOpV1 = serde_json::from_str(json).unwrap();
-        assert!(matches!(&op, PlanOpV1::Combine(c) if c.inputs.len() == 2 && c.mode == CombineMode::Union));
         let rt: PlanOpV1 = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
         assert_eq!(op, rt);
     }
