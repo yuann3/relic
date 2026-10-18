@@ -151,18 +151,35 @@ fn query_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let focused = m.focus == Focus::Query;
     let block = pane(t, "Query · local index · offline".into(), focused);
     let inner = block.inner(area);
-    let mut spans = vec![
-        Span::styled("> ", t.title),
-        Span::raw(display_line(&m.query)),
-    ];
+    // Room after the prompt, keeping a cell for the cursor.
+    let shown = tail(&display_line(&m.query), usize::from(inner.width).saturating_sub(3));
+    let mut spans = vec![Span::styled("> ", t.title), Span::raw(shown.clone())];
     if m.query.is_empty() {
         spans.push(Span::styled("type to search your history", t.dim));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     if focused && m.modal.is_none() {
-        let x = inner.x + 2 + ratatui::text::Line::raw(display_line(&m.query)).width() as u16;
+        let x = inner.x + 2 + Line::raw(shown).width() as u16;
         frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
     }
+}
+
+/// The end of `text` that fits in `room` columns, behind '…' when cut:
+/// typing and Backspace act at the end, so the end must stay in view.
+fn tail(text: &str, room: usize) -> String {
+    if Line::raw(text).width() <= room {
+        return text.to_string();
+    }
+    let (mut width, mut start) = (1, text.len());
+    for (i, c) in text.char_indices().rev() {
+        let w = Span::raw(&text[i..i + c.len_utf8()]).width();
+        if width + w > room {
+            break;
+        }
+        width += w;
+        start = i;
+    }
+    format!("…{}", &text[start..])
 }
 
 fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
@@ -425,10 +442,10 @@ fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     }
     let hints = match m.focus {
         Focus::Query => {
-            "type to search · ↑/↓ select · Enter open · Tab pane (then ? help) · ^F fzf · ^R recall · Esc quit"
+            "↑/↓ select · Enter open · Tab pane, then ? help · ^F fzf · ^R recall · Esc quit"
         }
         _ => {
-            "j/k move · Enter open · Tab pane · / search · f fzf · r recall · ? help · Esc back · q quit"
+            "j/k move · Enter open · Tab pane · / search · f fzf · r recall · ? help · q quit"
         }
     };
     let [a, b] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
@@ -750,6 +767,25 @@ mod tests {
         let s = screen(&m);
         assert_eq!(row_of(&s, ">  2023"), Some(bottom - 3), "{s}");
         assert_eq!(row_of(&s, "row-34"), Some(bottom), "the rows stayed put:\n{s}");
+    }
+
+    /// At 80 columns the hints end in how to quit, and a long query keeps
+    /// its end, where typing happens, in view.
+    #[test]
+    fn hints_fit_80_columns_and_a_long_query_shows_its_end() {
+        let store = store_with(NGINX);
+        let long = "certbot renew --deploy-hook 'systemctl reload nginx' --cert-name example.com zz";
+        let mut m = typed(&store, long, false);
+        let s = text(&render(&m, 80, 24));
+        let lines: Vec<&str> = s.lines().collect();
+        assert!(lines[1].contains("…") && lines[1].contains("example.com zz"), "{s}");
+        assert!(lines[23].trim_end().ends_with("Esc quit"), "{s}");
+        drive(&mut m, &store, UiAction::Key(Key::Tab));
+        let s = text(&render(&m, 80, 24));
+        assert!(s.lines().last().unwrap().trim_end().ends_with("q quit"), "{s}");
+        // A query that fits is shown whole, with no '…'.
+        let s = text(&render(&typed(&store, "certb", false), 80, 24));
+        assert!(s.contains("> certb") && !s.contains('…'), "{s}");
     }
 
     #[test]
