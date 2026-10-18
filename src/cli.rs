@@ -20,6 +20,7 @@ USAGE:
             $ui,
             "    relic import <HISTORY_FILE> [--shell zsh|bash] [--db PATH]
     relic forget <ID>... [--db PATH]
+    relic model check
     relic --help | --version
 
 OPTIONS:
@@ -37,6 +38,21 @@ OPTIONS:
     --shell       History format for import. Default: what the file was imported
                   as before, else what its content or name shows. A --shell
                   that differs from the stored one replaces that file's records
+
+MODEL:
+    model check sends a synthetic request, never your history, and prints
+    a relic.model-check/v1 receipt. Configure the model with:
+    RELIC_MODEL_PROFILE   openai (default), vllm, llama_cpp or custom
+    RELIC_MODEL_URL       Base URL up to the API version. Default for openai:
+                          https://api.openai.com/v1. Plain http only to a
+                          loopback address such as 127.0.0.1
+    RELIC_MODEL_NAME      The model to ask for
+    RELIC_MODEL_API_KEY   Bearer key; required for openai
+    RELIC_MODEL_OUTPUT, RELIC_MODEL_TOKEN_FIELD
+                          custom only: json_schema, flat_json_schema or
+                          json_object; max_completion_tokens or max_tokens
+    RELIC_MODEL_PRICE_IN, RELIC_MODEL_PRICE_OUT
+                          US dollars per million tokens, to fence cost
 
 EXIT STATUS:
     0             Success; search found a match
@@ -63,6 +79,7 @@ pub enum Command {
     Ui { db: Option<PathBuf> },
     Import { path: PathBuf, shell: Option<SourceKind>, db: Option<PathBuf> },
     Forget { ids: Vec<i64>, db: Option<PathBuf> },
+    ModelCheck,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -126,6 +143,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             let path = path.ok_or("import needs a history file")?;
             Ok(Command::Import { path, shell, db })
         }
+        "model" => match (args.next().transpose()?.as_deref(), args.next().transpose()?.as_deref()) {
+            (Some("-h" | "--help"), _) | (Some("check"), Some("-h" | "--help")) => Ok(Command::Help),
+            (Some("check"), None) => Ok(Command::ModelCheck),
+            (Some("check"), Some(a)) => Err(format!("unexpected argument for model check: {a}")),
+            (Some(sub), _) => Err(format!("unknown model command: {sub}; try model check")),
+            (None, _) => Err("model needs a command: model check".into()),
+        },
         "forget" => {
             let (mut ids, mut db) = (Vec::new(), None);
             while let Some(a) = args.next().transpose()? {
@@ -313,6 +337,9 @@ mod tests {
         assert!(p(&["import", "h", "--shell", "fish"]).is_err());
         assert_eq!(p(&["forget", "#42", "7"]).unwrap(), Command::Forget { ids: vec![42, 7], db: None });
         assert!(p(&["forget"]).is_err());
+        assert_eq!(p(&["model", "check"]).unwrap(), Command::ModelCheck);
+        assert_eq!(p(&["model", "check", "--help"]).unwrap(), Command::Help);
+        assert!(p(&["model"]).is_err() && p(&["model", "chek"]).is_err() && p(&["model", "check", "x"]).is_err());
         assert!(p(&["forget", "all"]).is_err());
     }
 

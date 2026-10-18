@@ -2,7 +2,8 @@ use crate::domain::StoredObservation;
 use crate::rlm::budget::BudgetExhausted;
 use crate::rlm::evidence::{HandleId, HandleRegistry};
 use crate::rlm::validate::HandleKind;
-use crate::rlm::model::{EvidenceItem, EvidencePacket};
+use crate::rlm::model::egress::{self, Role};
+use crate::rlm::model::{EvidenceItem, EvidencePacket, OutputError, parse_output};
 use crate::app::{self, Budget, Order, SearchRequest};
 use crate::rlm::protocol::*;
 use crate::store::{Store, is_interrupt};
@@ -16,7 +17,6 @@ pub enum ExecError {
     HandleNotFound(String),
     /// A handle reference named a set of the wrong kind for its operator.
     WrongKind { handle: String, expected: HandleKind },
-    Model(crate::rlm::model::ModelError),
     Budget(BudgetExhausted),
     /// The investigation's cancel flag was set.
     Cancelled,
@@ -148,10 +148,6 @@ pub fn execute_expand(
 
 /// Most items in one child call (research, operator algebra: assess).
 pub const CHILD_ITEMS_MAX: usize = 4;
-/// Most JSON bytes of a packet and its objective; the child request cap of
-/// ADR 0004. The adapter's template and schema must fit in it too (S6).
-pub const CHILD_PACKET_MAX: usize = 24 * 1024;
-
 /// Most bytes of one note to the root; root state has a 64 KiB cap.
 const NOTE_MAX: usize = 256;
 
@@ -165,10 +161,10 @@ pub fn check_child_result(
     packet: &EvidencePacket,
     raw: &str,
 ) -> Result<Vec<Option<ItemAssessmentV1>>, ChildRejection> {
-    if raw.len() > CHILD_RESULT_MAX {
-        return Err(ChildRejection::Oversize { bytes: raw.len() });
-    }
-    let result: ChildResultV1 = serde_json::from_str(raw).map_err(|e| ChildRejection::Malformed(e.to_string()))?;
+    let result: ChildResultV1 = parse_output(raw, CHILD_RESULT_MAX).map_err(|e| match e {
+        OutputError::Oversize { bytes } => ChildRejection::Oversize { bytes },
+        OutputError::Malformed(e) => ChildRejection::Malformed(e),
+    })?;
     if result.version != 1 {
         return Err(ChildRejection::Version(result.version));
     }
@@ -192,20 +188,26 @@ pub fn check_child_result(
     Ok(slots)
 }
 
-/// Encoded size of what one child call is sent.
+/// What a child call shows the model.
+pub fn child_payload(objective: &str, packet: &EvidencePacket) -> serde_json::Value {
+    serde_json::json!({"objective": objective, "packet": packet})
+}
+
+/// Bytes the child request for `packet` counts against its cap.
 fn packet_bytes(objective: &str, packet: &EvidencePacket) -> usize {
-    serde_json::to_vec(&(objective, packet)).expect("strings and integers serialize").len()
+    egress::request_bytes(Role::Child, &child_payload(objective, packet))
 }
 
 /// Split `items` in order into packets of at most [`CHILD_ITEMS_MAX`] items
-/// and [`CHILD_PACKET_MAX`] bytes. An item too big for a packet of its own
+/// whose child requests fit [`egress::CHILD_MAX`], instructions and schema
+/// included. An item too big for a packet of its own
 /// is cut at a char boundary and marked with [`TruncationV1`].
 pub fn packets(objective: &str, items: Vec<EvidenceItem>) -> Vec<EvidencePacket> {
     // Fixed width, so moving an item to the next packet cannot grow it:
     // admission caps an assess at 64 items, so at most 64 packets.
     let id = |n: usize| format!("pkt_{n:02}");
     let mut out: Vec<EvidencePacket> = Vec::new();
-    let over = |p: &EvidencePacket| p.items.len() > CHILD_ITEMS_MAX || packet_bytes(objective, p) > CHILD_PACKET_MAX;
+    let over = |p: &EvidencePacket| p.items.len() > CHILD_ITEMS_MAX || packet_bytes(objective, p) > egress::CHILD_MAX;
     let mut packet = EvidencePacket { packet_id: id(0), items: Vec::new() };
     for item in items {
         packet.items.push(item);
@@ -232,7 +234,7 @@ fn truncate_to_fit(objective: &str, packet: &mut EvidencePacket) {
         item.safe_text.clear();
         item.safe_text.push_str(&text[..n]);
         item.truncation = Some(TruncationV1 { original_bytes: text.len(), sent_bytes: n });
-        packet_bytes(objective, packet) <= CHILD_PACKET_MAX
+        packet_bytes(objective, packet) <= egress::CHILD_MAX
     };
     // Size only grows with the prefix, so binary search over byte lengths;
     // the empty prefix fits because admission caps the objective.
@@ -248,12 +250,16 @@ fn truncate_to_fit(objective: &str, packet: &mut EvidencePacket) {
     fits(packet, text.floor_char_boundary(lo));
 }
 
+/// Makes the child calls for a batch of packets: each packet's reply body,
+/// or why it has none.
+pub type CallChildren<'a> = dyn FnMut(&[EvidencePacket], &str) -> Result<Vec<Result<String, String>>, ExecError> + 'a;
+
 /// Execute an assess operator: batch evidence into child model calls.
 pub fn execute_assess(
     assess: &AssessV1,
     registry: &mut HandleRegistry,
     plan_outputs: &std::collections::HashMap<String, HandleId>,
-    call_child: &mut dyn FnMut(&EvidencePacket, &str) -> Result<String, ExecError>,
+    call_children: &mut CallChildren,
     notes: &mut Vec<String>,
 ) -> Result<HandleId, ExecError> {
     let source_handle_id = resolve_input(&assess.input, plan_outputs)?;
@@ -276,15 +282,22 @@ pub fn execute_assess(
             truncation: None,
         })
         .collect();
+    // Redacted once here so the packets are sized as they will be sent: the
+    // egress seam redacts again, and safe text redacts to itself.
+    let objective = crate::redact::Redactor::new().redact(&assess.objective);
+    let packets = packets(&objective, items);
+    let replies = call_children(&packets, &objective)?;
     let mut assessments = Vec::with_capacity(selected_count);
-    for packet in &packets(&assess.objective, items) {
-        let raw = call_child(packet, &assess.objective)?;
-        match check_child_result(packet, &raw) {
+    for (packet, reply) in packets.iter().zip(replies) {
+        let checked = reply.map_err(|e| format!("child call for {} failed: {e}", packet.packet_id)).and_then(|raw| {
+            check_child_result(packet, &raw).map_err(|why| format!("child result for {} rejected: {why}", packet.packet_id))
+        });
+        match checked {
             Ok(slots) => assessments.extend(slots),
             // The other packets' verdicts stand; this one's items stay
             // unassessed and the root is told why.
             Err(why) => {
-                let mut note = format!("{}: child result for {} rejected: {why}", assess.op_id, packet.packet_id);
+                let mut note = format!("{}: {why}", assess.op_id);
                 // It quotes the model's ids, which only the 16 KiB body cap bounds.
                 note.truncate(note.floor_char_boundary(NOTE_MAX));
                 notes.push(note);
@@ -343,7 +356,19 @@ mod tests {
     use crate::domain::{Observation, ObservationKind, Provenance};
     use crate::import::SourceKind;
     use crate::rlm::evidence::HandleRegistry;
-    use crate::rlm::model::ModelBoundary;
+    use crate::rlm::model::{FakeModel, ModelBoundary};
+
+    /// The child calls for `packets`, one after another through the egress
+    /// seam, unmetered.
+    fn fake_children(model: &FakeModel, packets: &[EvidencePacket], objective: &str) -> Result<Vec<Result<String, String>>, ExecError> {
+        let mut ledger = crate::rlm::budget::BudgetLedger::new(BudgetV1::prototype_default());
+        let call = |p: &EvidencePacket| {
+            let req = egress::EgressRequest::new(Role::Child, child_payload(objective, p), &model.target(), &mut ledger, &mut |_| {})
+                .unwrap();
+            model.call(&req, std::time::Instant::now()).map(|r| r.body).map_err(|e| e.to_string())
+        };
+        Ok(packets.iter().map(call).collect())
+    }
     use crate::store::{Cursor, Store};
     use std::collections::HashMap;
 
@@ -568,7 +593,7 @@ mod tests {
         let counts: Vec<usize> = packets.iter().map(|p| p.items.len()).collect();
         assert_eq!(counts, [4, 2, 1, 4, 1]);
         for p in &packets {
-            assert!(packet_bytes("objective", p) <= CHILD_PACKET_MAX, "{} is over", p.packet_id);
+            assert!(packet_bytes("objective", p) <= egress::CHILD_MAX, "{} is over", p.packet_id);
         }
         let sent: Vec<&EvidenceItem> = packets.iter().flat_map(|p| &p.items).collect();
         for (sent, original) in sent.iter().zip(&items) {
@@ -594,14 +619,13 @@ mod tests {
         assert!(text.starts_with(&sent.safe_text));
         // As much as fits: within one char of the cap, not cut to nothing.
         let bytes = packet_bytes("objective", packet);
-        assert!(bytes <= CHILD_PACKET_MAX && bytes > CHILD_PACKET_MAX - 2, "{bytes} bytes");
+        assert!(bytes <= egress::CHILD_MAX && bytes > egress::CHILD_MAX - 2, "{bytes} bytes");
     }
 
     // --- Assess tests ---
 
     #[test]
     fn assess_batches_child_calls() {
-        use crate::rlm::model::FakeModel;
 
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
@@ -636,14 +660,14 @@ mod tests {
         let mut plan_outputs = HashMap::new();
         plan_outputs.insert("s1".to_string(), s_hid);
 
-        let mut child_calls = 0u16;
+        let mut child_calls = 0;
         let a_hid = execute_assess(
             &assess,
             &mut registry,
             &plan_outputs,
             &mut |p, o| {
-                child_calls += 1;
-                model.child_call(p, o).map_err(ExecError::Model)
+                child_calls += p.len();
+                fake_children(&model, p, o)
             },
             &mut Vec::new(),
         )
@@ -707,12 +731,10 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_child_result_leaves_its_packet_unassessed() {
-        use crate::rlm::model::FakeModel;
-
+    fn a_rejected_or_failed_child_call_leaves_only_its_packet_unassessed() {
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
-        let cmds: Vec<String> = (0..8).map(|i| format!("cargo task_{i}")).collect();
+        let cmds: Vec<String> = (0..12).map(|i| format!("cargo task_{i}")).collect();
         insert_commands(&mut store, rev_id, &cmds.iter().map(String::as_str).collect::<Vec<_>>());
         let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
         let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into()], match_mode: MatchMode::Any, limit: 50 };
@@ -728,21 +750,22 @@ mod tests {
             r
         });
         model.add_child_response(FakeModel::default_supports_handler());
+        model.add_child_response(FakeModel::default_supports_handler());
 
-        let assess = AssessV1 { op_id: "a1".into(), input: InputRefV1::Handle(s_hid), objective: "o".into(), max_items: 8 };
+        let assess = AssessV1 { op_id: "a1".into(), input: InputRefV1::Handle(s_hid), objective: "o".into(), max_items: 12 };
         let mut notes = Vec::new();
-        let a_hid = execute_assess(
-            &assess,
-            &mut registry,
-            &HashMap::new(),
-            &mut |p, o| model.child_call(p, o).map_err(ExecError::Model),
-            &mut notes,
-        )
-        .unwrap();
+        // The call for packet 1 fails outright, as an HTTP 500 would.
+        let mut call = |p: &[EvidencePacket], o: &str| {
+            let mut replies = fake_children(&model, p, o)?;
+            replies[1] = Err("HTTP 500".into());
+            Ok(replies)
+        };
+        let a_hid = execute_assess(&assess, &mut registry, &HashMap::new(), &mut call, &mut notes).unwrap();
 
         let verdicts: Vec<_> = registry.get_assessments(&a_hid).unwrap().iter().map(|a| a.as_ref().map(|a| a.verdict.clone())).collect();
-        assert_eq!(verdicts, [vec![None; 4], vec![Some(Verdict::Supports); 4]].concat());
-        assert_eq!(notes.len(), 1);
+        assert_eq!(verdicts, [vec![None; 8], vec![Some(Verdict::Supports); 4]].concat());
+        assert_eq!(notes.len(), 2);
         assert!(notes[0].contains("pkt_00") && notes[0].contains("not in the packet"), "{}", notes[0]);
+        assert!(notes[1].contains("pkt_01") && notes[1].contains("HTTP 500"), "{}", notes[1]);
     }
 }

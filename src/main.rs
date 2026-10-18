@@ -54,6 +54,16 @@ fn run(cmd: Command) -> Result<ExitCode> {
         }
         Command::Search(args) => return search(args),
         Command::Ui { db } => ui(&existing_db(db)?)?,
+        Command::ModelCheck => {
+            use relic::rlm::model::chat::{self, ChatCompletionsClient, ChatConfig};
+            let client = ChatCompletionsClient::new(ChatConfig::from_env(|k| std::env::var(k).ok())?)?;
+            let (receipt, verdict) = chat::check(&client);
+            // Terminal-safe: the receipt quotes the endpoint's error text.
+            let mut out = std::io::stdout().lock();
+            receipt.serialize(&mut serde_json::Serializer::with_formatter(&mut out, TerminalSafe))?;
+            writeln!(out)?;
+            verdict.map_err(|e| format!("model check failed: {e}"))?;
+        }
         Command::Forget { ids, db } => {
             let owns_dir = cli::owns_data_dir(&db);
             let db = existing_db(db)?;
