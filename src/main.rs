@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use relic::app::{self, Budget, MatchMode, Order, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
 use relic::import::{History, ImportError, ImportResult, Outcome, SourceKind};
-use relic::picker::{Pick, PickError};
+use relic::picker::{Pick, PickError, PickMode};
 use relic::store::Store;
 use serde::Serialize;
 
@@ -213,7 +213,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
             }
             page_notes(&page);
             relic::signal::install();
-            let id = match relic::picker::pick(&page) {
+            let id = match relic::picker::pick(&page, PickMode::Inline) {
                 Ok(Pick::Chosen(id)) => id,
                 Ok(Pick::NoMatch) => return Ok(ExitCode::FAILURE),
                 Ok(Pick::Cancelled) => return Ok(ExitCode::from(130)),

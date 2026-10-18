@@ -6,7 +6,7 @@
 mod fake_fzf;
 
 use fake_fzf::{FakeFzf, page};
-use relic::picker::{Pick, pick_with};
+use relic::picker::{Pick, PickMode, pick_with};
 
 #[test]
 fn user_fzf_defaults_never_reach_the_picker() {
@@ -17,7 +17,7 @@ fn user_fzf_defaults_never_reach_the_picker() {
         std::env::set_var("RELIC_PICKER_CANARY", "1");
     }
     let fzf = FakeFzf::new("printf '1\\t\\0'");
-    assert_eq!(pick_with(&page(&[1]), &fzf.path).unwrap(), Pick::Chosen(1));
+    assert_eq!(pick_with(&page(&[1]), &fzf.path, PickMode::Inline).unwrap(), Pick::Chosen(1));
     let env = String::from_utf8(fzf.read("env")).unwrap();
     assert!(env.contains("RELIC_PICKER_CANARY=1"), "env was not recorded");
     assert!(!env.contains("FZF_DEFAULT_OPTS"), "{env}");

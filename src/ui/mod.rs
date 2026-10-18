@@ -25,7 +25,7 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 
 use crate::app::{self, Budget, MatchMode, Order, SearchRequest};
-use crate::picker::{self, Pick, PickError};
+use crate::picker::{self, Pick, PickError, PickMode};
 use crate::store::Store;
 use model::{PAGE_LIMIT, PickOutcome, UiAction, UiEffect, UiModel, update};
 use term::{InputReader, TerminalGuard};
@@ -272,7 +272,7 @@ where
                 // Never two terminal readers: park ours before fzf starts.
                 self.input.pause();
                 guard.restore()?;
-                let picked = picker::pick(&page);
+                let picked = picker::pick(&page, PickMode::FullScreen);
                 guard.resume()?;
                 // The size may have changed while fzf ran.
                 redraw_all(&mut self.terminal)?;

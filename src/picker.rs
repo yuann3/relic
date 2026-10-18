@@ -42,7 +42,6 @@ const ARGS: &[&str] = &[
     "--delimiter=\t",
     "--with-nth=2..",
     "--nth=2..",
-    "--height=80%",
     "--layout=reverse",
     "--border",
 ];
@@ -90,6 +89,17 @@ impl From<std::io::Error> for PickError {
     }
 }
 
+/// Where fzf draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickMode {
+    /// Below the prompt (`--height=80%`), with the shell's output above it:
+    /// `search --fzf`.
+    Inline,
+    /// fzf's own alternate screen. From the TUI, inline would draw on the
+    /// primary screen the TUI just handed back, over the user's shell.
+    FullScreen,
+}
+
 /// What the user did in fzf. No match and cancel stay apart, as fzf keeps
 /// them: a script must tell "nothing matched" from "the user gave up".
 #[derive(Debug, PartialEq, Eq)]
@@ -102,17 +112,21 @@ pub enum Pick {
 }
 
 /// Let the user pick one hit with the `fzf` on PATH.
-pub fn pick(page: &SearchPage) -> Result<Pick, PickError> {
+pub fn pick(page: &SearchPage, mode: PickMode) -> Result<Pick, PickError> {
     let fzf = find_on_path(std::env::var_os("PATH").as_deref()).ok_or(PickError::Unavailable)?;
-    pick_with(page, &fzf)
+    pick_with(page, &fzf, mode)
 }
 
 /// [`pick`] with an explicit fzf binary.
-pub fn pick_with(page: &SearchPage, fzf: &Path) -> Result<Pick, PickError> {
+pub fn pick_with(page: &SearchPage, fzf: &Path, mode: PickMode) -> Result<Pick, PickError> {
     check_version(fzf)?;
     let records = encode(&page.hits);
-    let child = command(fzf)
-        .args(ARGS)
+    let mut cmd = command(fzf);
+    cmd.args(ARGS);
+    if mode == PickMode::Inline {
+        cmd.arg("--height=80%");
+    }
+    let child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
