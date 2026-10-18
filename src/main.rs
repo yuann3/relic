@@ -188,12 +188,20 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
     // Recent commands are what a typing surface shows; to a script they would
     // pass for matches. A query that searched nothing is a usage error.
     if !page.filtered {
-        page_notes(&page);
-        return Err(format!(
-            "nothing to search for in \"{}\": search matches words of letters or digits",
-            app::display_line(&page.query)
-        )
-        .into());
+        let why = match &page.deferred {
+            Some(w) if w.chars().any(char::is_alphanumeric) => format!(
+                "\"{}\" is too short; type {}+ characters",
+                app::display_line(w),
+                app::MIN_PREFIX_CHARS
+            ),
+            _ if page.words_dropped > 0 => format!(
+                "every word was ignored: a query uses at most {} words of at most {} parts each",
+                app::MAX_QUERY_WORDS,
+                app::MAX_WORD_TOKENS
+            ),
+            _ => "search matches words of letters or digits".into(),
+        };
+        return Err(format!("nothing to search for in \"{}\": {why}", app::display_line(&page.query)).into());
     }
     let mut out = std::io::stdout().lock();
     match args.output {
