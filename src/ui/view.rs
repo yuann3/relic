@@ -232,8 +232,11 @@ fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         .block(block)
         .highlight_style(t.selected)
         .highlight_symbol("> ");
-    let mut state = ListState::default().with_selected(Some(s.selected));
+    let mut state = ListState::default()
+        .with_offset(s.list_offset.get())
+        .with_selected(Some(s.selected));
     frame.render_stateful_widget(list, area, &mut state);
+    s.list_offset.set(state.offset());
 }
 
 fn timeline(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
@@ -272,8 +275,11 @@ fn timeline(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         .block(pane(t, title, focused))
         .highlight_style(t.selected)
         .highlight_symbol("> ");
-    let mut state = ListState::default().with_selected(Some(m.evidence.cursor));
+    let mut state = ListState::default()
+        .with_offset(m.evidence.list_offset.get())
+        .with_selected(Some(m.evidence.cursor));
     frame.render_stateful_widget(list, area, &mut state);
+    m.evidence.list_offset.set(state.offset());
 }
 
 fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
@@ -715,6 +721,35 @@ mod tests {
         ] {
             assert!(s.contains(want), "missing {want:?} in\n{s}");
         }
+    }
+
+    /// The list scrolls only when the highlight reaches an edge: moving
+    /// back up from the bottom moves the highlight, not the rows.
+    #[test]
+    fn the_highlight_moves_inside_a_scrolled_list() {
+        let rows: Vec<String> = (0..60).map(|i| format!("echo row-{i:02}")).collect();
+        let store = store_with(&rows.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut m = typed(&store, "", false);
+        drive(&mut m, &store, UiAction::Start);
+        drive(&mut m, &store, UiAction::Key(Key::Tab));
+        let mut screen = |m: &UiModel| {
+            term.draw(|f| view(f, m)).unwrap();
+            text(term.backend().buffer())
+        };
+        let row_of = |s: &str, needle: &str| s.lines().position(|l| l.contains(needle));
+        for _ in 0..25 {
+            drive(&mut m, &store, UiAction::Key(Key::Char('j')));
+            screen(&m);
+        }
+        let s = screen(&m);
+        let bottom = row_of(&s, ">  2023").unwrap();
+        for _ in 0..3 {
+            drive(&mut m, &store, UiAction::Key(Key::Char('k')));
+        }
+        let s = screen(&m);
+        assert_eq!(row_of(&s, ">  2023"), Some(bottom - 3), "{s}");
+        assert_eq!(row_of(&s, "row-34"), Some(bottom), "the rows stayed put:\n{s}");
     }
 
     #[test]

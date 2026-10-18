@@ -162,6 +162,10 @@ pub struct SearchState {
     /// The newest query ran out of its budget, and `page` is still the one
     /// for an earlier query (ADR 0007).
     pub too_broad: bool,
+    /// First list row on screen, kept by the view between frames so the
+    /// highlight moves inside the pane and the list scrolls only at its
+    /// edges. Back to the top for each new page.
+    pub list_offset: Cell<usize>,
 }
 
 impl SearchState {
@@ -187,6 +191,8 @@ pub struct EvidenceState {
     /// back rather than `update` estimating and stopping short of the end.
     pub scroll_max: Cell<u16>,
     pub error: Option<String>,
+    /// Like [`SearchState::list_offset`], for the timeline.
+    pub list_offset: Cell<usize>,
 }
 
 impl EvidenceState {
@@ -384,6 +390,7 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
                 Ok(page) => {
                     m.search.error = None;
                     m.search.selected = 0;
+                    m.search.list_offset.set(0);
                     let first = page.hits.first().map(|h| h.id);
                     m.search.page = Some(page);
                     // Evidence the user opened while this search ran stays put.
@@ -417,6 +424,7 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
             match result {
                 Ok(Some(view)) => {
                     m.evidence.cursor = view.timeline.iter().position(|o| o.id == id).unwrap_or(0);
+                    m.evidence.list_offset.set(0);
                     m.evidence.view = Some(view);
                     m.evidence.error = None;
                 }
