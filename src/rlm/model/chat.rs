@@ -177,10 +177,7 @@ impl ChatCompletionsClient {
             OutputMode::FlatJsonSchema => json!({"type": "json_object", "schema": req.schema()}),
             OutputMode::JsonObject => json!({"type": "json_object"}),
         };
-        let token_field = match self.config.token_field {
-            TokenField::MaxCompletionTokens => "max_completion_tokens",
-            TokenField::MaxTokens => "max_tokens",
-        };
+        let token_field = token_field(self.config.token_field);
         let mut body = json!({
             "model": self.config.model,
             "messages": [
@@ -236,6 +233,91 @@ impl ModelBoundary for ChatCompletionsClient {
         }
         let text = response.into_body().with_config().limit(BODY_MAX).read_to_string().map_err(classify)?;
         reply(&text)
+    }
+}
+
+/// `relic model check`: one synthetic child call and one synthetic root call,
+/// each held to the same checks recall uses. Never sends user data
+/// (research, model HTTP boundary). The receipt says what the endpoint
+/// did either way; the error says why it failed.
+pub fn check(client: &ChatCompletionsClient) -> (Value, Result<(), String>) {
+    use crate::rlm::executor::{check_child_result, child_payload};
+    use crate::rlm::model::{EvidenceItem, EvidencePacket, parse_output};
+    use crate::rlm::protocol::{RootActionKind, RootActionV1};
+
+    let packet = EvidencePacket {
+        packet_id: "pkt_00".into(),
+        items: vec![EvidenceItem {
+            item_id: "item_0".into(),
+            evidence_id: "ev1_0000000000000001".into(),
+            safe_text: "ls -la /tmp".into(),
+            truncation: None,
+        }],
+    };
+    let state = json!({
+        "question": "Which command listed the files in /tmp?",
+        "state_version": 0,
+        "corpus": {"observation_count": 1},
+        "handles": [], "notes": [],
+        "budget_remaining": {"root_calls": 1, "child_calls": 0, "plan_ops": 8, "rows_returned": 20},
+    });
+    let probes = [
+        (Role::Child, child_payload("Did this command list files in /tmp?", &packet)),
+        (Role::Root, state),
+    ];
+    let mut ledger = crate::rlm::budget::BudgetLedger::new(crate::rlm::protocol::BudgetV1::prototype_default());
+    let mut roles = serde_json::Map::new();
+    let mut verdict = Ok(());
+    for (role, payload) in probes {
+        let name = format!("{role:?}").to_lowercase();
+        let outcome = EgressRequest::new(role, payload, &client.target(), &mut ledger, &mut |_| {})
+            .map_err(|e| e.to_string())
+            .and_then(|req| client.call(&req, Instant::now() + CHECK_DEADLINE).map_err(|e| e.to_string()));
+        let checked = outcome.as_ref().map_err(Clone::clone).and_then(|reply| match role {
+            Role::Child => check_child_result(&packet, &reply.body).map(drop).map_err(|e| e.to_string()),
+            Role::Root => parse_output::<RootActionV1>(&reply.body, crate::rlm::coordinator::ROOT_RESULT_MAX)
+                .map_err(|e| format!("{e:?}"))
+                .and_then(|a| match a.kind {
+                    RootActionKind::Plan => crate::rlm::validate::validate_plan(&a, 0).map(drop).map_err(|e| e.to_string()),
+                    RootActionKind::Finish if a.finish.is_some() => Ok(()),
+                    RootActionKind::Finish => Err("a finish without its body".into()),
+                }),
+        });
+        let reply = outcome.as_ref().ok();
+        roles.insert(name.clone(), json!({
+            "ok": checked.is_ok(),
+            "returned_model": reply.and_then(|r| r.returned_model.clone()),
+            "usage_reported": reply.is_some_and(|r| r.usage.is_some()),
+            "error": checked.as_ref().err(),
+        }));
+        if let (Err(e), Ok(())) = (checked, &verdict) {
+            verdict = Err(format!("{name} call: {e}"));
+        }
+    }
+    let receipt = json!({
+        "schema": "relic.model-check/v1",
+        "relic_version": env!("CARGO_PKG_VERSION"),
+        "profile": client.config.profile.name(),
+        "endpoint_origin_hash": crate::rlm::evidence::hex_hash(client.origin.as_bytes()),
+        "requested_model": client.config.model,
+        "output_mode": match client.config.output {
+            OutputMode::JsonSchema => "json_schema",
+            OutputMode::FlatJsonSchema => "flat_json_schema",
+            OutputMode::JsonObject => "json_object",
+        },
+        "token_field": token_field(client.config.token_field),
+        "checked_at_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+        "roles": roles,
+    });
+    (receipt, verdict)
+}
+
+/// How long each probe may take.
+const CHECK_DEADLINE: Duration = Duration::from_secs(60);
+fn token_field(field: TokenField) -> &'static str {
+    match field {
+        TokenField::MaxCompletionTokens => "max_completion_tokens",
+        TokenField::MaxTokens => "max_tokens",
     }
 }
 
@@ -487,6 +569,44 @@ mod tests {
         }
         let shown = format!("{:?}", config(Profile::OpenAi, "https://x.example/v1".into()));
         assert!(!shown.contains("sk-test-key"), "{shown}");
+    }
+
+    #[test]
+    fn model_check_holds_both_roles_to_recall_checks() {
+        let child = |item: &str| {
+            json!({"version": 1, "packet_id": "pkt_00", "assessments": [{"item_id": item, "verdict": "supports",
+                "confidence": "high", "claims": [{"text": "ls listed /tmp", "supports": ["ev1_0000000000000001"], "contradicts": []}],
+                "missing": []}]})
+            .to_string()
+        };
+        let plan = json!({"version": 1, "expected_state_version": 0, "kind": "plan", "finish": null, "plan": {"ops": [
+            {"op": "search", "op_id": "s1", "terms": ["ls", "tmp"], "match": "all", "limit": 10}]}})
+        .to_string();
+        let run = |child: String, root: String| {
+            let (url, rx) = serve(vec![answer(200, "", completion(&child, "stop")), answer(200, "", completion(&root, "stop"))]);
+            let client = ChatCompletionsClient::new(config(Profile::OpenAi, url.clone())).unwrap();
+            let (receipt, verdict) = check(&client);
+            let sent: Vec<String> = rx.try_iter().collect();
+            (receipt, verdict, sent, url)
+        };
+
+        let (receipt, verdict, sent, url) = run(child("item_0"), plan.clone());
+        assert_eq!(verdict, Ok(()));
+        assert_eq!((receipt["roles"]["child"]["ok"].clone(), receipt["roles"]["root"]["ok"].clone()), (json!(true), json!(true)));
+        assert_eq!(receipt["roles"]["root"]["returned_model"], "m-1-2026");
+        assert_eq!(sent.len(), 2);
+        // The receipt names the endpoint by hash only.
+        let origin = url.trim_end_matches("/v1");
+        assert!(!receipt.to_string().contains(origin), "{receipt}");
+
+        // A reply that recall would reject fails the check, and says where.
+        let (receipt, verdict, _, _) = run(child("item_9"), plan.clone());
+        assert!(verdict.unwrap_err().starts_with("child call: item_id \"item_9\""));
+        assert_eq!((receipt["roles"]["child"]["ok"].clone(), receipt["roles"]["root"]["ok"].clone()), (json!(false), json!(true)));
+        let relate = json!({"version": 1, "expected_state_version": 0, "kind": "plan", "finish": null,
+            "plan": {"ops": [{"op": "relate", "op_id": "r1"}]}});
+        let (_, verdict, _, _) = run(child("item_0"), relate.to_string());
+        assert!(verdict.unwrap_err().starts_with("root call: NotExecuted"));
     }
 
     #[test]

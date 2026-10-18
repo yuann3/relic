@@ -390,7 +390,7 @@ fn verdict_counts(slots: &[Option<ItemAssessmentV1>]) -> serde_json::Value {
 }
 
 /// Most bytes of a root reply; well over 1536 output tokens of JSON.
-const ROOT_RESULT_MAX: usize = 32 * 1024;
+pub const ROOT_RESULT_MAX: usize = 32 * 1024;
 
 /// The root state the model is shown; the egress seam caps it at 64 KiB.
 fn build_root_state(
