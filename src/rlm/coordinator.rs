@@ -252,20 +252,15 @@ fn execute_op(
         }
 
         Op::Assess(a) => {
-            // Reserve child calls.
-            let batch_count =
-                (a.max_items as u16).div_ceil(a.batch_size as u16);
             ledger
                 .reserve(&Reservation {
-                    child_calls: batch_count,
                     evidence_handles: 1,
                     ..Default::default()
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let hid =
-                executor::execute_assess(a, registry, plan_outputs, model, child_calls)
-                    .map_err(CoordinatorError::Execution)?;
+            let hid = executor::execute_assess(a, registry, plan_outputs, model, ledger, child_calls)
+                .map_err(CoordinatorError::Execution)?;
 
             Ok(Some((a.op_id.clone(), hid)))
         }
@@ -291,15 +286,13 @@ fn execute_op(
             let items: Vec<EvidenceItem> = (0..count)
                 .map(|idx| {
                     let text = &obs[idx].safe_text;
-                    let truncated = if text.len() > i.max_item_bytes as usize {
-                        &text[..i.max_item_bytes as usize]
-                    } else {
-                        text
-                    };
+                    let sent = text.floor_char_boundary(i.max_item_bytes as usize);
                     EvidenceItem {
                         item_id: format!("item_{idx}"),
                         evidence_id: ev_handles[idx].id.clone(),
-                        safe_text: truncated.to_string(),
+                        safe_text: text[..sent].to_string(),
+                        truncation: (sent < text.len())
+                            .then_some(TruncationV1 { original_bytes: text.len(), sent_bytes: sent }),
                     }
                 })
                 .collect();
@@ -350,16 +343,7 @@ fn build_root_state_json(
     });
 
     if let Some(inspection) = last_inspection {
-        state["last_inspection"] = serde_json::json!({
-            "packet_id": inspection.packet_id,
-            "items": inspection.items.iter().map(|item| {
-                serde_json::json!({
-                    "item_id": item.item_id,
-                    "evidence_id": item.evidence_id,
-                    "safe_text": item.safe_text,
-                })
-            }).collect::<Vec<_>>(),
-        });
+        state["last_inspection"] = serde_json::json!(inspection);
     }
 
     serde_json::to_string(&state).unwrap_or_default()
@@ -433,7 +417,6 @@ mod tests {
                         input: InputRefV1::Output("e1".to_string()),
                         objective: "identify certificate renewal steps".to_string(),
                         max_items: 8,
-                        batch_size: 4,
                     }),
                     PlanOpV1::Inspect(InspectV1 {
                         op_id: "i1".to_string(),
@@ -531,6 +514,7 @@ mod tests {
                     item_id: format!("item_{i}"),
                     evidence_id: format!("ev1_{i:016x}"),
                     safe_text: format!("Long command text for item {i} with extra detail"),
+                    truncation: None,
                 })
                 .collect(),
         };

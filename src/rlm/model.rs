@@ -1,17 +1,18 @@
 use crate::rlm::protocol::*;
 
 /// Packet of evidence items sent to a child model call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EvidencePacket {
     pub packet_id: String,
     pub items: Vec<EvidenceItem>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EvidenceItem {
     pub item_id: String,
     pub evidence_id: String,
     pub safe_text: String,
+    pub truncation: Option<TruncationV1>,
 }
 
 /// Trait for the model boundary. Implemented by FakeModel for tests.

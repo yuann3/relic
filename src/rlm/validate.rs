@@ -40,7 +40,7 @@ pub enum ValidationError {
     SearchTooManyTerms { op_id: String, count: usize, max: usize },
     SearchNoTerms { op_id: String },
     LimitZero { op_id: String },
-    AssessBatchSizeZero { op_id: String },
+    AssessObjectiveTooLong { op_id: String, bytes: usize, max: usize },
     AssessMaxItemsExceeded { op_id: String, count: u32, max: u32 },
     ExpandWindowExceeded { op_id: String, per_side: u32, max: u32 },
 }
@@ -57,6 +57,9 @@ const MAX_OPS_PER_PLAN: usize = 8;
 /// The one word cap every search shares (ADR 0006).
 const MAX_SEARCH_TERMS: usize = crate::app::MAX_QUERY_WORDS;
 const MAX_ASSESS_ITEMS: u32 = 64;
+/// Goes into every child packet beside its items; this leaves a lone item
+/// most of the packet cap, so truncation can always make it fit.
+pub const MAX_OBJECTIVE_BYTES: usize = 1024;
 const MAX_EXPAND_PER_SIDE: u32 = 32;
 
 /// Validate a plan structurally and semantically.
@@ -244,9 +247,11 @@ fn validate_op_limits(op: &Op) -> Result<(), ValidationError> {
             }
         }
         Op::Assess(a) => {
-            if a.batch_size == 0 {
-                return Err(ValidationError::AssessBatchSizeZero {
+            if a.objective.len() > MAX_OBJECTIVE_BYTES {
+                return Err(ValidationError::AssessObjectiveTooLong {
                     op_id: a.op_id.clone(),
+                    bytes: a.objective.len(),
+                    max: MAX_OBJECTIVE_BYTES,
                 });
             }
             if a.max_items > MAX_ASSESS_ITEMS {
@@ -320,7 +325,6 @@ mod tests {
             input: InputRefV1::Output(input_op.to_string()),
             objective: "test".to_string(),
             max_items: 32,
-            batch_size: 4,
         })
     }
 
@@ -479,20 +483,20 @@ mod tests {
     }
 
     #[test]
-    fn assess_batch_size_zero_rejected() {
-        let action = make_action(0, vec![
+    fn assess_objective_over_cap_rejected() {
+        let action = |bytes: usize| make_action(0, vec![
             search("s1", &["cargo"], 50),
             PlanOpV1::Assess(AssessV1 {
                 op_id: "a1".to_string(),
                 input: InputRefV1::Output("s1".to_string()),
-                objective: "test".to_string(),
+                objective: "o".repeat(bytes),
                 max_items: 8,
-                batch_size: 0,
             }),
         ]);
+        assert!(validate_plan(&action(MAX_OBJECTIVE_BYTES), 0).is_ok());
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
-            ValidationError::AssessBatchSizeZero { .. }
+            validate_plan(&action(MAX_OBJECTIVE_BYTES + 1), 0).unwrap_err(),
+            ValidationError::AssessObjectiveTooLong { bytes: 1025, .. }
         ));
     }
 
@@ -505,7 +509,6 @@ mod tests {
                 input: InputRefV1::Output("s1".to_string()),
                 objective: "test".to_string(),
                 max_items: 65,
-                batch_size: 4,
             }),
         ]);
         assert!(matches!(

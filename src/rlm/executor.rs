@@ -1,4 +1,5 @@
 use crate::domain::StoredObservation;
+use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
 use crate::rlm::evidence::{HandleId, HandleRegistry};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary};
 use crate::app::{self, Budget, Order, SearchRequest};
@@ -12,6 +13,7 @@ pub enum ExecError {
     HandleNotFound(String),
     NoObservationsForExpand,
     Model(crate::rlm::model::ModelError),
+    Budget(BudgetExhausted),
     ChildAllowlistViolation { item_id: String, bad_evidence_id: String },
 }
 
@@ -92,12 +94,75 @@ pub fn execute_expand(
     Ok(registry.insert_evidence_set(all_neighbors))
 }
 
+/// Most items in one child call (research, operator algebra: assess).
+pub const CHILD_ITEMS_MAX: usize = 4;
+/// Most JSON bytes of a packet and its objective; the child request cap of
+/// ADR 0004. The adapter's template and schema must fit in it too (S6).
+pub const CHILD_PACKET_MAX: usize = 24 * 1024;
+
+/// Encoded size of what one child call is sent.
+fn packet_bytes(objective: &str, packet: &EvidencePacket) -> usize {
+    serde_json::to_vec(&(objective, packet)).expect("strings and integers serialize").len()
+}
+
+/// Split `items` in order into packets of at most [`CHILD_ITEMS_MAX`] items
+/// and [`CHILD_PACKET_MAX`] bytes. An item too big for a packet of its own
+/// is cut at a char boundary and marked with [`TruncationV1`].
+pub fn packets(objective: &str, items: Vec<EvidenceItem>) -> Vec<EvidencePacket> {
+    // Fixed width, so moving an item to the next packet cannot grow it:
+    // admission caps an assess at 64 items, so at most 64 packets.
+    let id = |n: usize| format!("pkt_{n:02}");
+    let mut out: Vec<EvidencePacket> = Vec::new();
+    let over = |p: &EvidencePacket| p.items.len() > CHILD_ITEMS_MAX || packet_bytes(objective, p) > CHILD_PACKET_MAX;
+    let mut packet = EvidencePacket { packet_id: id(0), items: Vec::new() };
+    for item in items {
+        packet.items.push(item);
+        if packet.items.len() > 1 && over(&packet) {
+            let moved = packet.items.pop().into_iter().collect();
+            let next = EvidencePacket { packet_id: id(out.len() + 1), items: moved };
+            out.push(std::mem::replace(&mut packet, next));
+        }
+        if over(&packet) {
+            truncate_to_fit(objective, &mut packet);
+        }
+    }
+    if !packet.items.is_empty() {
+        out.push(packet);
+    }
+    out
+}
+
+/// Cut the one item in `packet` to the longest prefix that fits.
+fn truncate_to_fit(objective: &str, packet: &mut EvidencePacket) {
+    let text = std::mem::take(&mut packet.items[0].safe_text);
+    let fits = |packet: &mut EvidencePacket, n: usize| {
+        let item = &mut packet.items[0];
+        item.safe_text.clear();
+        item.safe_text.push_str(&text[..n]);
+        item.truncation = Some(TruncationV1 { original_bytes: text.len(), sent_bytes: n });
+        packet_bytes(objective, packet) <= CHILD_PACKET_MAX
+    };
+    // Size only grows with the prefix, so binary search over byte lengths;
+    // the empty prefix fits because admission caps the objective.
+    let (mut lo, mut hi) = (0, text.len());
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(packet, text.floor_char_boundary(mid)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    fits(packet, text.floor_char_boundary(lo));
+}
+
 /// Execute an assess operator: batch evidence into child model calls.
 pub fn execute_assess(
     assess: &AssessV1,
     registry: &mut HandleRegistry,
     plan_outputs: &std::collections::HashMap<String, HandleId>,
     model: &dyn ModelBoundary,
+    ledger: &mut BudgetLedger,
     child_calls_made: &mut u16,
 ) -> Result<HandleId, ExecError> {
     let source_handle_id = resolve_input(&assess.input, plan_outputs)?;
@@ -111,7 +176,6 @@ pub fn execute_assess(
 
     // Select up to max_items observations.
     let selected_count = source_obs.len().min(assess.max_items as usize);
-    let batch_size = assess.batch_size as usize;
 
     // Build allowlist of evidence IDs for this assess.
     let allowlist: std::collections::HashSet<&str> = evidence_handles[..selected_count]
@@ -119,28 +183,26 @@ pub fn execute_assess(
         .map(|eh| eh.id.as_str())
         .collect();
 
+    let items = (0..selected_count)
+        .map(|i| EvidenceItem {
+            item_id: format!("item_{i}"),
+            evidence_id: evidence_handles[i].id.clone(),
+            safe_text: source_obs[i].safe_text.clone(),
+            truncation: None,
+        })
+        .collect();
+    let packets = packets(&assess.objective, items);
+    let child_calls = u16::try_from(packets.len()).map_err(|_| ExecError::Budget(BudgetExhausted::ChildCalls))?;
+    ledger
+        .reserve(&Reservation { child_calls, ..Default::default() })
+        .map_err(ExecError::Budget)?;
+
     // Collect all child assessments.
     let mut all_assessments: Vec<ItemAssessmentV1> = Vec::new();
 
-    for chunk_start in (0..selected_count).step_by(batch_size) {
-        let chunk_end = (chunk_start + batch_size).min(selected_count);
-        let packet_id = format!("pkt_{}_{}", assess.op_id, chunk_start);
-
-        let items: Vec<EvidenceItem> = (chunk_start..chunk_end)
-            .map(|i| EvidenceItem {
-                item_id: format!("item_{i}"),
-                evidence_id: evidence_handles[i].id.clone(),
-                safe_text: source_obs[i].safe_text.clone(),
-            })
-            .collect();
-
-        let packet = EvidencePacket {
-            packet_id: packet_id.clone(),
-            items,
-        };
-
+    for packet in &packets {
         let child_result = model
-            .child_call(&packet, &assess.objective)
+            .child_call(packet, &assess.objective)
             .map_err(ExecError::Model)?;
         *child_calls_made += 1;
 
@@ -188,6 +250,7 @@ mod tests {
     use crate::import::SourceKind;
     use crate::rlm::evidence::HandleRegistry;
     use crate::rlm::validate::HandleKind;
+    use crate::rlm::budget::BudgetLedger;
     use crate::store::{Cursor, Store};
     use std::collections::HashMap;
 
@@ -350,6 +413,52 @@ mod tests {
         assert_eq!(ordinals.len(), unique.len(), "no duplicates");
     }
 
+    // --- Batching ---
+
+    fn item(i: usize, text: String) -> EvidenceItem {
+        EvidenceItem { item_id: format!("item_{i}"), evidence_id: format!("ev1_{i:016x}"), safe_text: text, truncation: None }
+    }
+
+    #[test]
+    fn packets_hold_at_most_four_items_and_24_kib_in_order() {
+        let sizes = [10, 10, 9000, 9000, 9000, 10, 30_000, 10, 10, 10, 10, 10];
+        let items: Vec<_> = sizes.iter().enumerate().map(|(i, &n)| item(i, "x".repeat(n))).collect();
+        let packets = packets("objective", items.clone());
+
+        // Worked by hand: a 5th item or a 3rd 9000-byte one starts a packet,
+        // and the 30 000-byte item fills one alone.
+        let counts: Vec<usize> = packets.iter().map(|p| p.items.len()).collect();
+        assert_eq!(counts, [4, 2, 1, 4, 1]);
+        for p in &packets {
+            assert!(packet_bytes("objective", p) <= CHILD_PACKET_MAX, "{} is over", p.packet_id);
+        }
+        let sent: Vec<&EvidenceItem> = packets.iter().flat_map(|p| &p.items).collect();
+        for (sent, original) in sent.iter().zip(&items) {
+            assert_eq!(sent.item_id, original.item_id);
+            if sent.item_id != "item_6" {
+                assert_eq!((&sent.safe_text, &sent.truncation), (&original.safe_text, &None));
+            }
+        }
+        let ids: std::collections::HashSet<_> = packets.iter().map(|p| &p.packet_id).collect();
+        assert_eq!(ids.len(), packets.len(), "packet ids are distinct");
+    }
+
+    #[test]
+    fn an_item_over_the_cap_is_sent_cut_and_marked() {
+        // Two-byte chars, so a cut at an odd byte would split one.
+        let text = "é".repeat(15 * 1024);
+        let packets = packets("objective", vec![item(0, text.clone())]);
+        let [packet] = packets.as_slice() else { panic!("one packet, got {}", packets.len()) };
+        let sent = &packet.items[0];
+        let t = sent.truncation.as_ref().expect("marked as truncated");
+        assert_eq!(t.original_bytes, 30 * 1024);
+        assert_eq!(t.sent_bytes, sent.safe_text.len());
+        assert!(text.starts_with(&sent.safe_text));
+        // As much as fits: within one char of the cap, not cut to nothing.
+        let bytes = packet_bytes("objective", packet);
+        assert!(bytes <= CHILD_PACKET_MAX && bytes > CHILD_PACKET_MAX - 2, "{bytes} bytes");
+    }
+
     // --- Assess tests ---
 
     #[test]
@@ -374,7 +483,7 @@ mod tests {
         let s_hid = execute_search(&store, &search, &mut registry).unwrap();
         assert_eq!(registry.get(&s_hid).unwrap().count, 8);
 
-        // Set up fake model with 2 handlers (8 items / batch_size 4 = 2 calls).
+        // The host batches 4 small items per call: 2 calls.
         let model = FakeModel::new();
         model.add_child_response(FakeModel::default_supports_handler());
         model.add_child_response(FakeModel::default_supports_handler());
@@ -384,18 +493,19 @@ mod tests {
             input: InputRefV1::Output("s1".to_string()),
             objective: "find build tasks".to_string(),
             max_items: 8,
-            batch_size: 4,
         };
 
         let mut plan_outputs = HashMap::new();
         plan_outputs.insert("s1".to_string(), s_hid);
 
         let mut child_calls = 0u16;
+        let mut ledger = BudgetLedger::new(BudgetV1::prototype_default());
         let a_hid = execute_assess(
             &assess,
             &mut registry,
             &plan_outputs,
             &model,
+            &mut ledger,
             &mut child_calls,
         )
         .unwrap();
@@ -449,17 +559,18 @@ mod tests {
             input: InputRefV1::Output("s1".to_string()),
             objective: "test".to_string(),
             max_items: 1,
-            batch_size: 1,
         };
         let mut plan_outputs = HashMap::new();
         plan_outputs.insert("s1".to_string(), s_hid);
 
         let mut child_calls = 0u16;
+        let mut ledger = BudgetLedger::new(BudgetV1::prototype_default());
         let result = execute_assess(
             &assess,
             &mut registry,
             &plan_outputs,
             &model,
+            &mut ledger,
             &mut child_calls,
         );
 

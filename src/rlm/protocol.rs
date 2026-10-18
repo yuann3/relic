@@ -61,7 +61,14 @@ pub struct AssessV1 {
     pub input: InputRefV1,
     pub objective: String,
     pub max_items: u32,
-    pub batch_size: u32,
+}
+
+/// Marks an item the host cut to fit its packet. Truncated evidence cannot
+/// support a claim about what was cut (research, evidence sufficiency 5).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TruncationV1 {
+    pub original_bytes: usize,
+    pub sent_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -273,9 +280,9 @@ mod tests {
 
     #[test]
     fn assess_op_round_trips() {
-        let json = r#"{"op":"assess","op_id":"a1","input":{"output":"e1"},"objective":"find renewal steps","max_items":32,"batch_size":4}"#;
+        let json = r#"{"op":"assess","op_id":"a1","input":{"output":"e1"},"objective":"find renewal steps","max_items":32}"#;
         let op: PlanOpV1 = serde_json::from_str(json).unwrap();
-        assert!(matches!(&op, PlanOpV1::Assess(a) if a.max_items == 32 && a.batch_size == 4));
+        assert!(matches!(&op, PlanOpV1::Assess(a) if a.max_items == 32));
         let rt: PlanOpV1 = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
         assert_eq!(op, rt);
     }
@@ -388,7 +395,7 @@ mod tests {
                     {"op":"search","op_id":"s1","terms":["certificate","renew"],"match":"any","limit":120},
                     {"op":"expand","op_id":"e1","input":{"output":"s1"},"scope":"same_session","before":8,"after":16,"limit":200},
                     {"op":"relate","op_id":"g1","input":{"output":"e1"},"relation":"git_state","per_seed":2,"limit":80},
-                    {"op":"assess","op_id":"a1","input":{"output":"g1"},"objective":"find observed renewal steps and contrary outcomes","max_items":32,"batch_size":4},
+                    {"op":"assess","op_id":"a1","input":{"output":"g1"},"objective":"find observed renewal steps and contrary outcomes","max_items":32},
                     {"op":"select","op_id":"k1","input":{"output":"a1"},"verdicts":["supports","contradicts"],"limit":20},
                     {"op":"inspect","op_id":"i1","input":{"output":"k1"},"limit":12,"max_item_bytes":2048}
                 ]
