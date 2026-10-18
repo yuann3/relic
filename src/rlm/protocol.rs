@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+// Every struct a model writes denies unknown fields: a field the host does
+// not read is a model fault or an injection attempt, and fails closed (ADR 0009).
+
 // --- Plan operators ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -15,6 +18,7 @@ pub enum PlanOpV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SearchV1 {
     pub op_id: String,
     pub terms: Vec<String>,
@@ -31,6 +35,7 @@ pub enum MatchMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExpandV1 {
     pub op_id: String,
     pub input: InputRefV1,
@@ -48,6 +53,7 @@ pub enum ExpandScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RelateV1 {
     pub op_id: String,
     pub input: InputRefV1,
@@ -66,6 +72,7 @@ pub enum Relation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CombineV1 {
     pub op_id: String,
     pub inputs: Vec<InputRefV1>,
@@ -82,6 +89,7 @@ pub enum CombineMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AssessV1 {
     pub op_id: String,
     pub input: InputRefV1,
@@ -91,6 +99,7 @@ pub struct AssessV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SelectV1 {
     pub op_id: String,
     pub input: InputRefV1,
@@ -99,6 +108,7 @@ pub struct SelectV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct InspectV1 {
     pub op_id: String,
     pub input: InputRefV1,
@@ -116,11 +126,13 @@ pub enum InputRefV1 {
 // --- Plan and root action ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PlanV1 {
     pub ops: Vec<PlanOpV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RootActionV1 {
     pub version: u8,
     pub expected_state_version: u32,
@@ -141,6 +153,7 @@ pub enum RootActionKind {
 // --- Finish and claims ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FinishV1 {
     pub status: AnswerStatus,
     pub answer: String,
@@ -162,6 +175,7 @@ pub enum AnswerStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FinalClaimV1 {
     pub text: String,
     pub supports: Vec<String>,
@@ -170,6 +184,7 @@ pub struct FinalClaimV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ProcedureStepV1 {
     pub text: String,
     pub supports: Vec<String>,
@@ -178,6 +193,7 @@ pub struct ProcedureStepV1 {
 // --- Child result ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ChildResultV1 {
     pub version: u8,
     pub packet_id: String,
@@ -185,6 +201,7 @@ pub struct ChildResultV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ItemAssessmentV1 {
     pub item_id: String,
     pub verdict: Verdict,
@@ -212,6 +229,7 @@ pub enum Confidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimV1 {
     pub text: String,
     #[serde(default)]
@@ -336,6 +354,27 @@ mod tests {
     fn unknown_op_rejected() {
         let json = r#"{"op":"hack","op_id":"x1"}"#;
         assert!(serde_json::from_str::<PlanOpV1>(json).is_err());
+    }
+
+    #[test]
+    fn unknown_field_rejected_at_every_depth() {
+        let op = r#"{"op":"search","op_id":"s1","terms":["git"],"match":"any","limit":5}"#;
+        let action = |op: &str| format!(r#"{{"version":1,"expected_state_version":0,"kind":"plan","plan":{{"ops":[{op}]}}}}"#);
+        let child = |claim: &str| format!(
+            r#"{{"version":1,"packet_id":"p","assessments":[{{"item_id":"i","verdict":"supports","confidence":"low","claims":[{claim}]}}]}}"#
+        );
+        // The same documents parse without the extra field, so only it can fail them.
+        assert!(serde_json::from_str::<RootActionV1>(&action(op)).is_ok());
+        assert!(serde_json::from_str::<ChildResultV1>(&child(r#"{"text":"t"}"#)).is_ok());
+
+        let op_extra = op.replace(r#""limit":5"#, r#""limit":5,"sql":"x""#);
+        let action_extra = action(op).replacen('{', r#"{"note":"x","#, 1);
+        let finish_extra = r#"{"version":1,"expected_state_version":0,"kind":"finish","finish":{"status":"partial","answer":"","claims":[{"text":"t","supports":[],"why":"x"}]}}"#;
+        assert!(serde_json::from_str::<RootActionV1>(&finish_extra.replace(r#","why":"x""#, "")).is_ok());
+        assert!(serde_json::from_str::<RootActionV1>(&action(&op_extra)).is_err(), "inside the tagged op");
+        assert!(serde_json::from_str::<RootActionV1>(&action_extra).is_err(), "on the action");
+        assert!(serde_json::from_str::<RootActionV1>(finish_extra).is_err(), "on a final claim");
+        assert!(serde_json::from_str::<ChildResultV1>(&child(r#"{"text":"t","evidence":"x"}"#)).is_err(), "on a child claim");
     }
 
     // --- RootActionV1 round-trips ---
