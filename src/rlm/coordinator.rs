@@ -43,6 +43,19 @@ impl std::fmt::Display for CoordinatorError {
 
 impl std::error::Error for CoordinatorError {}
 
+/// What one investigation's steps share.
+struct Run<'a> {
+    store: &'a Store,
+    model: &'a dyn ModelBoundary,
+    registry: HandleRegistry,
+    ledger: BudgetLedger,
+    turns: u32,
+    child_calls: u16,
+    last_inspection: Option<EvidencePacket>,
+    /// What the host tells the root about the last plan, besides its handles.
+    notes: Vec<String>,
+}
+
 /// Run a bounded RLM investigation.
 pub fn run_investigation(
     question: &str,
@@ -53,113 +66,67 @@ pub fn run_investigation(
     let investigation_id = 1u64; // Single investigation for prototype.
     let installation_key = b"prototype-key".to_vec();
 
-    let mut registry = HandleRegistry::new(
-        investigation_id,
-        installation_key,
-        budget.evidence_handles as usize,
-    );
-    let mut ledger = BudgetLedger::new(budget);
-    let mut state_version: u32 = 0;
-    let mut turns: u32 = 0;
-    let mut total_child_calls: u16 = 0;
-    let mut last_inspection: Option<EvidencePacket> = None;
-    // What the host tells the root about the last plan, besides its handles.
-    let mut notes: Vec<String> = Vec::new();
+    let mut run = Run {
+        store,
+        model,
+        registry: HandleRegistry::new(investigation_id, installation_key, budget.evidence_handles as usize),
+        ledger: BudgetLedger::new(budget),
+        turns: 0,
+        child_calls: 0,
+        last_inspection: None,
+        notes: Vec::new(),
+    };
+    let (status, finish) = investigate(&mut run, question);
+    InvestigationResult { status, finish, turns: run.turns, child_calls: run.child_calls }
+}
 
+fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<FinishV1>) {
+    let mut state_version: u32 = 0;
     loop {
         // Reserve budget for a root call.
-        if ledger.reserve(&Reservation {
-            root_calls: 1,
-            ..Default::default()
-        }).is_err() {
-            return InvestigationResult {
-                status: InvestigationStatus::BudgetExhausted,
-                finish: None,
-                turns,
-                child_calls: total_child_calls,
-            };
+        if run.ledger.reserve(&Reservation { root_calls: 1, ..Default::default() }).is_err() {
+            return (InvestigationStatus::BudgetExhausted, None);
         }
 
         // Build root state and call model.
         let state_json = build_root_state_json(
             question,
             state_version,
-            &registry,
-            &last_inspection,
-            &std::mem::take(&mut notes),
-            &ledger,
-            store,
+            &run.registry,
+            &run.last_inspection,
+            &std::mem::take(&mut run.notes),
+            &run.ledger,
+            run.store,
         );
 
-        let action = match model.root_call(&state_json) {
+        let action = match run.model.root_call(&state_json) {
             Ok(a) => a,
-            Err(e) => {
-                return InvestigationResult {
-                    status: InvestigationStatus::Failed(format!("model error: {e}")),
-                    finish: None,
-                    turns,
-                    child_calls: total_child_calls,
-                };
-            }
+            Err(e) => return (InvestigationStatus::Failed(format!("model error: {e}")), None),
         };
-        turns += 1;
+        run.turns += 1;
 
         match action.kind {
             RootActionKind::Plan => {
-                // Validate the plan.
                 let validated = match validate::validate_plan(&action, state_version) {
                     Ok(v) => v,
-                    Err(e) => {
-                        return InvestigationResult {
-                            status: InvestigationStatus::Failed(format!("validation: {e}")),
-                            finish: None,
-                            turns,
-                            child_calls: total_child_calls,
-                        };
-                    }
+                    Err(e) => return (InvestigationStatus::Failed(format!("validation: {e}")), None),
                 };
 
-                // Reserve budget for plan ops.
-                let op_count = validated.ops.len() as u16;
-                if ledger.reserve(&Reservation {
-                    plan_ops: op_count,
-                    ..Default::default()
-                }).is_err() {
-                    return InvestigationResult {
-                        status: InvestigationStatus::BudgetExhausted,
-                        finish: None,
-                        turns,
-                        child_calls: total_child_calls,
-                    };
+                // Admission caps a plan at 8 ops.
+                let plan_ops = u16::try_from(validated.ops.len()).unwrap_or(u16::MAX);
+                if run.ledger.reserve(&Reservation { plan_ops, ..Default::default() }).is_err() {
+                    return (InvestigationStatus::BudgetExhausted, None);
                 }
 
                 // Execute ops sequentially.
                 let mut plan_outputs: HashMap<String, HandleId> = HashMap::new();
-
                 for op in &validated.ops {
-                    match execute_op(
-                        op,
-                        store,
-                        &mut registry,
-                        &plan_outputs,
-                        model,
-                        &mut ledger,
-                        &mut total_child_calls,
-                        &mut last_inspection,
-                        &mut notes,
-                    ) {
+                    match execute_op(run, op, &plan_outputs) {
                         Ok(Some((op_id, handle_id))) => {
                             plan_outputs.insert(op_id, handle_id);
                         }
                         Ok(None) => {}
-                        Err(e) => {
-                            return InvestigationResult {
-                                status: InvestigationStatus::Failed(format!("exec: {e}")),
-                                finish: None,
-                                turns,
-                                child_calls: total_child_calls,
-                            };
-                        }
+                        Err(e) => return (InvestigationStatus::Failed(format!("exec: {e}")), None),
                     }
                 }
 
@@ -168,49 +135,26 @@ pub fn run_investigation(
             }
 
             RootActionKind::Finish => {
-                let finish = match action.finish {
-                    Some(f) => f,
-                    None => {
-                        return InvestigationResult {
-                            status: InvestigationStatus::Failed(
-                                "finish action missing finish body".into(),
-                            ),
-                            finish: None,
-                            turns,
-                            child_calls: total_child_calls,
-                        };
-                    }
+                let Some(finish) = action.finish else {
+                    return (InvestigationStatus::Failed("finish action missing finish body".into()), None);
                 };
-
                 let status = match finish.status {
                     AnswerStatus::Answered => InvestigationStatus::Completed,
                     AnswerStatus::Partial => InvestigationStatus::Partial,
                     AnswerStatus::Abstained => InvestigationStatus::Abstained,
                 };
-
-                return InvestigationResult {
-                    status,
-                    finish: Some(finish),
-                    turns,
-                    child_calls: total_child_calls,
-                };
+                return (status, Some(finish));
             }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_op(
+    run: &mut Run,
     op: &Op,
-    store: &Store,
-    registry: &mut HandleRegistry,
     plan_outputs: &HashMap<String, HandleId>,
-    model: &dyn ModelBoundary,
-    ledger: &mut BudgetLedger,
-    child_calls: &mut u16,
-    last_inspection: &mut Option<EvidencePacket>,
-    notes: &mut Vec<String>,
 ) -> Result<Option<(String, HandleId)>, CoordinatorError> {
+    let Run { store, model, registry, ledger, child_calls, last_inspection, notes, .. } = run;
     match op {
         Op::Search(s) => {
             // Reserve rows.
@@ -264,7 +208,15 @@ fn execute_op(
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let hid = executor::execute_assess(a, registry, plan_outputs, model, ledger, child_calls, notes)
+            // One child call admitted at a time, so a later stop leaves the
+            // rest unsent.
+            let mut call_child = |packet: &EvidencePacket, objective: &str| {
+                ledger.reserve(&Reservation { child_calls: 1, ..Default::default() }).map_err(ExecError::Budget)?;
+                let raw = model.child_call(packet, objective).map_err(ExecError::Model)?;
+                *child_calls += 1;
+                Ok(raw)
+            };
+            let hid = executor::execute_assess(a, registry, plan_outputs, &mut call_child, notes)
                 .map_err(CoordinatorError::Execution)?;
 
             Ok(Some((a.op_id.clone(), hid)))

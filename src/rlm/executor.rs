@@ -1,8 +1,8 @@
 use crate::domain::StoredObservation;
-use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
+use crate::rlm::budget::BudgetExhausted;
 use crate::rlm::evidence::{HandleId, HandleRegistry};
 use crate::rlm::validate::HandleKind;
-use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary};
+use crate::rlm::model::{EvidenceItem, EvidencePacket};
 use crate::app::{self, Budget, Order, SearchRequest};
 use crate::rlm::protocol::*;
 use crate::store::Store;
@@ -237,9 +237,7 @@ pub fn execute_assess(
     assess: &AssessV1,
     registry: &mut HandleRegistry,
     plan_outputs: &std::collections::HashMap<String, HandleId>,
-    model: &dyn ModelBoundary,
-    ledger: &mut BudgetLedger,
-    child_calls_made: &mut u16,
+    call_child: &mut dyn FnMut(&EvidencePacket, &str) -> Result<String, ExecError>,
     notes: &mut Vec<String>,
 ) -> Result<HandleId, ExecError> {
     let source_handle_id = resolve_input(&assess.input, plan_outputs)?;
@@ -262,18 +260,9 @@ pub fn execute_assess(
             truncation: None,
         })
         .collect();
-    let packets = packets(&assess.objective, items);
-    let child_calls = u16::try_from(packets.len()).map_err(|_| ExecError::Budget(BudgetExhausted::ChildCalls))?;
-    ledger
-        .reserve(&Reservation { child_calls, ..Default::default() })
-        .map_err(ExecError::Budget)?;
-
     let mut assessments = Vec::with_capacity(selected_count);
-    for packet in &packets {
-        let raw = model
-            .child_call(packet, &assess.objective)
-            .map_err(ExecError::Model)?;
-        *child_calls_made += 1;
+    for packet in &packets(&assess.objective, items) {
+        let raw = call_child(packet, &assess.objective)?;
         match check_child_result(packet, &raw) {
             Ok(slots) => assessments.extend(slots),
             // The other packets' verdicts stand; this one's items stay
@@ -338,7 +327,7 @@ mod tests {
     use crate::domain::{Observation, ObservationKind, Provenance};
     use crate::import::SourceKind;
     use crate::rlm::evidence::HandleRegistry;
-    use crate::rlm::budget::BudgetLedger;
+    use crate::rlm::model::ModelBoundary;
     use crate::store::{Cursor, Store};
     use std::collections::HashMap;
 
@@ -615,14 +604,14 @@ mod tests {
         plan_outputs.insert("s1".to_string(), s_hid);
 
         let mut child_calls = 0u16;
-        let mut ledger = BudgetLedger::new(BudgetV1::prototype_default());
         let a_hid = execute_assess(
             &assess,
             &mut registry,
             &plan_outputs,
-            &model,
-            &mut ledger,
-            &mut child_calls,
+            &mut |p, o| {
+                child_calls += 1;
+                model.child_call(p, o).map_err(ExecError::Model)
+            },
             &mut Vec::new(),
         )
         .unwrap();
@@ -713,9 +702,7 @@ mod tests {
             &assess,
             &mut registry,
             &HashMap::new(),
-            &model,
-            &mut BudgetLedger::new(BudgetV1::prototype_default()),
-            &mut 0,
+            &mut |p, o| model.child_call(p, o).map_err(ExecError::Model),
             &mut notes,
         )
         .unwrap();
