@@ -333,12 +333,10 @@ where
                 // takes the terminal (ADR 0011).
                 self.input.pause();
                 guard.restore()?;
-                // SAFETY: SIG_DFL stops the whole process here; the shell's
-                // `fg` continues it after the raise.
-                unsafe {
-                    libc::signal(libc::SIGTSTP, libc::SIG_DFL);
-                    libc::raise(libc::SIGTSTP);
-                }
+                // SAFETY: raise(2) has no preconditions. Nothing in Relic
+                // changes SIGTSTP, so a disposition not inherited as ignored
+                // is the default: this stops the process until `fg`.
+                unsafe { libc::raise(libc::SIGTSTP) };
                 guard.resume()?;
                 redraw_all(&mut self.terminal)?;
                 self.input.resume();
