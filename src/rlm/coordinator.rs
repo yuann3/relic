@@ -222,7 +222,7 @@ fn execute_op(
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let hid = executor::execute_search(store, s, registry)
+            let hid = executor::execute_search(store, s, registry, &crate::app::Budget::start(), notes)
                 .map_err(CoordinatorError::Execution)?;
 
             // Release unused row reservation.

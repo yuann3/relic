@@ -14,7 +14,6 @@ pub enum ExecError {
     HandleNotFound(String),
     /// A handle reference named a set of the wrong kind for its operator.
     WrongKind { handle: String, expected: HandleKind },
-    NoObservationsForExpand,
     Model(crate::rlm::model::ModelError),
     Budget(BudgetExhausted),
 }
@@ -60,6 +59,8 @@ pub fn execute_search(
     store: &Store,
     search: &SearchV1,
     registry: &mut HandleRegistry,
+    budget: &Budget,
+    notes: &mut Vec<String>,
 ) -> Result<HandleId, ExecError> {
     let query = match search.match_mode {
         MatchMode::Any => search.terms.join(" OR "),
@@ -74,7 +75,16 @@ pub fn execute_search(
         mode: app::MatchMode::Words,
         order: Order::RecentlyImported,
     };
-    let page = app::search(store, &req, &Budget::start()).map_err(ExecError::Search)?;
+    let page = match app::search(store, &req, budget) {
+        Ok(page) => page,
+        // A step result, not a failed investigation: the root sees an empty
+        // set and why, and can plan rarer terms (#26 handoff).
+        Err(e @ app::SearchError::TooBroad) => {
+            notes.push(format!("{}: {e}", search.op_id));
+            return Ok(registry.insert_evidence_set(Vec::new()));
+        }
+        Err(e) => return Err(ExecError::Search(e)),
+    };
 
     // Fetch full StoredObservation for each hit.
     let mut observations = Vec::with_capacity(page.hits.len());
@@ -98,10 +108,6 @@ pub fn execute_expand(
     let seed_obs = registry
         .get_observations(&source_handle_id)
         .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.clone()))?;
-
-    if seed_obs.is_empty() {
-        return Err(ExecError::NoObservationsForExpand);
-    }
 
     let mut seen_ids = std::collections::HashSet::new();
     let mut all_neighbors: Vec<StoredObservation> = Vec::new();
@@ -380,7 +386,7 @@ mod tests {
             limit: 50,
         };
 
-        let hid = execute_search(&store, &search, &mut registry).unwrap();
+        let hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         let handle = registry.get(&hid).unwrap();
         assert_eq!(handle.kind, HandleKind::EvidenceSet);
         assert_eq!(handle.count, 2);
@@ -405,7 +411,7 @@ mod tests {
             limit: 5,
         };
 
-        let hid = execute_search(&store, &search, &mut registry).unwrap();
+        let hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         assert_eq!(registry.get(&hid).unwrap().count, 5);
     }
 
@@ -429,7 +435,7 @@ mod tests {
             match_mode: MatchMode::Any,
             limit: 10,
         };
-        let s_hid = execute_search(&store, &search, &mut registry).unwrap();
+        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         assert_eq!(registry.get(&s_hid).unwrap().count, 1);
 
         // Expand around it.
@@ -472,7 +478,7 @@ mod tests {
             match_mode: MatchMode::Any,
             limit: 10,
         };
-        let s_hid = execute_search(&store, &search, &mut registry).unwrap();
+        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         assert_eq!(registry.get(&s_hid).unwrap().count, 2);
 
         let expand = ExpandV1 {
@@ -493,6 +499,34 @@ mod tests {
         let ordinals: Vec<i64> = obs.iter().map(|o| o.ordinal).collect();
         let unique: std::collections::HashSet<i64> = ordinals.iter().copied().collect();
         assert_eq!(ordinals.len(), unique.len(), "no duplicates");
+    }
+
+    #[test]
+    fn a_too_broad_search_is_an_empty_set_and_a_note() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = seed_store(&mut store);
+        let cmds: Vec<String> = (0..2_000).map(|i| format!("cargo cmd_{i}")).collect();
+        insert_commands(&mut store, rev_id, &cmds.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into()], match_mode: MatchMode::Any, limit: 50 };
+
+        let spent = Budget { deadline: std::time::Instant::now(), cancel: None };
+        let mut notes = Vec::new();
+        let hid = execute_search(&store, &search, &mut registry, &spent, &mut notes).unwrap();
+        assert_eq!(registry.get(&hid).unwrap().count, 0);
+        assert!(notes.len() == 1 && notes[0].starts_with("s1: query too broad"), "{notes:?}");
+
+        // A plan built on it runs on: expanding nothing finds nothing.
+        let expand = ExpandV1 {
+            op_id: "e1".into(),
+            input: InputRefV1::Handle(hid),
+            scope: ExpandScope::SameSource,
+            before: 2,
+            after: 2,
+            limit: 10,
+        };
+        let e_hid = execute_expand(&store, &expand, &mut registry, &HashMap::new()).unwrap();
+        assert_eq!(registry.get(&e_hid).unwrap().count, 0);
     }
 
     // --- Batching ---
@@ -562,7 +596,7 @@ mod tests {
             match_mode: MatchMode::Any,
             limit: 50,
         };
-        let s_hid = execute_search(&store, &search, &mut registry).unwrap();
+        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         assert_eq!(registry.get(&s_hid).unwrap().count, 8);
 
         // The host batches 4 small items per call: 2 calls.
@@ -660,7 +694,7 @@ mod tests {
         insert_commands(&mut store, rev_id, &cmds.iter().map(String::as_str).collect::<Vec<_>>());
         let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
         let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into()], match_mode: MatchMode::Any, limit: 50 };
-        let s_hid = execute_search(&store, &search, &mut registry).unwrap();
+        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         // Packet 1's evidence, which packet 0's child was never sent.
         let other_packet = registry.get_evidence_handles(&s_hid).unwrap()[4].id.clone();
 
