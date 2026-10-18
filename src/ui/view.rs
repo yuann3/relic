@@ -20,6 +20,12 @@ pub const MIN_HEIGHT: u16 = 10;
 /// Under this width the three columns become named panes switched with Tab.
 pub const NARROW_WIDTH: u16 = 100;
 const MAX_STEPS_SHOWN: usize = 8;
+/// Characters of a command one list row looks at; a row shows at most a
+/// pane's width. The whole of a 1 MiB command took ~40 ms every frame.
+const ROW_CHARS: usize = 1024;
+/// Bytes of a command the evidence pane wraps, for the same reason. The
+/// rest is counted on screen, not silently dropped.
+const EVIDENCE_BYTES: usize = 16 * 1024;
 
 
 struct Theme {
@@ -164,6 +170,11 @@ fn query_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     }
 }
 
+/// The start of `text` a list row can show, neutralized.
+fn row_text(text: &str) -> String {
+    text.chars().take(ROW_CHARS).map(crate::app::display_char).collect()
+}
+
 /// The end of `text` that fits in `room` columns, behind '…' when cut:
 /// typing and Backspace act at the end, so the end must stay in view.
 fn tail(text: &str, room: usize) -> String {
@@ -241,7 +252,7 @@ fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
                 Span::styled(h.when().label(), t.dim),
                 Span::raw(format!(" {:<5} ", h.source)),
             ];
-            spans.extend(safe_spans(&display_line(&h.text), t));
+            spans.extend(safe_spans(&row_text(&h.text), t));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -284,7 +295,7 @@ fn timeline(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             };
             // Month-day is enough beside neighbors; the detail pane has the year.
             let mut spans = vec![mark, Span::styled(v.when(o).short(), t.dim), Span::raw(" ")];
-            spans.extend(safe_spans(&display_line(&o.safe_text), t));
+            spans.extend(safe_spans(&row_text(&o.safe_text), t));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -337,8 +348,18 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         Line::raw(""),
         Line::styled("exact text, redacted at import:", t.title),
     ];
-    for l in o.safe_text.split('\n') {
+    let shown = o.safe_text.floor_char_boundary(EVIDENCE_BYTES);
+    for l in o.safe_text[..shown].split('\n') {
         lines.push(Line::from(safe_spans(&display_line(l), t)));
+    }
+    if shown < o.safe_text.len() {
+        lines.push(Line::styled(
+            format!(
+                "… {} more bytes not shown; `relic search --json` prints all of it",
+                o.safe_text.len() - shown
+            ),
+            t.dim,
+        ));
     }
     let inner = block.inner(area);
     let p = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
@@ -844,6 +865,23 @@ mod tests {
         // short one: one line of text wraps to many rows here.
         let s = text(&render(&m, 100, 14));
         assert!(s.contains("TAILWORD"), "{s}");
+    }
+
+    /// A command longer than the pane wraps is cut at a stated point, and
+    /// the pane says how much it left out.
+    #[test]
+    fn evidence_counts_the_bytes_of_a_huge_command_it_does_not_show() {
+        let long = format!("huge {}", "x".repeat(EVIDENCE_BYTES * 3));
+        let store = store_with(&["ls", &long]);
+        let mut m = typed(&store, "huge", false);
+        drive(&mut m, &store, UiAction::Key(Key::Enter));
+        render(&m, 120, 40);
+        for _ in 0..2000 {
+            drive(&mut m, &store, UiAction::Key(Key::PageDown));
+        }
+        let s = text(&render(&m, 120, 40));
+        let left_out = long.len() - EVIDENCE_BYTES;
+        assert!(s.contains(&format!("… {left_out} more bytes not shown")), "{s}");
     }
 
     #[test]
