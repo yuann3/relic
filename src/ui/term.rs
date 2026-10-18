@@ -246,13 +246,8 @@ impl InputReader {
     ) -> Self {
         let gate = Arc::new((Mutex::new(Gate::default()), Condvar::new()));
         let g = Arc::clone(&gate);
-        let handle = std::thread::Builder::new()
-            .name("relic-input".into())
-            .spawn(move || {
-                crate::signal::block_in_this_thread();
-                read_loop(&g, &tx, &mut next)
-            })
-            .expect("spawn input thread");
+        let builder = std::thread::Builder::new().name("relic-input".into());
+        let handle = crate::signal::spawn(builder, move || read_loop(&g, &tx, &mut next)).expect("spawn input thread");
         Self {
             gate,
             handle: Some(handle),

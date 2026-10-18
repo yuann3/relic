@@ -72,12 +72,8 @@ pub fn run(db: &Path) -> Result<()> {
     let mailbox = Arc::new(Mailbox::default());
     let worker = {
         let (mb, tx) = (Arc::clone(&mailbox), tx.clone());
-        std::thread::Builder::new()
-            .name("relic-search".into())
-            .spawn(move || {
-                crate::signal::block_in_this_thread();
-                search_worker(&worker_store, &mb, &tx, debounce())
-            })?
+        let builder = std::thread::Builder::new().name("relic-search".into());
+        crate::signal::spawn(builder, move || search_worker(&worker_store, &mb, &tx, debounce()))?
     };
     let outcome = (|| {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;

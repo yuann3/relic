@@ -18,12 +18,8 @@ pub fn spawn(
     cancel: Arc<AtomicBool>,
     tx: SyncSender<UiAction>,
 ) -> std::io::Result<JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name(format!("relic-recall-{op}"))
-        .spawn(move || {
-            crate::signal::block_in_this_thread();
-            script(op, &query, cite, &cancel, &tx)
-        })
+    let builder = std::thread::Builder::new().name(format!("relic-recall-{op}"));
+    crate::signal::spawn(builder, move || script(op, &query, cite, &cancel, &tx))
 }
 
 fn script(op: u64, query: &str, cite: i64, cancel: &AtomicBool, tx: &SyncSender<UiAction>) {

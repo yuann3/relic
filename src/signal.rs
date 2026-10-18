@@ -22,7 +22,7 @@ static TTY: OnceLock<(libc::c_int, libc::termios)> = OnceLock::new();
 
 /// Installs the handler for every fatal signal not inherited as ignored: a
 /// `nohup` or `trap '' TERM` is the user's choice. Call before the terminal
-/// changes, on the main thread, before [`block_in_this_thread`] threads exist.
+/// changes, on the main thread, before any thread from [`spawn`] exists.
 pub fn install() {
     save_tty();
     for sig in FATAL {
@@ -51,18 +51,30 @@ pub fn install() {
     }
 }
 
-/// Keeps fatal signals off this thread, so the handler runs on the main
-/// thread: there it cannot race the main thread taking the terminal back
-/// after fzf, and a `waitpid` on fzf is interrupted rather than raced.
-pub fn block_in_this_thread() {
-    // SAFETY: builds a signal set on the stack and blocks it for this thread.
+/// Spawns a thread with fatal signals blocked from its first instruction,
+/// so the handler runs on the main thread: there it cannot race the main
+/// thread taking the terminal back after fzf, and a `waitpid` on fzf is
+/// interrupted rather than raced. Blocking inside the new thread would leave
+/// a window where a signal could land on it; one that arrives while the
+/// caller has them blocked stays pending and reaches it on the restore.
+pub fn spawn<F, T>(builder: std::thread::Builder, f: F) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    // SAFETY: builds signal sets on the stack; the new thread inherits the
+    // blocked mask, then the caller gets its own mask back.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         for s in FATAL {
             libc::sigaddset(&mut set, s);
         }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        let handle = builder.spawn(f);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        handle
     }
 }
 
@@ -143,5 +155,30 @@ fn stop_child() {
             let reset = b"\x1b[?1000l\x1b[?1006l\x1b[?1049l\x1b[?25h";
             libc::write(*fd, reset.as_ptr().cast(), reset.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Which of the fatal signals this thread blocks.
+    fn blocked() -> Vec<bool> {
+        // SAFETY: a null new set only reads this thread's mask.
+        unsafe {
+            let mut cur: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut cur);
+            FATAL.iter().map(|&s| libc::sigismember(&cur, s) == 1).collect()
+        }
+    }
+
+    #[test]
+    fn spawned_threads_block_fatal_signals_and_the_caller_still_takes_them() {
+        let before = blocked();
+        assert_eq!(before, [false; 4], "the test thread starts unblocked");
+        let child = spawn(std::thread::Builder::new(), blocked).unwrap().join().unwrap();
+        assert_eq!(child, [true; 4]);
+        // Left blocked, Ctrl-C would stay pending on the main thread forever.
+        assert_eq!(blocked(), before);
     }
 }

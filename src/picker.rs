@@ -138,10 +138,7 @@ pub fn pick_with(page: &SearchPage, fzf: &Path, mode: PickMode) -> Result<Pick, 
 
     // Feeding stdin from this thread while fzf blocks on a full stdout pipe
     // (or never reads) would deadlock; a writer thread keeps both moving.
-    let writer = std::thread::spawn(move || {
-        crate::signal::block_in_this_thread();
-        stdin.write_all(&records)
-    });
+    let writer = crate::signal::spawn(std::thread::Builder::new(), move || stdin.write_all(&records))?;
 
     let mut out = Vec::new();
     let read = (&mut stdout).take(OUTPUT_MAX as u64 + 1).read_to_end(&mut out);
