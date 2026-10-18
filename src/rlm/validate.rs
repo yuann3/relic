@@ -163,7 +163,7 @@ pub fn validate_plan(
     Ok(ValidatedPlan { ops })
 }
 
-fn op_id(op: &Op) -> &str {
+pub fn op_id(op: &Op) -> &str {
     match op {
         Op::Search(s) => &s.op_id,
         Op::Expand(e) => &e.op_id,

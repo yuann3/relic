@@ -5,7 +5,9 @@ use crate::rlm::validate::HandleKind;
 use crate::rlm::model::{EvidenceItem, EvidencePacket};
 use crate::app::{self, Budget, Order, SearchRequest};
 use crate::rlm::protocol::*;
-use crate::store::Store;
+use crate::store::{Store, is_interrupt};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug)]
 pub enum ExecError {
@@ -16,6 +18,8 @@ pub enum ExecError {
     WrongKind { handle: String, expected: HandleKind },
     Model(crate::rlm::model::ModelError),
     Budget(BudgetExhausted),
+    /// The investigation's cancel flag was set.
+    Cancelled,
 }
 
 /// Why a child result was rejected whole (ADR 0009).
@@ -83,6 +87,7 @@ pub fn execute_search(
             notes.push(format!("{}: {e}", search.op_id));
             return Ok(registry.insert_evidence_set(Vec::new()));
         }
+        Err(app::SearchError::Cancelled) => return Err(ExecError::Cancelled),
         Err(e) => return Err(ExecError::Search(e)),
     };
 
@@ -103,29 +108,35 @@ pub fn execute_expand(
     expand: &ExpandV1,
     registry: &mut HandleRegistry,
     plan_outputs: &std::collections::HashMap<String, HandleId>,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<HandleId, ExecError> {
     let source_handle_id = resolve_input(&expand.input, plan_outputs)?;
     let seed_obs = registry
         .get_observations(&source_handle_id)
         .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.clone()))?;
 
-    let mut seen_ids = std::collections::HashSet::new();
-    let mut all_neighbors: Vec<StoredObservation> = Vec::new();
-
-    for obs in seed_obs {
-        let neighbors = store
-            .get_neighbors(obs.revision_id, obs.ordinal, expand.before, expand.after)
-            .map_err(ExecError::Store)?;
-        for n in neighbors {
-            if seen_ids.insert(n.id) {
-                all_neighbors.push(n);
+    let stop = {
+        let cancel = Arc::clone(cancel);
+        move || cancel.load(Ordering::Relaxed)
+    };
+    let all_neighbors = store
+        .interruptible(stop, |store| {
+            let mut seen_ids = std::collections::HashSet::new();
+            let mut all_neighbors: Vec<StoredObservation> = Vec::new();
+            for obs in seed_obs {
+                for n in store.get_neighbors(obs.revision_id, obs.ordinal, expand.before, expand.after)? {
+                    if seen_ids.insert(n.id) {
+                        all_neighbors.push(n);
+                    }
+                }
+                if all_neighbors.len() >= expand.limit as usize {
+                    all_neighbors.truncate(expand.limit as usize);
+                    break;
+                }
             }
-        }
-        if all_neighbors.len() >= expand.limit as usize {
-            all_neighbors.truncate(expand.limit as usize);
-            break;
-        }
-    }
+            Ok(all_neighbors)
+        })
+        .map_err(|e| if is_interrupt(&e) { ExecError::Cancelled } else { ExecError::Store(e) })?;
 
     Ok(registry.insert_evidence_set(all_neighbors))
 }
@@ -439,7 +450,7 @@ mod tests {
         let mut plan_outputs = HashMap::new();
         plan_outputs.insert("s1".to_string(), s_hid);
 
-        let e_hid = execute_expand(&store, &expand, &mut registry, &plan_outputs).unwrap();
+        let e_hid = execute_expand(&store, &expand, &mut registry, &plan_outputs, &Arc::default()).unwrap();
         let obs = registry.get_observations(&e_hid).unwrap();
 
         // Should have ordinals 22..=28 (7 items: 3 before + center + 3 after)
@@ -481,7 +492,7 @@ mod tests {
         let mut plan_outputs = HashMap::new();
         plan_outputs.insert("s1".to_string(), s_hid);
 
-        let e_hid = execute_expand(&store, &expand, &mut registry, &plan_outputs).unwrap();
+        let e_hid = execute_expand(&store, &expand, &mut registry, &plan_outputs, &Arc::default()).unwrap();
         let obs = registry.get_observations(&e_hid).unwrap();
 
         // Ordinals 8..=13 — no duplicates despite overlapping windows.
@@ -514,7 +525,7 @@ mod tests {
             after: 2,
             limit: 10,
         };
-        let e_hid = execute_expand(&store, &expand, &mut registry, &HashMap::new()).unwrap();
+        let e_hid = execute_expand(&store, &expand, &mut registry, &HashMap::new(), &Arc::default()).unwrap();
         assert_eq!(registry.get(&e_hid).unwrap().count, 0);
     }
 

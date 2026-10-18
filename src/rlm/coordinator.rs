@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
 use crate::rlm::evidence::{HandleId, HandleRegistry};
@@ -23,7 +25,19 @@ pub enum InvestigationStatus {
     Partial,
     Abstained,
     BudgetExhausted,
+    Cancelled,
     Failed(String),
+}
+
+/// What an investigation is doing, for a progress display; the UI maps it
+/// to its own events (ADR 0009).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Progress {
+    RootCall { turn: u32 },
+    Op { op_id: String },
+    ChildCall { op_id: String, packet_id: String },
+    /// A note to the root: a rejected child result or a too-broad search.
+    Note(String),
 }
 
 #[derive(Debug)]
@@ -54,14 +68,26 @@ struct Run<'a> {
     last_inspection: Option<EvidencePacket>,
     /// What the host tells the root about the last plan, besides its handles.
     notes: Vec<String>,
+    cancel: &'a Arc<AtomicBool>,
+    progress: &'a mut dyn FnMut(Progress),
 }
 
-/// Run a bounded RLM investigation.
+impl Run<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// Run a bounded RLM investigation. Setting `cancel` from any thread stops
+/// it at the next admission point, or mid-statement in SQLite, with
+/// [`InvestigationStatus::Cancelled`].
 pub fn run_investigation(
     question: &str,
     store: &Store,
     model: &dyn ModelBoundary,
     budget: BudgetV1,
+    cancel: &Arc<AtomicBool>,
+    progress: &mut dyn FnMut(Progress),
 ) -> InvestigationResult {
     let investigation_id = 1u64; // Single investigation for prototype.
     let installation_key = b"prototype-key".to_vec();
@@ -75,6 +101,8 @@ pub fn run_investigation(
         child_calls: 0,
         last_inspection: None,
         notes: Vec::new(),
+        cancel,
+        progress,
     };
     let (status, finish) = investigate(&mut run, question);
     InvestigationResult { status, finish, turns: run.turns, child_calls: run.child_calls }
@@ -83,6 +111,9 @@ pub fn run_investigation(
 fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<FinishV1>) {
     let mut state_version: u32 = 0;
     loop {
+        if run.cancelled() {
+            return (InvestigationStatus::Cancelled, None);
+        }
         // Reserve budget for a root call.
         if run.ledger.reserve(&Reservation { root_calls: 1, ..Default::default() }).is_err() {
             return (InvestigationStatus::BudgetExhausted, None);
@@ -99,11 +130,17 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
             run.store,
         );
 
+        (run.progress)(Progress::RootCall { turn: run.turns + 1 });
         let action = match run.model.root_call(&state_json) {
             Ok(a) => a,
             Err(e) => return (InvestigationStatus::Failed(format!("model error: {e}")), None),
         };
         run.turns += 1;
+        // A reply that lands after cancel is dropped, not acted on: a late
+        // finish must not pass for a completed investigation.
+        if run.cancelled() {
+            return (InvestigationStatus::Cancelled, None);
+        }
 
         match action.kind {
             RootActionKind::Plan => {
@@ -121,15 +158,33 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
                 // Execute ops sequentially.
                 let mut plan_outputs: HashMap<String, HandleId> = HashMap::new();
                 for op in &validated.ops {
-                    match execute_op(run, op, &plan_outputs) {
+                    if run.cancelled() {
+                        return (InvestigationStatus::Cancelled, None);
+                    }
+                    (run.progress)(Progress::Op { op_id: validate::op_id(op).to_string() });
+                    let noted = run.notes.len();
+                    let out = execute_op(run, op, &plan_outputs);
+                    for note in &run.notes[noted..] {
+                        (run.progress)(Progress::Note(note.clone()));
+                    }
+                    match out {
                         Ok(Some((op_id, handle_id))) => {
                             plan_outputs.insert(op_id, handle_id);
                         }
                         Ok(None) => {}
+                        Err(CoordinatorError::Execution(ExecError::Cancelled)) => {
+                            return (InvestigationStatus::Cancelled, None);
+                        }
+                        Err(CoordinatorError::Budget(_) | CoordinatorError::Execution(ExecError::Budget(_))) => {
+                            return (InvestigationStatus::BudgetExhausted, None);
+                        }
                         Err(e) => return (InvestigationStatus::Failed(format!("exec: {e}")), None),
                     }
                 }
 
+                if run.cancelled() {
+                    return (InvestigationStatus::Cancelled, None);
+                }
                 // Observation committed — increment state version.
                 state_version += 1;
             }
@@ -154,7 +209,7 @@ fn execute_op(
     op: &Op,
     plan_outputs: &HashMap<String, HandleId>,
 ) -> Result<Option<(String, HandleId)>, CoordinatorError> {
-    let Run { store, model, registry, ledger, child_calls, last_inspection, notes, .. } = run;
+    let Run { store, model, registry, ledger, child_calls, last_inspection, notes, cancel, progress, .. } = run;
     match op {
         Op::Search(s) => {
             // Reserve rows.
@@ -166,7 +221,8 @@ fn execute_op(
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let hid = executor::execute_search(store, s, registry, &crate::app::Budget::start(), notes)
+            let budget = crate::app::Budget { cancel: Some(Arc::clone(cancel)), ..crate::app::Budget::start() };
+            let hid = executor::execute_search(store, s, registry, &budget, notes)
                 .map_err(CoordinatorError::Execution)?;
 
             // Release unused row reservation.
@@ -188,7 +244,7 @@ fn execute_op(
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let hid = executor::execute_expand(store, e, registry, plan_outputs)
+            let hid = executor::execute_expand(store, e, registry, plan_outputs, cancel)
                 .map_err(CoordinatorError::Execution)?;
 
             let actual = registry.get(&hid).map(|h| h.count as u64).unwrap_or(0);
@@ -211,7 +267,11 @@ fn execute_op(
             // One child call admitted at a time, so a later stop leaves the
             // rest unsent.
             let mut call_child = |packet: &EvidencePacket, objective: &str| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(ExecError::Cancelled);
+                }
                 ledger.reserve(&Reservation { child_calls: 1, ..Default::default() }).map_err(ExecError::Budget)?;
+                progress(Progress::ChildCall { op_id: a.op_id.clone(), packet_id: packet.packet_id.clone() });
                 let raw = model.child_call(packet, objective).map_err(ExecError::Model)?;
                 *child_calls += 1;
                 Ok(raw)
@@ -452,6 +512,8 @@ mod tests {
             &store,
             &model,
             budget,
+            &Arc::default(),
+            &mut |_| {},
         );
 
         // Core assertions for the wayfinder question:
@@ -505,7 +567,7 @@ mod tests {
                 missing: vec!["test".into()],
             }),
         });
-        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default());
+        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
         assert_eq!(result.status, InvestigationStatus::Abstained);
         serde_json::from_str(&model.root_states()[1]).unwrap()
     }
@@ -558,6 +620,81 @@ mod tests {
         assert_eq!(
             assessed["verdicts"],
             serde_json::json!({"supports": 0, "contradicts": 1, "unclear": 0, "irrelevant": 0, "unassessed": 1})
+        );
+    }
+
+    fn plan(ops: serde_json::Value) -> RootActionV1 {
+        serde_json::from_value(serde_json::json!({"version": 1, "expected_state_version": 0, "kind": "plan", "plan": {"ops": ops}})).unwrap()
+    }
+
+    #[test]
+    fn cancel_before_the_start_makes_no_root_call() {
+        let mut store = Store::open_memory().unwrap();
+        seed_corpus(&mut store);
+        let model = FakeModel::new();
+        model.add_root_response(plan(serde_json::json!([{"op": "search", "op_id": "s1", "terms": ["certbot"], "match": "any", "limit": 5}])));
+
+        let mut events = Vec::new();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &cancel, &mut |p| events.push(p));
+        assert_eq!((result.status, result.turns), (InvestigationStatus::Cancelled, 0));
+        assert!(model.root_states().is_empty() && events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_root_reply_after_cancel_is_dropped() {
+        let mut store = Store::open_memory().unwrap();
+        seed_corpus(&mut store);
+        let model = FakeModel::new();
+        let finish = FinishV1 {
+            status: AnswerStatus::Abstained,
+            answer: String::new(),
+            claims: vec![],
+            procedure: vec![],
+            contradictions: vec![],
+            missing: vec!["m".into()],
+        };
+        model.add_root_response(RootActionV1 { version: 1, expected_state_version: 0, kind: RootActionKind::Finish, plan: None, finish: Some(finish) });
+
+        // Ctrl-C while the root call is out.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &cancel, &mut |_| cancel.store(true, Ordering::Relaxed));
+        assert_eq!(model.root_states().len(), 1, "the call was made");
+        assert_eq!(result.status, InvestigationStatus::Cancelled);
+        assert!(result.finish.is_none());
+    }
+
+    #[test]
+    fn cancel_during_a_child_call_admits_no_other() {
+        let mut store = Store::open_memory().unwrap();
+        seed_corpus(&mut store);
+        let model = FakeModel::new();
+        // 8 items: two packets of 4.
+        model.add_root_response(plan(serde_json::json!([
+            {"op": "search", "op_id": "s1", "terms": ["generic"], "match": "any", "limit": 8},
+            {"op": "assess", "op_id": "a1", "input": {"output": "s1"}, "objective": "o", "max_items": 8},
+        ])));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let honest = FakeModel::default_supports_handler();
+        let flag = Arc::clone(&cancel);
+        // Ctrl-C while the first child is out.
+        model.add_child_response(move |p| {
+            flag.store(true, Ordering::Relaxed);
+            honest(p)
+        });
+        model.add_child_response(FakeModel::default_supports_handler());
+
+        let mut events = Vec::new();
+        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &cancel, &mut |p| events.push(p));
+        assert_eq!((result.status, result.child_calls), (InvestigationStatus::Cancelled, 1));
+        assert_eq!(
+            events,
+            [
+                Progress::RootCall { turn: 1 },
+                Progress::Op { op_id: "s1".into() },
+                Progress::Op { op_id: "a1".into() },
+                Progress::ChildCall { op_id: "a1".into(), packet_id: "pkt_00".into() },
+            ]
         );
     }
 
@@ -643,7 +780,7 @@ mod tests {
         let mut budget = BudgetV1::prototype_default();
         budget.root_calls = 0;
 
-        let result = run_investigation("test", &store, &model, budget);
+        let result = run_investigation("test", &store, &model, budget, &Arc::default(), &mut |_| {});
         assert_eq!(result.status, InvestigationStatus::BudgetExhausted);
         assert_eq!(result.turns, 0);
     }
@@ -674,6 +811,8 @@ mod tests {
             &store,
             &model,
             BudgetV1::prototype_default(),
+            &Arc::default(),
+            &mut |_| {},
         );
         assert_eq!(result.status, InvestigationStatus::Abstained);
         assert_eq!(result.turns, 1);
