@@ -267,7 +267,10 @@ unsafe fn supervise(
                 libc::kill(-pid, libc::SIGCONT);
             }
             match libc::waitpid(pid, &mut st, libc::WNOHANG | libc::WUNTRACED) {
-                0 | -1 => {}
+                0 => {}
+                // The job is gone without a status to report: no `say`, so
+                // the test sees the supervisor's EOF, not a stale exit 0.
+                -1 => libc::_exit(1),
                 _ if libc::WIFSTOPPED(st) => {
                     libc::tcsetpgrp(slave, libc::getpgrp());
                 }
