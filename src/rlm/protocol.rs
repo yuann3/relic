@@ -65,7 +65,7 @@ pub struct AssessV1 {
 
 /// Marks an item the host cut to fit its packet. Truncated evidence cannot
 /// support a claim about what was cut (research, evidence sufficiency 5).
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TruncationV1 {
     pub original_bytes: usize,
     pub sent_bytes: usize,

@@ -103,6 +103,11 @@ fn keyed_evidence_id(obs_id: i64, investigation_id: InvestigationId, key: &[u8])
     format!("ev1_{}", hex_encode(&hash))
 }
 
+/// A short hex digest of `data`, for audit records.
+pub(crate) fn hex_hash(data: &[u8]) -> String {
+    hex_encode(&content_hash(data))
+}
+
 fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
