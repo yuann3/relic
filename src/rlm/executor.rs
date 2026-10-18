@@ -1,6 +1,7 @@
 use crate::domain::StoredObservation;
 use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
 use crate::rlm::evidence::{HandleId, HandleRegistry};
+use crate::rlm::validate::HandleKind;
 use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary};
 use crate::app::{self, Budget, Order, SearchRequest};
 use crate::rlm::protocol::*;
@@ -11,6 +12,8 @@ pub enum ExecError {
     Store(rusqlite::Error),
     Search(app::SearchError),
     HandleNotFound(String),
+    /// A handle reference named a set of the wrong kind for its operator.
+    WrongKind { handle: String, expected: HandleKind },
     NoObservationsForExpand,
     Model(crate::rlm::model::ModelError),
     Budget(BudgetExhausted),
@@ -283,6 +286,32 @@ pub fn execute_assess(
     Ok(registry.insert_assessment_set(assessed_obs, assessments))
 }
 
+/// Execute a select operator: the items of an assessment set whose verdict
+/// is one of `select.verdicts`, in order. Unassessed items never pass.
+pub fn execute_select(
+    select: &SelectV1,
+    registry: &mut HandleRegistry,
+    plan_outputs: &std::collections::HashMap<String, HandleId>,
+) -> Result<HandleId, ExecError> {
+    let source = resolve_input(&select.input, plan_outputs)?;
+    let handle = registry.get(&source).ok_or_else(|| ExecError::HandleNotFound(source.clone()))?;
+    // Plan admission checks plan outputs; a handle from an earlier turn
+    // is checked here.
+    if handle.kind != HandleKind::AssessmentSet {
+        return Err(ExecError::WrongKind { handle: source, expected: HandleKind::AssessmentSet });
+    }
+    let observations = registry.get_observations(&source).unwrap_or_default();
+    let assessments = registry.get_assessments(&source).unwrap_or_default();
+    let picked = observations
+        .iter()
+        .zip(assessments)
+        .filter(|(_, a)| a.as_ref().is_some_and(|a| select.verdicts.contains(&a.verdict)))
+        .map(|(o, _)| o.clone())
+        .take(select.limit as usize)
+        .collect();
+    Ok(registry.insert_evidence_set(picked))
+}
+
 /// Resolve an InputRefV1 to a HandleId.
 pub fn resolve_input(
     input: &InputRefV1,
@@ -303,7 +332,6 @@ mod tests {
     use crate::domain::{Observation, ObservationKind, Provenance};
     use crate::import::SourceKind;
     use crate::rlm::evidence::HandleRegistry;
-    use crate::rlm::validate::HandleKind;
     use crate::rlm::budget::BudgetLedger;
     use crate::store::{Cursor, Store};
     use std::collections::HashMap;

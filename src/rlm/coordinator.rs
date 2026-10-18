@@ -310,8 +310,18 @@ fn execute_op(
             Ok(None) // Inspect doesn't produce a handle — it produces a root observation.
         }
 
-        // Select is not implemented in the prototype.
-        Op::Select(_) => Ok(None),
+        Op::Select(k) => {
+            ledger
+                .reserve(&Reservation {
+                    evidence_handles: 1,
+                    ..Default::default()
+                })
+                .map_err(CoordinatorError::Budget)?;
+
+            let hid = executor::execute_select(k, registry, plan_outputs).map_err(CoordinatorError::Execution)?;
+
+            Ok(Some((k.op_id.clone(), hid)))
+        }
     }
 }
 
@@ -502,6 +512,101 @@ mod tests {
         assert_eq!(finish.status, AnswerStatus::Answered);
         assert!(!finish.claims.is_empty());
         assert!(!finish.procedure.is_empty());
+    }
+
+    /// Run search `certbot` -> assess -> select `verdicts` -> inspect with
+    /// `child` judging, and return the root state the finish turn saw.
+    fn select_through(
+        child: impl Fn(&EvidencePacket) -> ChildResultV1 + Send + 'static,
+        verdicts: Vec<Verdict>,
+    ) -> serde_json::Value {
+        let mut store = Store::open_memory().unwrap();
+        seed_corpus(&mut store);
+        let model = FakeModel::new();
+        let op = |json: serde_json::Value| serde_json::from_value::<PlanOpV1>(json).unwrap();
+        model.add_root_response(RootActionV1 {
+            version: 1,
+            expected_state_version: 0,
+            kind: RootActionKind::Plan,
+            plan: Some(PlanV1 {
+                ops: vec![
+                    op(serde_json::json!({"op": "search", "op_id": "s1", "terms": ["certbot"], "match": "any", "limit": 10})),
+                    op(serde_json::json!({"op": "assess", "op_id": "a1", "input": {"output": "s1"}, "objective": "renewal", "max_items": 8})),
+                    op(serde_json::json!({"op": "select", "op_id": "k1", "input": {"output": "a1"}, "verdicts": verdicts, "limit": 20})),
+                    op(serde_json::json!({"op": "inspect", "op_id": "i1", "input": {"output": "k1"}, "limit": 8, "max_item_bytes": 2048})),
+                ],
+            }),
+            finish: None,
+        });
+        model.add_child_response(child);
+        model.add_root_response(RootActionV1 {
+            version: 1,
+            expected_state_version: 1,
+            kind: RootActionKind::Finish,
+            plan: None,
+            finish: Some(FinishV1 {
+                status: AnswerStatus::Abstained,
+                answer: String::new(),
+                claims: vec![],
+                procedure: vec![],
+                contradictions: vec![],
+                missing: vec!["test".into()],
+            }),
+        });
+        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default());
+        assert_eq!(result.status, InvestigationStatus::Abstained);
+        serde_json::from_str(&model.root_states()[1]).unwrap()
+    }
+
+    /// Judge `certbot renew` with `renew` and `certbot status` with `status`;
+    /// `None` leaves an item out of the result.
+    fn judge(renew: Option<Verdict>, status: Option<Verdict>) -> impl Fn(&EvidencePacket) -> ChildResultV1 + Send {
+        move |p| ChildResultV1 {
+            version: 1,
+            packet_id: p.packet_id.clone(),
+            assessments: p
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let verdict = if item.safe_text.contains("renew") { renew.clone() } else { status.clone() };
+                    Some(ItemAssessmentV1 {
+                        item_id: item.item_id.clone(),
+                        verdict: verdict?,
+                        confidence: Confidence::High,
+                        claims: vec![],
+                        missing: vec![],
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn inspected(state: &serde_json::Value) -> Vec<&str> {
+        state["last_inspection"]["items"].as_array().unwrap().iter().map(|i| i["safe_text"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn select_passes_on_the_items_with_the_chosen_verdicts() {
+        use Verdict::*;
+        let state = select_through(judge(Some(Supports), Some(Irrelevant)), vec![Supports]);
+        assert_eq!(inspected(&state), ["certbot renew --nginx -d example.com"]);
+        // One verdict flipped, nothing else changed.
+        let state = select_through(judge(Some(Irrelevant), Some(Irrelevant)), vec![Supports]);
+        assert_eq!(inspected(&state), Vec::<&str>::new());
+        let state = select_through(judge(Some(Irrelevant), Some(Supports)), vec![Supports]);
+        assert_eq!(inspected(&state), ["certbot status"]);
+    }
+
+    #[test]
+    fn an_item_the_child_skipped_never_passes_select() {
+        use Verdict::*;
+        let state = select_through(judge(Some(Contradicts), None), vec![Supports, Contradicts, Unclear, Irrelevant]);
+        assert_eq!(inspected(&state), ["certbot renew --nginx -d example.com"]);
+        let assessed = state["handles"].as_array().unwrap().iter().find(|h| h["kind"] == "AssessmentSet").unwrap();
+        assert_eq!(
+            assessed["verdicts"],
+            serde_json::json!({"supports": 0, "contradicts": 1, "unclear": 0, "irrelevant": 0, "unassessed": 1})
+        );
     }
 
     #[test]

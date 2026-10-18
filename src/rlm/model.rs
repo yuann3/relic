@@ -51,14 +51,17 @@ type ChildHandler = Box<dyn Fn(&EvidencePacket) -> String + Send>;
 pub struct FakeModel {
     child_responses: std::sync::Mutex<Vec<ChildHandler>>,
     root_responses: std::sync::Mutex<Vec<RootActionV1>>,
+    root_states: std::sync::Mutex<Vec<String>>,
 }
 
 impl FakeModel {
     pub fn new() -> Self {
-        Self {
-            child_responses: std::sync::Mutex::new(Vec::new()),
-            root_responses: std::sync::Mutex::new(Vec::new()),
-        }
+        Self::default()
+    }
+
+    /// Every root state it was shown, in order.
+    pub fn root_states(&self) -> Vec<String> {
+        self.root_states.lock().unwrap().clone()
     }
 
     /// Add a child response generator. Called in FIFO order for each batch.
@@ -123,8 +126,9 @@ impl ModelBoundary for FakeModel {
 
     fn root_call(
         &self,
-        _state_json: &str,
+        state_json: &str,
     ) -> Result<RootActionV1, ModelError> {
+        self.root_states.lock().unwrap().push(state_json.to_string());
         let mut responses = self.root_responses.lock().unwrap();
         if responses.is_empty() {
             return Err(ModelError::Refused("no more scripted root responses".into()));
