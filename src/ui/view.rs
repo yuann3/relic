@@ -406,9 +406,12 @@ fn recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             lines.push(Line::styled("Enter here opens the cited evidence", t.dim));
         }
     }
-    let p = Paragraph::new(Text::from(lines))
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let inner = block.inner(area);
+    let p = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let rows = p.line_count(inner.width);
+    let max = u16::try_from(rows.saturating_sub(usize::from(inner.height))).unwrap_or(u16::MAX);
+    r.scroll_max.set(max);
+    let p = p.block(block).scroll((r.scroll.unwrap_or(max).min(max), 0));
     frame.render_widget(p, area);
 }
 
@@ -1081,6 +1084,16 @@ mod tests {
         ] {
             assert!(s.contains(want), "missing {want:?} in\n{s}");
         }
+
+        // At 120x26 the pane is shorter than its text: it follows the end,
+        // so the finding is in view, and k scrolls back to the start.
+        let s = text(&render(&m, 120, 26));
+        assert!(s.contains("claim-end") && !s.contains("status: finished"), "{s}");
+        for _ in 0..20 {
+            drive(&mut m, &store, UiAction::Key(Key::Char('k')));
+        }
+        let s = text(&render(&m, 120, 26));
+        assert!(s.contains("status: finished") && !s.contains("claim-end"), "{s}");
     }
 
     #[test]

@@ -247,6 +247,11 @@ pub struct RecallState {
     pub started_at: Option<Instant>,
     pub now: Option<Instant>,
     pub finding: Option<Finding>,
+    /// `None` follows the newest line, so progress and then the finding stay
+    /// in view; scrolling up pins a row until it is back at the end.
+    pub scroll: Option<u16>,
+    /// Like [`EvidenceState::scroll_max`]: only the view knows the wrap.
+    pub scroll_max: Cell<u16>,
 }
 
 impl RecallState {
@@ -274,6 +279,8 @@ impl Default for RecallState {
             started_at: None,
             now: None,
             finding: None,
+            scroll: None,
+            scroll_max: Cell::new(0),
         }
     }
 }
@@ -638,7 +645,12 @@ fn move_by(m: &mut UiModel, delta: isize) -> Vec<UiEffect> {
                 .min(m.evidence.scroll_max.get());
             vec![]
         }
-        Focus::Recall => vec![],
+        Focus::Recall => {
+            let max = m.recall.scroll_max.get();
+            let to = m.recall.scroll.unwrap_or(max).saturating_add_signed(delta as i16).min(max);
+            m.recall.scroll = (to < max).then_some(to);
+            vec![]
+        }
     }
 }
 
