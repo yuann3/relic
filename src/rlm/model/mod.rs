@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod egress;
 pub mod prompt;
 

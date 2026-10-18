@@ -17,6 +17,7 @@ ratatui = { version = "0.30", optional = true, default-features = false, feature
 rusqlite = { version = "0.35", features = ["bundled", "hooks", "modern_sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 [[bin]]
 name = "relic"
