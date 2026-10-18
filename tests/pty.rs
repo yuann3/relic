@@ -405,6 +405,23 @@ mod tui {
         signal_while_fzf_runs(s, &fzf);
     }
 
+    /// With stdout sent to a file, the reset after killing fzf goes to the
+    /// terminal fzf drew on, never into the user's output.
+    #[test]
+    fn a_fatal_signal_while_search_fzf_runs_writes_nothing_to_redirected_stdout() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let fzf = FakeFzf::new(STUBBORN_PICKER);
+        let path = path_with(fzf.dir.path());
+        let out = fzf.dir.path().join("stdout");
+        let script = "exec \"$0\" search fixture --fzf --db \"$1\" > \"$2\"";
+        let args = ["-c".as_ref(), script.as_ref(), RELIC.as_ref(), fx.db.as_os_str(), out.as_os_str()];
+        let s = Session::spawn_program("/bin/sh".as_ref(), &args, &[("PATH", &path)]);
+        signal_while_fzf_runs(s, &fzf);
+        let written = std::fs::read(&out).unwrap();
+        assert!(written.is_empty(), "{:?}", String::from_utf8_lossy(&written));
+    }
+
     /// A signal the user's shell left ignored (`nohup`, `trap '' TERM`)
     /// stays ignored.
     #[test]

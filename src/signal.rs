@@ -137,8 +137,11 @@ fn stop_child() {
         libc::kill(pid, libc::SIGKILL);
         libc::waitpid(pid, &mut st, 0);
         // A killed fzf leaves its screen behind: mouse reporting, its
-        // alternate screen and a hidden cursor.
-        let reset = b"\x1b[?1000l\x1b[?1006l\x1b[?1049l\x1b[?25h";
-        libc::write(libc::STDOUT_FILENO, reset.as_ptr().cast(), reset.len());
+        // alternate screen and a hidden cursor. To the terminal fzf drew on:
+        // `search --fzf` may have its stdout in the user's file or pipe.
+        if let Some((fd, _)) = TTY.get() {
+            let reset = b"\x1b[?1000l\x1b[?1006l\x1b[?1049l\x1b[?25h";
+            libc::write(*fd, reset.as_ptr().cast(), reset.len());
+        }
     }
 }
