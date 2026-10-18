@@ -269,8 +269,8 @@ fn import_gates(relic: &Path, work: &Path, samples: usize, gates: &mut Vec<Value
 /// The read-path gates on a 1M store. Whole words must answer in under 20 ms
 /// (ADR 0007). Everything else, whatever it costs unbounded, must end within
 /// the query deadline plus `DEADLINE_EPSILON_MS` (ADR 0006): with a page,
-/// with no match, or stopped as too broad. Which of those is recorded, not
-/// gated; a deadline that did not hold shows as time.
+/// with no match, stopped as too broad, or with every word ignored. Which of
+/// those is recorded, not gated; a deadline that did not hold shows as time.
 fn search_gates(relic: &Path, db: &Path, samples: usize, gates: &mut Vec<Value>) -> Result<(), String> {
     let hot = |n: usize| format!("{}ta", "task/".repeat(n - 1));
     let git_400 = vec!["git"; 400];
@@ -314,7 +314,8 @@ fn search_gates(relic: &Path, db: &Path, samples: usize, gates: &mut Vec<Value>)
 }
 
 /// Wall time in ms of one `relic search`, and how it ended. Anything but a
-/// page, no match or a stop at the deadline is a harness failure.
+/// page, no match, a stop at the deadline or an ignored query is a harness
+/// failure.
 fn timed_search(cmd: &mut Command) -> Result<(f64, String), String> {
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     let t = Instant::now();
@@ -325,6 +326,9 @@ fn timed_search(cmd: &mut Command) -> Result<(f64, String), String> {
         Some(0) => "page",
         Some(1) => "no match",
         Some(2) if stderr.contains("too broad") => "too broad",
+        // A word past the token cap is dropped, and a query left empty is a
+        // usage error (#22); it still had to end within the deadline.
+        Some(2) if stderr.contains("every word was ignored") => "ignored",
         _ => return Err(format!("{cmd:?} exited with {}: {stderr}", out.status)),
     };
     Ok((ms, outcome.into()))
