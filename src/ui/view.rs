@@ -62,7 +62,8 @@ impl Theme {
 pub fn view(frame: &mut Frame, m: &UiModel) {
     let t = Theme::new(m.mono);
     let area = frame.area();
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+    m.too_small.set(area.width < MIN_WIDTH || area.height < MIN_HEIGHT);
+    if m.too_small.get() {
         let msg = format!(
             "terminal too small ({}x{}); relic needs at least {MIN_WIDTH}x{MIN_HEIGHT}. Ctrl-C twice quits.",
             area.width, area.height

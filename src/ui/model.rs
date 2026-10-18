@@ -284,6 +284,9 @@ pub struct UiModel {
     pub notice: Option<String>,
     /// `NO_COLOR`: styles use modifiers only.
     pub mono: bool,
+    /// Set by the view on each draw. While the workspace is replaced by the
+    /// "too small" message, keys would act on panes the user cannot see.
+    pub too_small: Cell<bool>,
     pub dirty: bool,
     last_interrupt: Option<Instant>,
 }
@@ -299,6 +302,7 @@ impl UiModel {
             modal: None,
             notice: None,
             mono,
+            too_small: Cell::new(false),
             dirty: true,
             last_interrupt: None,
         }
@@ -316,6 +320,9 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
         UiAction::Start => query_changed(m),
         UiAction::Key(key) => {
             m.dirty = true;
+            if m.too_small.get() && key != Key::Ctrl('z') {
+                return vec![];
+            }
             on_key(m, key)
         }
         UiAction::Interrupt(at) => {
@@ -324,7 +331,7 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
         }
         UiAction::Paste(text) => {
             m.dirty = true;
-            if m.modal.is_some() {
+            if m.modal.is_some() || m.too_small.get() {
                 return vec![];
             }
             m.focus = Focus::Query;

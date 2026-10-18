@@ -202,6 +202,29 @@ mod tui {
         o.screen.in_alt() && top.chars().count() == 80 && top.ends_with('┓')
     }
 
+    /// While the workspace is replaced by "too small", keys do nothing to
+    /// panes the user cannot see: q in the results pane does not quit, and
+    /// typing does not reach the query.
+    #[test]
+    fn keys_do_nothing_while_the_terminal_is_too_small() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let mut s = ready(&fx, &[]);
+        s.send(b"\t");
+        s.resize(8, 30);
+        s.signal(libc::SIGWINCH);
+        s.wait_screen("terminal too small");
+        s.send(b"qx");
+        s.assert_alive_for(Duration::from_millis(300));
+        s.resize(24, 80);
+        s.signal(libc::SIGWINCH);
+        s.wait_for("the workspace back at 80 columns", |o| {
+            o.screen.text().lines().next().is_some_and(|top| top.chars().count() == 80)
+        });
+        s.with(|o| assert!(!o.screen.text().contains("> x"), "{}", pty_support::dump(o)));
+        quits_cleanly(s, b"q");
+    }
+
     #[test]
     fn resize_storm_then_quit() {
         let _s = serial();

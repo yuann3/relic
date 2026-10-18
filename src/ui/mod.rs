@@ -219,6 +219,7 @@ where
             }
 
             while let Some(action) = queue.pop_front() {
+                let resized = matches!(action, UiAction::Resize);
                 if let UiAction::SearchDone {
                     generation,
                     elapsed,
@@ -234,6 +235,12 @@ where
                         UiEffect::Exit => return Ok(()),
                         e => queue.extend(self.run_effect(e, guard)?),
                     }
+                }
+                // Draw the new size before the keys queued behind it: the
+                // view decides whether the workspace still fits, and keys
+                // act only on what is on screen.
+                if resized {
+                    break;
                 }
             }
         }
