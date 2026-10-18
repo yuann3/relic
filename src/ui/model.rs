@@ -102,6 +102,8 @@ pub enum UiAction {
         event: RecallEvent,
     },
     InputClosed,
+    /// Ctrl-Z, but SIGTSTP was ignored when Relic started.
+    SuspendRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,6 +483,11 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
         }
         UiAction::Recall { op, event } => on_recall_event(m, op, event),
         UiAction::InputClosed => vec![UiEffect::Exit],
+        UiAction::SuspendRefused => {
+            m.dirty = true;
+            m.notice = Some("not suspending: Ctrl-Z was ignored when relic started".into());
+            vec![]
+        }
     }
 }
 

@@ -132,6 +132,23 @@ mod tui {
         s.assert_restored();
     }
 
+    /// Ctrl-Z ignored by whoever started relic stays ignored: relic says so
+    /// and keeps running.
+    #[test]
+    fn ctrl_z_under_an_inherited_ignored_sigtstp_does_not_suspend() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let script = "trap '' TSTP; exec \"$0\" ui --db \"$1\"";
+        let args = ["-c".as_ref(), script.as_ref(), RELIC.as_ref(), fx.db.as_os_str()];
+        let mut s = Session::spawn_program("/bin/sh".as_ref(), &args, &[]);
+        s.wait_ready();
+        s.send(b"\x1a");
+        s.wait_screen("not suspending");
+        s.send(b"zz");
+        s.wait_screen("> zz ");
+        quits_cleanly(s, b"\x1b");
+    }
+
     /// A dumb terminal gets a message, not escape sequences it cannot draw.
     #[test]
     fn a_dumb_terminal_is_refused_without_touching_it() {

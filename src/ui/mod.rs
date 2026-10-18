@@ -318,6 +318,17 @@ where
                 vec![]
             }
             UiEffect::Suspend => {
+                // An inherited SIG_IGN is the user's choice, as for the fatal
+                // signals: whoever started Relic may have no `fg` to offer.
+                // SAFETY: sigaction with a null new action only reads.
+                let ignored = unsafe {
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut old);
+                    old.sa_sigaction == libc::SIG_IGN
+                };
+                if ignored {
+                    return Ok(vec![UiAction::SuspendRefused]);
+                }
                 // The fzf hand-off, with the shell as the program that
                 // takes the terminal (ADR 0011).
                 self.input.pause();
