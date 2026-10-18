@@ -13,12 +13,24 @@ pub enum HandleKind {
 /// A plan that passed structural and semantic validation.
 #[derive(Debug)]
 pub struct ValidatedPlan {
-    pub ops: Vec<PlanOpV1>,
+    pub ops: Vec<Op>,
+}
+
+/// An operator the kernel executes: what is left of [`PlanOpV1`] once
+/// admission has refused the ones not built.
+#[derive(Debug)]
+pub enum Op {
+    Search(SearchV1),
+    Expand(ExpandV1),
+    Assess(AssessV1),
+    Select(SelectV1),
+    Inspect(InspectV1),
 }
 
 #[derive(Debug, PartialEq)]
 pub enum ValidationError {
     EmptyPlan,
+    NotExecuted(&'static str),
     TooManyOps { count: usize, max: usize },
     DuplicateOpId(String),
     UnknownInputRef { op_id: String, ref_id: String },
@@ -28,7 +40,7 @@ pub enum ValidationError {
     SearchTooManyTerms { op_id: String, count: usize, max: usize },
     SearchNoTerms { op_id: String },
     LimitZero { op_id: String },
-    AssessBatchSizeZero { op_id: String },
+    AssessObjectiveTooLong { op_id: String, bytes: usize, max: usize },
     AssessMaxItemsExceeded { op_id: String, count: u32, max: u32 },
     ExpandWindowExceeded { op_id: String, per_side: u32, max: u32 },
 }
@@ -45,6 +57,9 @@ const MAX_OPS_PER_PLAN: usize = 8;
 /// The one word cap every search shares (ADR 0006).
 const MAX_SEARCH_TERMS: usize = crate::app::MAX_QUERY_WORDS;
 const MAX_ASSESS_ITEMS: u32 = 64;
+/// Goes into every child packet beside its items; this leaves a lone item
+/// most of the packet cap, so truncation can always make it fit.
+pub const MAX_OBJECTIVE_BYTES: usize = 1024;
 const MAX_EXPAND_PER_SIDE: u32 = 32;
 
 /// Validate a plan structurally and semantically.
@@ -71,10 +86,24 @@ pub fn validate_plan(
         });
     }
 
+    let ops = plan
+        .ops
+        .iter()
+        .map(|op| match op.clone() {
+            PlanOpV1::Search(s) => Ok(Op::Search(s)),
+            PlanOpV1::Expand(e) => Ok(Op::Expand(e)),
+            PlanOpV1::Assess(a) => Ok(Op::Assess(a)),
+            PlanOpV1::Select(s) => Ok(Op::Select(s)),
+            PlanOpV1::Inspect(i) => Ok(Op::Inspect(i)),
+            PlanOpV1::Relate => Err(ValidationError::NotExecuted("relate")),
+            PlanOpV1::Combine => Err(ValidationError::NotExecuted("combine")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     // Check for duplicate op_ids and build index.
     let mut seen_ids = HashSet::new();
     let mut op_index: HashMap<&str, usize> = HashMap::new();
-    for (i, op) in plan.ops.iter().enumerate() {
+    for (i, op) in ops.iter().enumerate() {
         let id = op_id(op);
         if !seen_ids.insert(id) {
             return Err(ValidationError::DuplicateOpId(id.to_string()));
@@ -85,7 +114,7 @@ pub fn validate_plan(
     // Validate each op: resolve inputs, check kinds, check limits.
     let mut output_kinds: HashMap<&str, HandleKind> = HashMap::new();
 
-    for (i, op) in plan.ops.iter().enumerate() {
+    for (i, op) in ops.iter().enumerate() {
         let id = op_id(op);
 
         // Validate operator-specific limits.
@@ -131,63 +160,53 @@ pub fn validate_plan(
         output_kinds.insert(id, output_kind(op));
     }
 
-    Ok(ValidatedPlan {
-        ops: plan.ops.clone(),
-    })
+    Ok(ValidatedPlan { ops })
 }
 
-fn op_id(op: &PlanOpV1) -> &str {
+pub fn op_id(op: &Op) -> &str {
     match op {
-        PlanOpV1::Search(s) => &s.op_id,
-        PlanOpV1::Expand(e) => &e.op_id,
-        PlanOpV1::Relate(r) => &r.op_id,
-        PlanOpV1::Combine(c) => &c.op_id,
-        PlanOpV1::Assess(a) => &a.op_id,
-        PlanOpV1::Select(s) => &s.op_id,
-        PlanOpV1::Inspect(i) => &i.op_id,
+        Op::Search(s) => &s.op_id,
+        Op::Expand(e) => &e.op_id,
+        Op::Assess(a) => &a.op_id,
+        Op::Select(s) => &s.op_id,
+        Op::Inspect(i) => &i.op_id,
     }
 }
 
-fn op_inputs(op: &PlanOpV1) -> Vec<&InputRefV1> {
+fn op_inputs(op: &Op) -> Vec<&InputRefV1> {
     match op {
-        PlanOpV1::Search(_) => vec![],
-        PlanOpV1::Expand(e) => vec![&e.input],
-        PlanOpV1::Relate(r) => vec![&r.input],
-        PlanOpV1::Combine(c) => c.inputs.iter().collect(),
-        PlanOpV1::Assess(a) => vec![&a.input],
-        PlanOpV1::Select(s) => vec![&s.input],
-        PlanOpV1::Inspect(i) => vec![&i.input],
+        Op::Search(_) => vec![],
+        Op::Expand(e) => vec![&e.input],
+        Op::Assess(a) => vec![&a.input],
+        Op::Select(s) => vec![&s.input],
+        Op::Inspect(i) => vec![&i.input],
     }
 }
 
-fn output_kind(op: &PlanOpV1) -> HandleKind {
+fn output_kind(op: &Op) -> HandleKind {
     match op {
-        PlanOpV1::Search(_) => HandleKind::EvidenceSet,
-        PlanOpV1::Expand(_) => HandleKind::EvidenceSet,
-        PlanOpV1::Relate(_) => HandleKind::EvidenceSet,
-        PlanOpV1::Combine(_) => HandleKind::EvidenceSet,
-        PlanOpV1::Assess(_) => HandleKind::AssessmentSet,
-        PlanOpV1::Select(_) => HandleKind::EvidenceSet,
-        PlanOpV1::Inspect(_) => HandleKind::Inspection,
+        Op::Search(_) => HandleKind::EvidenceSet,
+        Op::Expand(_) => HandleKind::EvidenceSet,
+        Op::Assess(_) => HandleKind::AssessmentSet,
+        Op::Select(_) => HandleKind::EvidenceSet,
+        Op::Inspect(_) => HandleKind::Inspection,
     }
 }
 
 /// What input kind does this operator expect? None means "any".
-fn expected_input_kind(op: &PlanOpV1) -> Option<HandleKind> {
+fn expected_input_kind(op: &Op) -> Option<HandleKind> {
     match op {
-        PlanOpV1::Search(_) => None,
-        PlanOpV1::Expand(_) => Some(HandleKind::EvidenceSet),
-        PlanOpV1::Relate(_) => Some(HandleKind::EvidenceSet),
-        PlanOpV1::Combine(_) => Some(HandleKind::EvidenceSet),
-        PlanOpV1::Assess(_) => Some(HandleKind::EvidenceSet),
-        PlanOpV1::Select(_) => Some(HandleKind::AssessmentSet),
-        PlanOpV1::Inspect(_) => Some(HandleKind::EvidenceSet),
+        Op::Search(_) => None,
+        Op::Expand(_) => Some(HandleKind::EvidenceSet),
+        Op::Assess(_) => Some(HandleKind::EvidenceSet),
+        Op::Select(_) => Some(HandleKind::AssessmentSet),
+        Op::Inspect(_) => Some(HandleKind::EvidenceSet),
     }
 }
 
-fn validate_op_limits(op: &PlanOpV1) -> Result<(), ValidationError> {
+fn validate_op_limits(op: &Op) -> Result<(), ValidationError> {
     match op {
-        PlanOpV1::Search(s) => {
+        Op::Search(s) => {
             if s.terms.is_empty() {
                 return Err(ValidationError::SearchNoTerms {
                     op_id: s.op_id.clone(),
@@ -206,7 +225,7 @@ fn validate_op_limits(op: &PlanOpV1) -> Result<(), ValidationError> {
                 });
             }
         }
-        PlanOpV1::Expand(e) => {
+        Op::Expand(e) => {
             if e.limit == 0 {
                 return Err(ValidationError::LimitZero {
                     op_id: e.op_id.clone(),
@@ -227,10 +246,12 @@ fn validate_op_limits(op: &PlanOpV1) -> Result<(), ValidationError> {
                 });
             }
         }
-        PlanOpV1::Assess(a) => {
-            if a.batch_size == 0 {
-                return Err(ValidationError::AssessBatchSizeZero {
+        Op::Assess(a) => {
+            if a.objective.len() > MAX_OBJECTIVE_BYTES {
+                return Err(ValidationError::AssessObjectiveTooLong {
                     op_id: a.op_id.clone(),
+                    bytes: a.objective.len(),
+                    max: MAX_OBJECTIVE_BYTES,
                 });
             }
             if a.max_items > MAX_ASSESS_ITEMS {
@@ -246,28 +267,14 @@ fn validate_op_limits(op: &PlanOpV1) -> Result<(), ValidationError> {
                 });
             }
         }
-        PlanOpV1::Relate(r) => {
-            if r.limit == 0 {
-                return Err(ValidationError::LimitZero {
-                    op_id: r.op_id.clone(),
-                });
-            }
-        }
-        PlanOpV1::Combine(c) => {
-            if c.limit == 0 {
-                return Err(ValidationError::LimitZero {
-                    op_id: c.op_id.clone(),
-                });
-            }
-        }
-        PlanOpV1::Select(s) => {
+        Op::Select(s) => {
             if s.limit == 0 {
                 return Err(ValidationError::LimitZero {
                     op_id: s.op_id.clone(),
                 });
             }
         }
-        PlanOpV1::Inspect(i) => {
+        Op::Inspect(i) => {
             if i.limit == 0 {
                 return Err(ValidationError::LimitZero {
                     op_id: i.op_id.clone(),
@@ -318,7 +325,6 @@ mod tests {
             input: InputRefV1::Output(input_op.to_string()),
             objective: "test".to_string(),
             max_items: 32,
-            batch_size: 4,
         })
     }
 
@@ -350,6 +356,21 @@ mod tests {
             inspect("i1", "k1"),
         ]);
         assert!(validate_plan(&action, 0).is_ok());
+    }
+
+    #[test]
+    fn relate_and_combine_refused_at_admission() {
+        let ops = [
+            ("relate", r#"{"op":"relate","op_id":"r1","input":{"output":"s1"},"relation":"git_state","per_seed":2,"limit":80}"#),
+            ("combine", r#"{"op":"combine","op_id":"c1","inputs":[{"output":"s1"}],"mode":"union","limit":20}"#),
+        ];
+        for (name, op) in ops {
+            let json = format!(
+                r#"{{"version":1,"expected_state_version":0,"kind":"plan","plan":{{"ops":[{{"op":"search","op_id":"s1","terms":["git"],"match":"any","limit":5}},{op}]}}}}"#
+            );
+            let action: RootActionV1 = serde_json::from_str(&json).unwrap();
+            assert_eq!(validate_plan(&action, 0).unwrap_err(), ValidationError::NotExecuted(name));
+        }
     }
 
     #[test]
@@ -462,20 +483,20 @@ mod tests {
     }
 
     #[test]
-    fn assess_batch_size_zero_rejected() {
-        let action = make_action(0, vec![
+    fn assess_objective_over_cap_rejected() {
+        let action = |bytes: usize| make_action(0, vec![
             search("s1", &["cargo"], 50),
             PlanOpV1::Assess(AssessV1 {
                 op_id: "a1".to_string(),
                 input: InputRefV1::Output("s1".to_string()),
-                objective: "test".to_string(),
+                objective: "o".repeat(bytes),
                 max_items: 8,
-                batch_size: 0,
             }),
         ]);
+        assert!(validate_plan(&action(MAX_OBJECTIVE_BYTES), 0).is_ok());
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
-            ValidationError::AssessBatchSizeZero { .. }
+            validate_plan(&action(MAX_OBJECTIVE_BYTES + 1), 0).unwrap_err(),
+            ValidationError::AssessObjectiveTooLong { bytes: 1025, .. }
         ));
     }
 
@@ -488,7 +509,6 @@ mod tests {
                 input: InputRefV1::Output("s1".to_string()),
                 objective: "test".to_string(),
                 max_items: 65,
-                batch_size: 4,
             }),
         ]);
         assert!(matches!(

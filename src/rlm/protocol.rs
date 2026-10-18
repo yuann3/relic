@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+// Every struct a model writes denies unknown fields: a field the host does
+// not read is a model fault or an injection attempt, and fails closed (ADR 0009).
+
 // --- Plan operators ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -7,14 +10,17 @@ use serde::{Deserialize, Serialize};
 pub enum PlanOpV1 {
     Search(SearchV1),
     Expand(ExpandV1),
-    Relate(RelateV1),
-    Combine(CombineV1),
+    // Named so that admission can say they are not built (ADR 0009); their
+    // fields are ignored, never read.
+    Relate,
+    Combine,
     Assess(AssessV1),
     Select(SelectV1),
     Inspect(InspectV1),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SearchV1 {
     pub op_id: String,
     pub terms: Vec<String>,
@@ -31,6 +37,7 @@ pub enum MatchMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExpandV1 {
     pub op_id: String,
     pub input: InputRefV1,
@@ -48,49 +55,24 @@ pub enum ExpandScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RelateV1 {
-    pub op_id: String,
-    pub input: InputRefV1,
-    pub relation: Relation,
-    pub per_seed: u32,
-    pub limit: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Relation {
-    SameSession,
-    SameCwdTime,
-    GitState,
-    SameRepo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CombineV1 {
-    pub op_id: String,
-    pub inputs: Vec<InputRefV1>,
-    pub mode: CombineMode,
-    pub limit: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum CombineMode {
-    Union,
-    Intersection,
-    Difference,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AssessV1 {
     pub op_id: String,
     pub input: InputRefV1,
     pub objective: String,
     pub max_items: u32,
-    pub batch_size: u32,
+}
+
+/// Marks an item the host cut to fit its packet. Truncated evidence cannot
+/// support a claim about what was cut (research, evidence sufficiency 5).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TruncationV1 {
+    pub original_bytes: usize,
+    pub sent_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SelectV1 {
     pub op_id: String,
     pub input: InputRefV1,
@@ -99,6 +81,7 @@ pub struct SelectV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct InspectV1 {
     pub op_id: String,
     pub input: InputRefV1,
@@ -116,11 +99,13 @@ pub enum InputRefV1 {
 // --- Plan and root action ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PlanV1 {
     pub ops: Vec<PlanOpV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RootActionV1 {
     pub version: u8,
     pub expected_state_version: u32,
@@ -141,6 +126,7 @@ pub enum RootActionKind {
 // --- Finish and claims ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FinishV1 {
     pub status: AnswerStatus,
     pub answer: String,
@@ -162,6 +148,7 @@ pub enum AnswerStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FinalClaimV1 {
     pub text: String,
     pub supports: Vec<String>,
@@ -170,6 +157,7 @@ pub struct FinalClaimV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ProcedureStepV1 {
     pub text: String,
     pub supports: Vec<String>,
@@ -178,6 +166,7 @@ pub struct ProcedureStepV1 {
 // --- Child result ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ChildResultV1 {
     pub version: u8,
     pub packet_id: String,
@@ -185,6 +174,7 @@ pub struct ChildResultV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ItemAssessmentV1 {
     pub item_id: String,
     pub verdict: Verdict,
@@ -212,6 +202,7 @@ pub enum Confidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimV1 {
     pub text: String,
     #[serde(default)]
@@ -288,28 +279,10 @@ mod tests {
     }
 
     #[test]
-    fn relate_op_round_trips() {
-        let json = r#"{"op":"relate","op_id":"r1","input":{"output":"e1"},"relation":"git_state","per_seed":2,"limit":80}"#;
-        let op: PlanOpV1 = serde_json::from_str(json).unwrap();
-        assert!(matches!(&op, PlanOpV1::Relate(r) if r.relation == Relation::GitState));
-        let rt: PlanOpV1 = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
-        assert_eq!(op, rt);
-    }
-
-    #[test]
-    fn combine_op_round_trips() {
-        let json = r#"{"op":"combine","op_id":"c1","inputs":[{"output":"s1"},{"output":"s2"}],"mode":"union","limit":200}"#;
-        let op: PlanOpV1 = serde_json::from_str(json).unwrap();
-        assert!(matches!(&op, PlanOpV1::Combine(c) if c.inputs.len() == 2 && c.mode == CombineMode::Union));
-        let rt: PlanOpV1 = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
-        assert_eq!(op, rt);
-    }
-
-    #[test]
     fn assess_op_round_trips() {
-        let json = r#"{"op":"assess","op_id":"a1","input":{"output":"e1"},"objective":"find renewal steps","max_items":32,"batch_size":4}"#;
+        let json = r#"{"op":"assess","op_id":"a1","input":{"output":"e1"},"objective":"find renewal steps","max_items":32}"#;
         let op: PlanOpV1 = serde_json::from_str(json).unwrap();
-        assert!(matches!(&op, PlanOpV1::Assess(a) if a.max_items == 32 && a.batch_size == 4));
+        assert!(matches!(&op, PlanOpV1::Assess(a) if a.max_items == 32));
         let rt: PlanOpV1 = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
         assert_eq!(op, rt);
     }
@@ -336,6 +309,27 @@ mod tests {
     fn unknown_op_rejected() {
         let json = r#"{"op":"hack","op_id":"x1"}"#;
         assert!(serde_json::from_str::<PlanOpV1>(json).is_err());
+    }
+
+    #[test]
+    fn unknown_field_rejected_at_every_depth() {
+        let op = r#"{"op":"search","op_id":"s1","terms":["git"],"match":"any","limit":5}"#;
+        let action = |op: &str| format!(r#"{{"version":1,"expected_state_version":0,"kind":"plan","plan":{{"ops":[{op}]}}}}"#);
+        let child = |claim: &str| format!(
+            r#"{{"version":1,"packet_id":"p","assessments":[{{"item_id":"i","verdict":"supports","confidence":"low","claims":[{claim}]}}]}}"#
+        );
+        // The same documents parse without the extra field, so only it can fail them.
+        assert!(serde_json::from_str::<RootActionV1>(&action(op)).is_ok());
+        assert!(serde_json::from_str::<ChildResultV1>(&child(r#"{"text":"t"}"#)).is_ok());
+
+        let op_extra = op.replace(r#""limit":5"#, r#""limit":5,"sql":"x""#);
+        let action_extra = action(op).replacen('{', r#"{"note":"x","#, 1);
+        let finish_extra = r#"{"version":1,"expected_state_version":0,"kind":"finish","finish":{"status":"partial","answer":"","claims":[{"text":"t","supports":[],"why":"x"}]}}"#;
+        assert!(serde_json::from_str::<RootActionV1>(&finish_extra.replace(r#","why":"x""#, "")).is_ok());
+        assert!(serde_json::from_str::<RootActionV1>(&action(&op_extra)).is_err(), "inside the tagged op");
+        assert!(serde_json::from_str::<RootActionV1>(&action_extra).is_err(), "on the action");
+        assert!(serde_json::from_str::<RootActionV1>(finish_extra).is_err(), "on a final claim");
+        assert!(serde_json::from_str::<ChildResultV1>(&child(r#"{"text":"t","evidence":"x"}"#)).is_err(), "on a child claim");
     }
 
     // --- RootActionV1 round-trips ---
@@ -401,7 +395,7 @@ mod tests {
                     {"op":"search","op_id":"s1","terms":["certificate","renew"],"match":"any","limit":120},
                     {"op":"expand","op_id":"e1","input":{"output":"s1"},"scope":"same_session","before":8,"after":16,"limit":200},
                     {"op":"relate","op_id":"g1","input":{"output":"e1"},"relation":"git_state","per_seed":2,"limit":80},
-                    {"op":"assess","op_id":"a1","input":{"output":"g1"},"objective":"find observed renewal steps and contrary outcomes","max_items":32,"batch_size":4},
+                    {"op":"assess","op_id":"a1","input":{"output":"g1"},"objective":"find observed renewal steps and contrary outcomes","max_items":32},
                     {"op":"select","op_id":"k1","input":{"output":"a1"},"verdicts":["supports","contradicts"],"limit":20},
                     {"op":"inspect","op_id":"i1","input":{"output":"k1"},"limit":12,"max_item_bytes":2048}
                 ]

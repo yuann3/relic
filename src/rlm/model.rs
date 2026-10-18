@@ -1,26 +1,28 @@
 use crate::rlm::protocol::*;
 
 /// Packet of evidence items sent to a child model call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EvidencePacket {
     pub packet_id: String,
     pub items: Vec<EvidenceItem>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EvidenceItem {
     pub item_id: String,
     pub evidence_id: String,
     pub safe_text: String,
+    pub truncation: Option<TruncationV1>,
 }
 
 /// Trait for the model boundary. Implemented by FakeModel for tests.
 pub trait ModelBoundary {
+    /// The child's reply body, unparsed: the kernel caps and checks it.
     fn child_call(
         &self,
         packet: &EvidencePacket,
         objective: &str,
-    ) -> Result<ChildResultV1, ModelError>;
+    ) -> Result<String, ModelError>;
 
     fn root_call(
         &self,
@@ -42,27 +44,38 @@ impl std::fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
-type ChildHandler = Box<dyn Fn(&EvidencePacket) -> ChildResultV1 + Send>;
+type ChildHandler = Box<dyn Fn(&EvidencePacket) -> String + Send>;
 
 /// A fake model that returns scripted responses for testing.
 #[derive(Default)]
 pub struct FakeModel {
     child_responses: std::sync::Mutex<Vec<ChildHandler>>,
     root_responses: std::sync::Mutex<Vec<RootActionV1>>,
+    root_states: std::sync::Mutex<Vec<String>>,
 }
 
 impl FakeModel {
     pub fn new() -> Self {
-        Self {
-            child_responses: std::sync::Mutex::new(Vec::new()),
-            root_responses: std::sync::Mutex::new(Vec::new()),
-        }
+        Self::default()
+    }
+
+    /// Every root state it was shown, in order.
+    pub fn root_states(&self) -> Vec<String> {
+        self.root_states.lock().unwrap().clone()
     }
 
     /// Add a child response generator. Called in FIFO order for each batch.
     pub fn add_child_response<F>(&self, f: F)
     where
         F: Fn(&EvidencePacket) -> ChildResultV1 + Send + 'static,
+    {
+        self.add_child_raw(move |p| serde_json::to_string(&f(p)).unwrap());
+    }
+
+    /// Add a child reply body exactly as the model would send it.
+    pub fn add_child_raw<F>(&self, f: F)
+    where
+        F: Fn(&EvidencePacket) -> String + Send + 'static,
     {
         self.child_responses.lock().unwrap().push(Box::new(f));
     }
@@ -102,7 +115,7 @@ impl ModelBoundary for FakeModel {
         &self,
         packet: &EvidencePacket,
         _objective: &str,
-    ) -> Result<ChildResultV1, ModelError> {
+    ) -> Result<String, ModelError> {
         let mut responses = self.child_responses.lock().unwrap();
         if responses.is_empty() {
             return Err(ModelError::Refused("no more scripted child responses".into()));
@@ -113,8 +126,9 @@ impl ModelBoundary for FakeModel {
 
     fn root_call(
         &self,
-        _state_json: &str,
+        state_json: &str,
     ) -> Result<RootActionV1, ModelError> {
+        self.root_states.lock().unwrap().push(state_json.to_string());
         let mut responses = self.root_responses.lock().unwrap();
         if responses.is_empty() {
             return Err(ModelError::Refused("no more scripted root responses".into()));

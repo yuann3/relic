@@ -1,18 +1,53 @@
 use crate::domain::StoredObservation;
+use crate::rlm::budget::BudgetExhausted;
 use crate::rlm::evidence::{HandleId, HandleRegistry};
-use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary};
+use crate::rlm::validate::HandleKind;
+use crate::rlm::model::{EvidenceItem, EvidencePacket};
 use crate::app::{self, Budget, Order, SearchRequest};
 use crate::rlm::protocol::*;
-use crate::store::Store;
+use crate::store::{Store, is_interrupt};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug)]
 pub enum ExecError {
     Store(rusqlite::Error),
     Search(app::SearchError),
     HandleNotFound(String),
-    NoObservationsForExpand,
+    /// A handle reference named a set of the wrong kind for its operator.
+    WrongKind { handle: String, expected: HandleKind },
     Model(crate::rlm::model::ModelError),
-    ChildAllowlistViolation { item_id: String, bad_evidence_id: String },
+    Budget(BudgetExhausted),
+    /// The investigation's cancel flag was set.
+    Cancelled,
+}
+
+/// Why a child result was rejected whole (ADR 0009).
+#[derive(Debug, PartialEq)]
+pub enum ChildRejection {
+    Oversize { bytes: usize },
+    Malformed(String),
+    Version(u8),
+    PacketId(String),
+    UnknownItem(String),
+    DuplicateItem(String),
+    Citation { item_id: String, evidence_id: String },
+}
+
+impl std::fmt::Display for ChildRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Oversize { bytes } => write!(f, "{bytes} bytes, over the {CHILD_RESULT_MAX}-byte cap"),
+            Self::Malformed(e) => write!(f, "not a child result: {e}"),
+            Self::Version(v) => write!(f, "version {v}, not 1"),
+            Self::PacketId(id) => write!(f, "packet_id {id:?} is not the packet sent"),
+            Self::UnknownItem(id) => write!(f, "item_id {id:?} is not in the packet"),
+            Self::DuplicateItem(id) => write!(f, "item_id {id:?} assessed twice"),
+            Self::Citation { item_id, evidence_id } => {
+                write!(f, "{item_id:?} cites {evidence_id:?}, which is not in the packet")
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for ExecError {
@@ -28,6 +63,8 @@ pub fn execute_search(
     store: &Store,
     search: &SearchV1,
     registry: &mut HandleRegistry,
+    budget: &Budget,
+    notes: &mut Vec<String>,
 ) -> Result<HandleId, ExecError> {
     let query = match search.match_mode {
         MatchMode::Any => search.terms.join(" OR "),
@@ -42,7 +79,17 @@ pub fn execute_search(
         mode: app::MatchMode::Words,
         order: Order::RecentlyImported,
     };
-    let page = app::search(store, &req, &Budget::start()).map_err(ExecError::Search)?;
+    let page = match app::search(store, &req, budget) {
+        Ok(page) => page,
+        // A step result, not a failed investigation: the root sees an empty
+        // set and why, and can plan rarer terms (#26 handoff).
+        Err(e @ app::SearchError::TooBroad) => {
+            notes.push(format!("{}: {e}", search.op_id));
+            return Ok(registry.insert_evidence_set(Vec::new()));
+        }
+        Err(app::SearchError::Cancelled) => return Err(ExecError::Cancelled),
+        Err(e) => return Err(ExecError::Search(e)),
+    };
 
     // Fetch full StoredObservation for each hit.
     let mut observations = Vec::with_capacity(page.hits.len());
@@ -61,35 +108,139 @@ pub fn execute_expand(
     expand: &ExpandV1,
     registry: &mut HandleRegistry,
     plan_outputs: &std::collections::HashMap<String, HandleId>,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<HandleId, ExecError> {
     let source_handle_id = resolve_input(&expand.input, plan_outputs)?;
     let seed_obs = registry
         .get_observations(&source_handle_id)
         .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.clone()))?;
 
-    if seed_obs.is_empty() {
-        return Err(ExecError::NoObservationsForExpand);
-    }
-
-    let mut seen_ids = std::collections::HashSet::new();
-    let mut all_neighbors: Vec<StoredObservation> = Vec::new();
-
-    for obs in seed_obs {
-        let neighbors = store
-            .get_neighbors(obs.revision_id, obs.ordinal, expand.before, expand.after)
-            .map_err(ExecError::Store)?;
-        for n in neighbors {
-            if seen_ids.insert(n.id) {
-                all_neighbors.push(n);
+    let stop = {
+        let cancel = Arc::clone(cancel);
+        move || cancel.load(Ordering::Relaxed)
+    };
+    let all_neighbors = store
+        .interruptible(stop, |store| {
+            let mut seen_ids = std::collections::HashSet::new();
+            let mut all_neighbors: Vec<StoredObservation> = Vec::new();
+            for obs in seed_obs {
+                for n in store.get_neighbors(obs.revision_id, obs.ordinal, expand.before, expand.after)? {
+                    if seen_ids.insert(n.id) {
+                        all_neighbors.push(n);
+                    }
+                }
+                if all_neighbors.len() >= expand.limit as usize {
+                    all_neighbors.truncate(expand.limit as usize);
+                    break;
+                }
             }
-        }
-        if all_neighbors.len() >= expand.limit as usize {
-            all_neighbors.truncate(expand.limit as usize);
-            break;
-        }
-    }
+            Ok(all_neighbors)
+        })
+        .map_err(|e| if is_interrupt(&e) { ExecError::Cancelled } else { ExecError::Store(e) })?;
 
     Ok(registry.insert_evidence_set(all_neighbors))
+}
+
+/// Most items in one child call (research, operator algebra: assess).
+pub const CHILD_ITEMS_MAX: usize = 4;
+/// Most JSON bytes of a packet and its objective; the child request cap of
+/// ADR 0004. The adapter's template and schema must fit in it too (S6).
+pub const CHILD_PACKET_MAX: usize = 24 * 1024;
+
+/// Most bytes of one note to the root; root state has a 64 KiB cap.
+const NOTE_MAX: usize = 256;
+
+/// Most bytes of a child's reply. Checked before parsing, so a huge body
+/// costs nothing to refuse (research, security boundary 7).
+pub const CHILD_RESULT_MAX: usize = 16 * 1024;
+
+/// The verdicts in `raw` on each item of `packet`, in packet order; `None`
+/// where the child skipped an item. Any fault rejects the whole result.
+pub fn check_child_result(
+    packet: &EvidencePacket,
+    raw: &str,
+) -> Result<Vec<Option<ItemAssessmentV1>>, ChildRejection> {
+    if raw.len() > CHILD_RESULT_MAX {
+        return Err(ChildRejection::Oversize { bytes: raw.len() });
+    }
+    let result: ChildResultV1 = serde_json::from_str(raw).map_err(|e| ChildRejection::Malformed(e.to_string()))?;
+    if result.version != 1 {
+        return Err(ChildRejection::Version(result.version));
+    }
+    if result.packet_id != packet.packet_id {
+        return Err(ChildRejection::PacketId(result.packet_id));
+    }
+    let mut slots: Vec<Option<ItemAssessmentV1>> = vec![None; packet.items.len()];
+    for a in result.assessments {
+        let Some(i) = packet.items.iter().position(|item| item.item_id == a.item_id) else {
+            return Err(ChildRejection::UnknownItem(a.item_id));
+        };
+        let cited = a.claims.iter().flat_map(|c| c.supports.iter().chain(&c.contradicts));
+        if let Some(bad) = cited.into_iter().find(|ev| !packet.items.iter().any(|item| &item.evidence_id == *ev)) {
+            return Err(ChildRejection::Citation { item_id: a.item_id, evidence_id: bad.clone() });
+        }
+        if slots[i].is_some() {
+            return Err(ChildRejection::DuplicateItem(a.item_id));
+        }
+        slots[i] = Some(a);
+    }
+    Ok(slots)
+}
+
+/// Encoded size of what one child call is sent.
+fn packet_bytes(objective: &str, packet: &EvidencePacket) -> usize {
+    serde_json::to_vec(&(objective, packet)).expect("strings and integers serialize").len()
+}
+
+/// Split `items` in order into packets of at most [`CHILD_ITEMS_MAX`] items
+/// and [`CHILD_PACKET_MAX`] bytes. An item too big for a packet of its own
+/// is cut at a char boundary and marked with [`TruncationV1`].
+pub fn packets(objective: &str, items: Vec<EvidenceItem>) -> Vec<EvidencePacket> {
+    // Fixed width, so moving an item to the next packet cannot grow it:
+    // admission caps an assess at 64 items, so at most 64 packets.
+    let id = |n: usize| format!("pkt_{n:02}");
+    let mut out: Vec<EvidencePacket> = Vec::new();
+    let over = |p: &EvidencePacket| p.items.len() > CHILD_ITEMS_MAX || packet_bytes(objective, p) > CHILD_PACKET_MAX;
+    let mut packet = EvidencePacket { packet_id: id(0), items: Vec::new() };
+    for item in items {
+        packet.items.push(item);
+        if packet.items.len() > 1 && over(&packet) {
+            let moved = packet.items.pop().into_iter().collect();
+            let next = EvidencePacket { packet_id: id(out.len() + 1), items: moved };
+            out.push(std::mem::replace(&mut packet, next));
+        }
+        if over(&packet) {
+            truncate_to_fit(objective, &mut packet);
+        }
+    }
+    if !packet.items.is_empty() {
+        out.push(packet);
+    }
+    out
+}
+
+/// Cut the one item in `packet` to the longest prefix that fits.
+fn truncate_to_fit(objective: &str, packet: &mut EvidencePacket) {
+    let text = std::mem::take(&mut packet.items[0].safe_text);
+    let fits = |packet: &mut EvidencePacket, n: usize| {
+        let item = &mut packet.items[0];
+        item.safe_text.clear();
+        item.safe_text.push_str(&text[..n]);
+        item.truncation = Some(TruncationV1 { original_bytes: text.len(), sent_bytes: n });
+        packet_bytes(objective, packet) <= CHILD_PACKET_MAX
+    };
+    // Size only grows with the prefix, so binary search over byte lengths;
+    // the empty prefix fits because admission caps the objective.
+    let (mut lo, mut hi) = (0, text.len());
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(packet, text.floor_char_boundary(mid)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    fits(packet, text.floor_char_boundary(lo));
 }
 
 /// Execute an assess operator: batch evidence into child model calls.
@@ -97,8 +248,8 @@ pub fn execute_assess(
     assess: &AssessV1,
     registry: &mut HandleRegistry,
     plan_outputs: &std::collections::HashMap<String, HandleId>,
-    model: &dyn ModelBoundary,
-    child_calls_made: &mut u16,
+    call_child: &mut dyn FnMut(&EvidencePacket, &str) -> Result<String, ExecError>,
+    notes: &mut Vec<String>,
 ) -> Result<HandleId, ExecError> {
     let source_handle_id = resolve_input(&assess.input, plan_outputs)?;
     let source_obs = registry
@@ -111,60 +262,60 @@ pub fn execute_assess(
 
     // Select up to max_items observations.
     let selected_count = source_obs.len().min(assess.max_items as usize);
-    let batch_size = assess.batch_size as usize;
 
-    // Build allowlist of evidence IDs for this assess.
-    let allowlist: std::collections::HashSet<&str> = evidence_handles[..selected_count]
-        .iter()
-        .map(|eh| eh.id.as_str())
+    let items = (0..selected_count)
+        .map(|i| EvidenceItem {
+            item_id: format!("item_{i}"),
+            evidence_id: evidence_handles[i].id.clone(),
+            safe_text: source_obs[i].safe_text.clone(),
+            truncation: None,
+        })
         .collect();
-
-    // Collect all child assessments.
-    let mut all_assessments: Vec<ItemAssessmentV1> = Vec::new();
-
-    for chunk_start in (0..selected_count).step_by(batch_size) {
-        let chunk_end = (chunk_start + batch_size).min(selected_count);
-        let packet_id = format!("pkt_{}_{}", assess.op_id, chunk_start);
-
-        let items: Vec<EvidenceItem> = (chunk_start..chunk_end)
-            .map(|i| EvidenceItem {
-                item_id: format!("item_{i}"),
-                evidence_id: evidence_handles[i].id.clone(),
-                safe_text: source_obs[i].safe_text.clone(),
-            })
-            .collect();
-
-        let packet = EvidencePacket {
-            packet_id: packet_id.clone(),
-            items,
-        };
-
-        let child_result = model
-            .child_call(&packet, &assess.objective)
-            .map_err(ExecError::Model)?;
-        *child_calls_made += 1;
-
-        // Validate child response: packet_id must match, all citation IDs in allowlist.
-        for assessment in &child_result.assessments {
-            for claim in &assessment.claims {
-                for ev_id in claim.supports.iter().chain(claim.contradicts.iter()) {
-                    if !allowlist.contains(ev_id.as_str()) {
-                        return Err(ExecError::ChildAllowlistViolation {
-                            item_id: assessment.item_id.clone(),
-                            bad_evidence_id: ev_id.clone(),
-                        });
-                    }
-                }
+    let mut assessments = Vec::with_capacity(selected_count);
+    for packet in &packets(&assess.objective, items) {
+        let raw = call_child(packet, &assess.objective)?;
+        match check_child_result(packet, &raw) {
+            Ok(slots) => assessments.extend(slots),
+            // The other packets' verdicts stand; this one's items stay
+            // unassessed and the root is told why.
+            Err(why) => {
+                let mut note = format!("{}: child result for {} rejected: {why}", assess.op_id, packet.packet_id);
+                // It quotes the model's ids, which only the 16 KiB body cap bounds.
+                note.truncate(note.floor_char_boundary(NOTE_MAX));
+                notes.push(note);
+                assessments.extend(packet.items.iter().map(|_| None));
             }
         }
-
-        all_assessments.extend(child_result.assessments);
     }
 
-    // Store the assessment result — reuse the same observations for now.
-    // The assessment metadata is carried in the child results, not in observations.
     let assessed_obs = source_obs[..selected_count].to_vec();
-    Ok(registry.insert_assessment_set(assessed_obs))
+    Ok(registry.insert_assessment_set(assessed_obs, assessments))
+}
+
+/// Execute a select operator: the items of an assessment set whose verdict
+/// is one of `select.verdicts`, in order. Unassessed items never pass.
+pub fn execute_select(
+    select: &SelectV1,
+    registry: &mut HandleRegistry,
+    plan_outputs: &std::collections::HashMap<String, HandleId>,
+) -> Result<HandleId, ExecError> {
+    let source = resolve_input(&select.input, plan_outputs)?;
+    let handle = registry.get(&source).ok_or_else(|| ExecError::HandleNotFound(source.clone()))?;
+    // Plan admission checks plan outputs; a handle from an earlier turn
+    // is checked here.
+    if handle.kind != HandleKind::AssessmentSet {
+        return Err(ExecError::WrongKind { handle: source, expected: HandleKind::AssessmentSet });
+    }
+    let observations = registry.get_observations(&source).unwrap_or_default();
+    let assessments = registry.get_assessments(&source).unwrap_or_default();
+    let picked = observations
+        .iter()
+        .zip(assessments)
+        .filter(|(_, a)| a.as_ref().is_some_and(|a| select.verdicts.contains(&a.verdict)))
+        .map(|(o, _)| o.clone())
+        .take(select.limit as usize)
+        .collect();
+    Ok(registry.insert_evidence_set(picked))
 }
 
 /// Resolve an InputRefV1 to a HandleId.
@@ -187,7 +338,7 @@ mod tests {
     use crate::domain::{Observation, ObservationKind, Provenance};
     use crate::import::SourceKind;
     use crate::rlm::evidence::HandleRegistry;
-    use crate::rlm::validate::HandleKind;
+    use crate::rlm::model::ModelBoundary;
     use crate::store::{Cursor, Store};
     use std::collections::HashMap;
 
@@ -235,7 +386,7 @@ mod tests {
             limit: 50,
         };
 
-        let hid = execute_search(&store, &search, &mut registry).unwrap();
+        let hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         let handle = registry.get(&hid).unwrap();
         assert_eq!(handle.kind, HandleKind::EvidenceSet);
         assert_eq!(handle.count, 2);
@@ -260,7 +411,7 @@ mod tests {
             limit: 5,
         };
 
-        let hid = execute_search(&store, &search, &mut registry).unwrap();
+        let hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         assert_eq!(registry.get(&hid).unwrap().count, 5);
     }
 
@@ -284,7 +435,7 @@ mod tests {
             match_mode: MatchMode::Any,
             limit: 10,
         };
-        let s_hid = execute_search(&store, &search, &mut registry).unwrap();
+        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         assert_eq!(registry.get(&s_hid).unwrap().count, 1);
 
         // Expand around it.
@@ -299,7 +450,7 @@ mod tests {
         let mut plan_outputs = HashMap::new();
         plan_outputs.insert("s1".to_string(), s_hid);
 
-        let e_hid = execute_expand(&store, &expand, &mut registry, &plan_outputs).unwrap();
+        let e_hid = execute_expand(&store, &expand, &mut registry, &plan_outputs, &Arc::default()).unwrap();
         let obs = registry.get_observations(&e_hid).unwrap();
 
         // Should have ordinals 22..=28 (7 items: 3 before + center + 3 after)
@@ -327,7 +478,7 @@ mod tests {
             match_mode: MatchMode::Any,
             limit: 10,
         };
-        let s_hid = execute_search(&store, &search, &mut registry).unwrap();
+        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         assert_eq!(registry.get(&s_hid).unwrap().count, 2);
 
         let expand = ExpandV1 {
@@ -341,13 +492,87 @@ mod tests {
         let mut plan_outputs = HashMap::new();
         plan_outputs.insert("s1".to_string(), s_hid);
 
-        let e_hid = execute_expand(&store, &expand, &mut registry, &plan_outputs).unwrap();
+        let e_hid = execute_expand(&store, &expand, &mut registry, &plan_outputs, &Arc::default()).unwrap();
         let obs = registry.get_observations(&e_hid).unwrap();
 
         // Ordinals 8..=13 — no duplicates despite overlapping windows.
         let ordinals: Vec<i64> = obs.iter().map(|o| o.ordinal).collect();
         let unique: std::collections::HashSet<i64> = ordinals.iter().copied().collect();
         assert_eq!(ordinals.len(), unique.len(), "no duplicates");
+    }
+
+    #[test]
+    fn a_too_broad_search_is_an_empty_set_and_a_note() {
+        let mut store = Store::open_memory().unwrap();
+        let rev_id = seed_store(&mut store);
+        let cmds: Vec<String> = (0..2_000).map(|i| format!("cargo cmd_{i}")).collect();
+        insert_commands(&mut store, rev_id, &cmds.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into()], match_mode: MatchMode::Any, limit: 50 };
+
+        let spent = Budget { deadline: std::time::Instant::now(), cancel: None };
+        let mut notes = Vec::new();
+        let hid = execute_search(&store, &search, &mut registry, &spent, &mut notes).unwrap();
+        assert_eq!(registry.get(&hid).unwrap().count, 0);
+        assert!(notes.len() == 1 && notes[0].starts_with("s1: query too broad"), "{notes:?}");
+
+        // A plan built on it runs on: expanding nothing finds nothing.
+        let expand = ExpandV1 {
+            op_id: "e1".into(),
+            input: InputRefV1::Handle(hid),
+            scope: ExpandScope::SameSource,
+            before: 2,
+            after: 2,
+            limit: 10,
+        };
+        let e_hid = execute_expand(&store, &expand, &mut registry, &HashMap::new(), &Arc::default()).unwrap();
+        assert_eq!(registry.get(&e_hid).unwrap().count, 0);
+    }
+
+    // --- Batching ---
+
+    fn item(i: usize, text: String) -> EvidenceItem {
+        EvidenceItem { item_id: format!("item_{i}"), evidence_id: format!("ev1_{i:016x}"), safe_text: text, truncation: None }
+    }
+
+    #[test]
+    fn packets_hold_at_most_four_items_and_24_kib_in_order() {
+        let sizes = [10, 10, 9000, 9000, 9000, 10, 30_000, 10, 10, 10, 10, 10];
+        let items: Vec<_> = sizes.iter().enumerate().map(|(i, &n)| item(i, "x".repeat(n))).collect();
+        let packets = packets("objective", items.clone());
+
+        // Worked by hand: a 5th item or a 3rd 9000-byte one starts a packet,
+        // and the 30 000-byte item fills one alone.
+        let counts: Vec<usize> = packets.iter().map(|p| p.items.len()).collect();
+        assert_eq!(counts, [4, 2, 1, 4, 1]);
+        for p in &packets {
+            assert!(packet_bytes("objective", p) <= CHILD_PACKET_MAX, "{} is over", p.packet_id);
+        }
+        let sent: Vec<&EvidenceItem> = packets.iter().flat_map(|p| &p.items).collect();
+        for (sent, original) in sent.iter().zip(&items) {
+            assert_eq!(sent.item_id, original.item_id);
+            if sent.item_id != "item_6" {
+                assert_eq!((&sent.safe_text, &sent.truncation), (&original.safe_text, &None));
+            }
+        }
+        let ids: std::collections::HashSet<_> = packets.iter().map(|p| &p.packet_id).collect();
+        assert_eq!(ids.len(), packets.len(), "packet ids are distinct");
+    }
+
+    #[test]
+    fn an_item_over_the_cap_is_sent_cut_and_marked() {
+        // Two-byte chars, so a cut at an odd byte would split one.
+        let text = "é".repeat(15 * 1024);
+        let packets = packets("objective", vec![item(0, text.clone())]);
+        let [packet] = packets.as_slice() else { panic!("one packet, got {}", packets.len()) };
+        let sent = &packet.items[0];
+        let t = sent.truncation.as_ref().expect("marked as truncated");
+        assert_eq!(t.original_bytes, 30 * 1024);
+        assert_eq!(t.sent_bytes, sent.safe_text.len());
+        assert!(text.starts_with(&sent.safe_text));
+        // As much as fits: within one char of the cap, not cut to nothing.
+        let bytes = packet_bytes("objective", packet);
+        assert!(bytes <= CHILD_PACKET_MAX && bytes > CHILD_PACKET_MAX - 2, "{bytes} bytes");
     }
 
     // --- Assess tests ---
@@ -371,10 +596,10 @@ mod tests {
             match_mode: MatchMode::Any,
             limit: 50,
         };
-        let s_hid = execute_search(&store, &search, &mut registry).unwrap();
+        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         assert_eq!(registry.get(&s_hid).unwrap().count, 8);
 
-        // Set up fake model with 2 handlers (8 items / batch_size 4 = 2 calls).
+        // The host batches 4 small items per call: 2 calls.
         let model = FakeModel::new();
         model.add_child_response(FakeModel::default_supports_handler());
         model.add_child_response(FakeModel::default_supports_handler());
@@ -384,7 +609,6 @@ mod tests {
             input: InputRefV1::Output("s1".to_string()),
             objective: "find build tasks".to_string(),
             max_items: 8,
-            batch_size: 4,
         };
 
         let mut plan_outputs = HashMap::new();
@@ -395,8 +619,11 @@ mod tests {
             &assess,
             &mut registry,
             &plan_outputs,
-            &model,
-            &mut child_calls,
+            &mut |p, o| {
+                child_calls += 1;
+                model.child_call(p, o).map_err(ExecError::Model)
+            },
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -410,59 +637,90 @@ mod tests {
     }
 
     #[test]
-    fn assess_rejects_bad_citation_in_child_response() {
+    fn child_result_rejected_whole_on_any_fault() {
+        let packet = EvidencePacket { packet_id: "pkt_00".into(), items: vec![item(0, "a".into()), item(1, "b".into())] };
+        let (ev0, ev1) = (packet.items[0].evidence_id.clone(), packet.items[1].evidence_id.clone());
+        let good = serde_json::json!({"version": 1, "packet_id": "pkt_00", "assessments": [
+            {"item_id": "item_0", "verdict": "supports", "confidence": "high",
+             "claims": [{"text": "t", "supports": [ev0], "contradicts": [ev1]}]},
+            {"item_id": "item_1", "verdict": "irrelevant", "confidence": "low", "claims": []},
+        ]});
+        let with = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = good.clone();
+            edit(&mut v);
+            check_child_result(&packet, &v.to_string())
+        };
+
+        let verdicts = |r: Result<Vec<Option<ItemAssessmentV1>>, _>| {
+            r.unwrap().into_iter().map(|a| a.map(|a| a.verdict)).collect::<Vec<_>>()
+        };
+        assert_eq!(verdicts(with(&|_| {})), [Some(Verdict::Supports), Some(Verdict::Irrelevant)]);
+        let omitted = with(&|v| drop(v["assessments"].as_array_mut().unwrap().pop()));
+        assert_eq!(verdicts(omitted), [Some(Verdict::Supports), None], "a skipped item is unassessed");
+
+        let foreign = item(9, String::new()).evidence_id;
+        assert_eq!(with(&|v| v["packet_id"] = "pkt_01".into()), Err(ChildRejection::PacketId("pkt_01".into())));
+        assert_eq!(with(&|v| v["version"] = 2.into()), Err(ChildRejection::Version(2)));
+        assert_eq!(
+            with(&|v| v["assessments"][1]["item_id"] = "item_9".into()),
+            Err(ChildRejection::UnknownItem("item_9".into()))
+        );
+        assert_eq!(
+            with(&|v| v["assessments"][1]["item_id"] = "item_0".into()),
+            Err(ChildRejection::DuplicateItem("item_0".into()))
+        );
+        let cited = |field: &'static str| {
+            with(&|v| v["assessments"][0]["claims"][0][field] = serde_json::json!([foreign]))
+        };
+        let outside = Err(ChildRejection::Citation { item_id: "item_0".into(), evidence_id: foreign.clone() });
+        assert_eq!(cited("supports"), outside);
+        assert_eq!(cited("contradicts"), outside);
+        assert!(matches!(
+            with(&|v| v["assessments"][1]["note"] = "x".into()),
+            Err(ChildRejection::Malformed(e)) if e.contains("unknown field")
+        ));
+        // A valid result padded past the cap: refused for its size alone.
+        let padded = format!("{good}{}", " ".repeat(CHILD_RESULT_MAX));
+        assert_eq!(check_child_result(&packet, &padded), Err(ChildRejection::Oversize { bytes: padded.len() }));
+    }
+
+    #[test]
+    fn a_rejected_child_result_leaves_its_packet_unassessed() {
         use crate::rlm::model::FakeModel;
 
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
-        insert_commands(&mut store, rev_id, &["cargo build"]);
-
+        let cmds: Vec<String> = (0..8).map(|i| format!("cargo task_{i}")).collect();
+        insert_commands(&mut store, rev_id, &cmds.iter().map(String::as_str).collect::<Vec<_>>());
         let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
-        let search = SearchV1 {
-            op_id: "s1".to_string(),
-            terms: vec!["cargo".to_string()],
-            match_mode: MatchMode::Any,
-            limit: 10,
-        };
-        let s_hid = execute_search(&store, &search, &mut registry).unwrap();
+        let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into()], match_mode: MatchMode::Any, limit: 50 };
+        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
+        // Packet 1's evidence, which packet 0's child was never sent.
+        let other_packet = registry.get_evidence_handles(&s_hid).unwrap()[4].id.clone();
 
-        // Fake model returns a citation that's not in the allowlist.
         let model = FakeModel::new();
-        model.add_child_response(|packet: &EvidencePacket| ChildResultV1 {
-            version: 1,
-            packet_id: packet.packet_id.clone(),
-            assessments: vec![ItemAssessmentV1 {
-                item_id: "item_0".to_string(),
-                verdict: Verdict::Supports,
-                confidence: Confidence::High,
-                claims: vec![ClaimV1 {
-                    text: "forged claim".to_string(),
-                    supports: vec!["ev1_FORGED".to_string()],
-                    contradicts: vec![],
-                }],
-                missing: vec![],
-            }],
+        let honest = FakeModel::default_supports_handler();
+        model.add_child_response(move |p| {
+            let mut r = honest(p);
+            r.assessments[0].claims[0].supports.push(other_packet.clone());
+            r
         });
+        model.add_child_response(FakeModel::default_supports_handler());
 
-        let assess = AssessV1 {
-            op_id: "a1".to_string(),
-            input: InputRefV1::Output("s1".to_string()),
-            objective: "test".to_string(),
-            max_items: 1,
-            batch_size: 1,
-        };
-        let mut plan_outputs = HashMap::new();
-        plan_outputs.insert("s1".to_string(), s_hid);
-
-        let mut child_calls = 0u16;
-        let result = execute_assess(
+        let assess = AssessV1 { op_id: "a1".into(), input: InputRefV1::Handle(s_hid), objective: "o".into(), max_items: 8 };
+        let mut notes = Vec::new();
+        let a_hid = execute_assess(
             &assess,
             &mut registry,
-            &plan_outputs,
-            &model,
-            &mut child_calls,
-        );
+            &HashMap::new(),
+            &mut |p, o| model.child_call(p, o).map_err(ExecError::Model),
+            &mut notes,
+        )
+        .unwrap();
 
-        assert!(matches!(result, Err(ExecError::ChildAllowlistViolation { .. })));
+        let verdicts: Vec<_> = registry.get_assessments(&a_hid).unwrap().iter().map(|a| a.as_ref().map(|a| a.verdict.clone())).collect();
+        assert_eq!(verdicts, [vec![None; 4], vec![Some(Verdict::Supports); 4]].concat());
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("pkt_00") && notes[0].contains("not in the packet"), "{}", notes[0]);
     }
 }

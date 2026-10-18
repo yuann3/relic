@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
 use crate::rlm::evidence::{HandleId, HandleRegistry};
 use crate::rlm::executor::{self, ExecError};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary, ModelError};
 use crate::rlm::protocol::*;
-use crate::rlm::validate::{self, ValidationError};
+use crate::rlm::validate::{self, HandleKind, Op, ValidationError};
 use crate::store::Store;
 
 /// Terminal result of an investigation.
@@ -23,7 +25,19 @@ pub enum InvestigationStatus {
     Partial,
     Abstained,
     BudgetExhausted,
+    Cancelled,
     Failed(String),
+}
+
+/// What an investigation is doing, for a progress display; the UI maps it
+/// to its own events (ADR 0009).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Progress {
+    RootCall { turn: u32 },
+    Op { op_id: String },
+    ChildCall { op_id: String, packet_id: String },
+    /// A note to the root: a rejected child result or a too-broad search.
+    Note(String),
 }
 
 #[derive(Debug)]
@@ -43,171 +57,161 @@ impl std::fmt::Display for CoordinatorError {
 
 impl std::error::Error for CoordinatorError {}
 
-/// Run a bounded RLM investigation.
+/// What one investigation's steps share.
+struct Run<'a> {
+    store: &'a Store,
+    model: &'a dyn ModelBoundary,
+    registry: HandleRegistry,
+    ledger: BudgetLedger,
+    turns: u32,
+    child_calls: u16,
+    last_inspection: Option<EvidencePacket>,
+    /// What the host tells the root about the last plan, besides its handles.
+    notes: Vec<String>,
+    cancel: &'a Arc<AtomicBool>,
+    progress: &'a mut dyn FnMut(Progress),
+}
+
+impl Run<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// Run a bounded RLM investigation. Setting `cancel` from any thread stops
+/// it at the next admission point, or mid-statement in SQLite, with
+/// [`InvestigationStatus::Cancelled`].
 pub fn run_investigation(
     question: &str,
     store: &Store,
     model: &dyn ModelBoundary,
     budget: BudgetV1,
+    cancel: &Arc<AtomicBool>,
+    progress: &mut dyn FnMut(Progress),
 ) -> InvestigationResult {
     let investigation_id = 1u64; // Single investigation for prototype.
     let installation_key = b"prototype-key".to_vec();
 
-    let mut registry = HandleRegistry::new(
-        investigation_id,
-        installation_key,
-        budget.evidence_handles as usize,
-    );
-    let mut ledger = BudgetLedger::new(budget);
-    let mut state_version: u32 = 0;
-    let mut turns: u32 = 0;
-    let mut total_child_calls: u16 = 0;
-    let mut last_inspection: Option<EvidencePacket> = None;
+    let mut run = Run {
+        store,
+        model,
+        registry: HandleRegistry::new(investigation_id, installation_key, budget.evidence_handles as usize),
+        ledger: BudgetLedger::new(budget),
+        turns: 0,
+        child_calls: 0,
+        last_inspection: None,
+        notes: Vec::new(),
+        cancel,
+        progress,
+    };
+    let (status, finish) = investigate(&mut run, question);
+    InvestigationResult { status, finish, turns: run.turns, child_calls: run.child_calls }
+}
 
+fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<FinishV1>) {
+    let mut state_version: u32 = 0;
     loop {
+        if run.cancelled() {
+            return (InvestigationStatus::Cancelled, None);
+        }
         // Reserve budget for a root call.
-        if ledger.reserve(&Reservation {
-            root_calls: 1,
-            ..Default::default()
-        }).is_err() {
-            return InvestigationResult {
-                status: InvestigationStatus::BudgetExhausted,
-                finish: None,
-                turns,
-                child_calls: total_child_calls,
-            };
+        if run.ledger.reserve(&Reservation { root_calls: 1, ..Default::default() }).is_err() {
+            return (InvestigationStatus::BudgetExhausted, None);
         }
 
         // Build root state and call model.
         let state_json = build_root_state_json(
             question,
             state_version,
-            &registry,
-            &last_inspection,
-            &ledger,
-            store,
+            &run.registry,
+            &run.last_inspection,
+            &std::mem::take(&mut run.notes),
+            &run.ledger,
+            run.store,
         );
 
-        let action = match model.root_call(&state_json) {
+        (run.progress)(Progress::RootCall { turn: run.turns + 1 });
+        let action = match run.model.root_call(&state_json) {
             Ok(a) => a,
-            Err(e) => {
-                return InvestigationResult {
-                    status: InvestigationStatus::Failed(format!("model error: {e}")),
-                    finish: None,
-                    turns,
-                    child_calls: total_child_calls,
-                };
-            }
+            Err(e) => return (InvestigationStatus::Failed(format!("model error: {e}")), None),
         };
-        turns += 1;
+        run.turns += 1;
+        // A reply that lands after cancel is dropped, not acted on: a late
+        // finish must not pass for a completed investigation.
+        if run.cancelled() {
+            return (InvestigationStatus::Cancelled, None);
+        }
 
         match action.kind {
             RootActionKind::Plan => {
-                // Validate the plan.
                 let validated = match validate::validate_plan(&action, state_version) {
                     Ok(v) => v,
-                    Err(e) => {
-                        return InvestigationResult {
-                            status: InvestigationStatus::Failed(format!("validation: {e}")),
-                            finish: None,
-                            turns,
-                            child_calls: total_child_calls,
-                        };
-                    }
+                    Err(e) => return (InvestigationStatus::Failed(format!("validation: {e}")), None),
                 };
 
-                // Reserve budget for plan ops.
-                let op_count = validated.ops.len() as u16;
-                if ledger.reserve(&Reservation {
-                    plan_ops: op_count,
-                    ..Default::default()
-                }).is_err() {
-                    return InvestigationResult {
-                        status: InvestigationStatus::BudgetExhausted,
-                        finish: None,
-                        turns,
-                        child_calls: total_child_calls,
-                    };
+                // Admission caps a plan at 8 ops.
+                let plan_ops = u16::try_from(validated.ops.len()).unwrap_or(u16::MAX);
+                if run.ledger.reserve(&Reservation { plan_ops, ..Default::default() }).is_err() {
+                    return (InvestigationStatus::BudgetExhausted, None);
                 }
 
                 // Execute ops sequentially.
                 let mut plan_outputs: HashMap<String, HandleId> = HashMap::new();
-
                 for op in &validated.ops {
-                    match execute_op(
-                        op,
-                        store,
-                        &mut registry,
-                        &plan_outputs,
-                        model,
-                        &mut ledger,
-                        &mut total_child_calls,
-                        &mut last_inspection,
-                    ) {
+                    if run.cancelled() {
+                        return (InvestigationStatus::Cancelled, None);
+                    }
+                    (run.progress)(Progress::Op { op_id: validate::op_id(op).to_string() });
+                    let noted = run.notes.len();
+                    let out = execute_op(run, op, &plan_outputs);
+                    for note in &run.notes[noted..] {
+                        (run.progress)(Progress::Note(note.clone()));
+                    }
+                    match out {
                         Ok(Some((op_id, handle_id))) => {
                             plan_outputs.insert(op_id, handle_id);
                         }
                         Ok(None) => {}
-                        Err(e) => {
-                            return InvestigationResult {
-                                status: InvestigationStatus::Failed(format!("exec: {e}")),
-                                finish: None,
-                                turns,
-                                child_calls: total_child_calls,
-                            };
+                        Err(CoordinatorError::Execution(ExecError::Cancelled)) => {
+                            return (InvestigationStatus::Cancelled, None);
                         }
+                        Err(CoordinatorError::Budget(_) | CoordinatorError::Execution(ExecError::Budget(_))) => {
+                            return (InvestigationStatus::BudgetExhausted, None);
+                        }
+                        Err(e) => return (InvestigationStatus::Failed(format!("exec: {e}")), None),
                     }
                 }
 
+                if run.cancelled() {
+                    return (InvestigationStatus::Cancelled, None);
+                }
                 // Observation committed — increment state version.
                 state_version += 1;
             }
 
             RootActionKind::Finish => {
-                let finish = match action.finish {
-                    Some(f) => f,
-                    None => {
-                        return InvestigationResult {
-                            status: InvestigationStatus::Failed(
-                                "finish action missing finish body".into(),
-                            ),
-                            finish: None,
-                            turns,
-                            child_calls: total_child_calls,
-                        };
-                    }
+                let Some(finish) = action.finish else {
+                    return (InvestigationStatus::Failed("finish action missing finish body".into()), None);
                 };
-
                 let status = match finish.status {
                     AnswerStatus::Answered => InvestigationStatus::Completed,
                     AnswerStatus::Partial => InvestigationStatus::Partial,
                     AnswerStatus::Abstained => InvestigationStatus::Abstained,
                 };
-
-                return InvestigationResult {
-                    status,
-                    finish: Some(finish),
-                    turns,
-                    child_calls: total_child_calls,
-                };
+                return (status, Some(finish));
             }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_op(
-    op: &PlanOpV1,
-    store: &Store,
-    registry: &mut HandleRegistry,
+    run: &mut Run,
+    op: &Op,
     plan_outputs: &HashMap<String, HandleId>,
-    model: &dyn ModelBoundary,
-    ledger: &mut BudgetLedger,
-    child_calls: &mut u16,
-    last_inspection: &mut Option<EvidencePacket>,
 ) -> Result<Option<(String, HandleId)>, CoordinatorError> {
+    let Run { store, model, registry, ledger, child_calls, last_inspection, notes, cancel, progress, .. } = run;
     match op {
-        PlanOpV1::Search(s) => {
+        Op::Search(s) => {
             // Reserve rows.
             ledger
                 .reserve(&Reservation {
@@ -217,7 +221,8 @@ fn execute_op(
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let hid = executor::execute_search(store, s, registry)
+            let budget = crate::app::Budget { cancel: Some(Arc::clone(cancel)), ..crate::app::Budget::start() };
+            let hid = executor::execute_search(store, s, registry, &budget, notes)
                 .map_err(CoordinatorError::Execution)?;
 
             // Release unused row reservation.
@@ -230,7 +235,7 @@ fn execute_op(
             Ok(Some((s.op_id.clone(), hid)))
         }
 
-        PlanOpV1::Expand(e) => {
+        Op::Expand(e) => {
             ledger
                 .reserve(&Reservation {
                     rows_returned: e.limit as u64,
@@ -239,7 +244,7 @@ fn execute_op(
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let hid = executor::execute_expand(store, e, registry, plan_outputs)
+            let hid = executor::execute_expand(store, e, registry, plan_outputs, cancel)
                 .map_err(CoordinatorError::Execution)?;
 
             let actual = registry.get(&hid).map(|h| h.count as u64).unwrap_or(0);
@@ -251,26 +256,33 @@ fn execute_op(
             Ok(Some((e.op_id.clone(), hid)))
         }
 
-        PlanOpV1::Assess(a) => {
-            // Reserve child calls.
-            let batch_count =
-                (a.max_items as u16).div_ceil(a.batch_size as u16);
+        Op::Assess(a) => {
             ledger
                 .reserve(&Reservation {
-                    child_calls: batch_count,
                     evidence_handles: 1,
                     ..Default::default()
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let hid =
-                executor::execute_assess(a, registry, plan_outputs, model, child_calls)
-                    .map_err(CoordinatorError::Execution)?;
+            // One child call admitted at a time, so a later stop leaves the
+            // rest unsent.
+            let mut call_child = |packet: &EvidencePacket, objective: &str| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(ExecError::Cancelled);
+                }
+                ledger.reserve(&Reservation { child_calls: 1, ..Default::default() }).map_err(ExecError::Budget)?;
+                progress(Progress::ChildCall { op_id: a.op_id.clone(), packet_id: packet.packet_id.clone() });
+                let raw = model.child_call(packet, objective).map_err(ExecError::Model)?;
+                *child_calls += 1;
+                Ok(raw)
+            };
+            let hid = executor::execute_assess(a, registry, plan_outputs, &mut call_child, notes)
+                .map_err(CoordinatorError::Execution)?;
 
             Ok(Some((a.op_id.clone(), hid)))
         }
 
-        PlanOpV1::Inspect(i) => {
+        Op::Inspect(i) => {
             let source_hid = executor::resolve_input(&i.input, plan_outputs)
                 .map_err(CoordinatorError::Execution)?;
 
@@ -291,15 +303,13 @@ fn execute_op(
             let items: Vec<EvidenceItem> = (0..count)
                 .map(|idx| {
                     let text = &obs[idx].safe_text;
-                    let truncated = if text.len() > i.max_item_bytes as usize {
-                        &text[..i.max_item_bytes as usize]
-                    } else {
-                        text
-                    };
+                    let sent = text.floor_char_boundary(i.max_item_bytes as usize);
                     EvidenceItem {
                         item_id: format!("item_{idx}"),
                         evidence_id: ev_handles[idx].id.clone(),
-                        safe_text: truncated.to_string(),
+                        safe_text: text[..sent].to_string(),
+                        truncation: (sent < text.len())
+                            .then_some(TruncationV1 { original_bytes: text.len(), sent_bytes: sent }),
                     }
                 })
                 .collect();
@@ -312,9 +322,32 @@ fn execute_op(
             Ok(None) // Inspect doesn't produce a handle — it produces a root observation.
         }
 
-        // Relate, Combine, Select — not implemented in prototype.
-        _ => Ok(None),
+        Op::Select(k) => {
+            ledger
+                .reserve(&Reservation {
+                    evidence_handles: 1,
+                    ..Default::default()
+                })
+                .map_err(CoordinatorError::Budget)?;
+
+            let hid = executor::execute_select(k, registry, plan_outputs).map_err(CoordinatorError::Execution)?;
+
+            Ok(Some((k.op_id.clone(), hid)))
+        }
     }
+}
+
+/// How many items of an assessment set got each verdict. Unassessed items
+/// are counted apart, never as support (ADR 0009).
+fn verdict_counts(slots: &[Option<ItemAssessmentV1>]) -> serde_json::Value {
+    let count = |v: Option<Verdict>| slots.iter().filter(|s| s.as_ref().map(|a| a.verdict.clone()) == v).count();
+    serde_json::json!({
+        "supports": count(Some(Verdict::Supports)),
+        "contradicts": count(Some(Verdict::Contradicts)),
+        "unclear": count(Some(Verdict::Unclear)),
+        "irrelevant": count(Some(Verdict::Irrelevant)),
+        "unassessed": count(None),
+    })
 }
 
 /// Build a JSON root state for the model. Must stay under 64 KiB.
@@ -323,6 +356,7 @@ fn build_root_state_json(
     state_version: u32,
     registry: &HandleRegistry,
     last_inspection: &Option<EvidencePacket>,
+    notes: &[String],
     ledger: &BudgetLedger,
     store: &Store,
 ) -> String {
@@ -335,12 +369,17 @@ fn build_root_state_json(
         "state_version": state_version,
         "corpus": { "observation_count": obs_count },
         "handles": summaries.iter().map(|s| {
-            serde_json::json!({
+            let mut h = serde_json::json!({
                 "id": s.id,
                 "kind": format!("{:?}", s.kind),
                 "count": s.count,
-            })
+            });
+            if let Some(slots) = registry.get_assessments(&s.id).filter(|_| s.kind == HandleKind::AssessmentSet) {
+                h["verdicts"] = verdict_counts(slots);
+            }
+            h
         }).collect::<Vec<_>>(),
+        "notes": notes,
         "budget_remaining": {
             "root_calls": remaining.root_calls,
             "child_calls": remaining.child_calls,
@@ -350,16 +389,7 @@ fn build_root_state_json(
     });
 
     if let Some(inspection) = last_inspection {
-        state["last_inspection"] = serde_json::json!({
-            "packet_id": inspection.packet_id,
-            "items": inspection.items.iter().map(|item| {
-                serde_json::json!({
-                    "item_id": item.item_id,
-                    "evidence_id": item.evidence_id,
-                    "safe_text": item.safe_text,
-                })
-            }).collect::<Vec<_>>(),
-        });
+        state["last_inspection"] = serde_json::json!(inspection);
     }
 
     serde_json::to_string(&state).unwrap_or_default()
@@ -433,7 +463,6 @@ mod tests {
                         input: InputRefV1::Output("e1".to_string()),
                         objective: "identify certificate renewal steps".to_string(),
                         max_items: 8,
-                        batch_size: 4,
                     }),
                     PlanOpV1::Inspect(InspectV1 {
                         op_id: "i1".to_string(),
@@ -483,6 +512,8 @@ mod tests {
             &store,
             &model,
             budget,
+            &Arc::default(),
+            &mut |_| {},
         );
 
         // Core assertions for the wayfinder question:
@@ -495,6 +526,176 @@ mod tests {
         assert_eq!(finish.status, AnswerStatus::Answered);
         assert!(!finish.claims.is_empty());
         assert!(!finish.procedure.is_empty());
+    }
+
+    /// Run search `certbot` -> assess -> select `verdicts` -> inspect with
+    /// `child` judging, and return the root state the finish turn saw.
+    fn select_through(
+        child: impl Fn(&EvidencePacket) -> ChildResultV1 + Send + 'static,
+        verdicts: Vec<Verdict>,
+    ) -> serde_json::Value {
+        let mut store = Store::open_memory().unwrap();
+        seed_corpus(&mut store);
+        let model = FakeModel::new();
+        let op = |json: serde_json::Value| serde_json::from_value::<PlanOpV1>(json).unwrap();
+        model.add_root_response(RootActionV1 {
+            version: 1,
+            expected_state_version: 0,
+            kind: RootActionKind::Plan,
+            plan: Some(PlanV1 {
+                ops: vec![
+                    op(serde_json::json!({"op": "search", "op_id": "s1", "terms": ["certbot"], "match": "any", "limit": 10})),
+                    op(serde_json::json!({"op": "assess", "op_id": "a1", "input": {"output": "s1"}, "objective": "renewal", "max_items": 8})),
+                    op(serde_json::json!({"op": "select", "op_id": "k1", "input": {"output": "a1"}, "verdicts": verdicts, "limit": 20})),
+                    op(serde_json::json!({"op": "inspect", "op_id": "i1", "input": {"output": "k1"}, "limit": 8, "max_item_bytes": 2048})),
+                ],
+            }),
+            finish: None,
+        });
+        model.add_child_response(child);
+        model.add_root_response(RootActionV1 {
+            version: 1,
+            expected_state_version: 1,
+            kind: RootActionKind::Finish,
+            plan: None,
+            finish: Some(FinishV1 {
+                status: AnswerStatus::Abstained,
+                answer: String::new(),
+                claims: vec![],
+                procedure: vec![],
+                contradictions: vec![],
+                missing: vec!["test".into()],
+            }),
+        });
+        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
+        assert_eq!(result.status, InvestigationStatus::Abstained);
+        serde_json::from_str(&model.root_states()[1]).unwrap()
+    }
+
+    /// Judge `certbot renew` with `renew` and `certbot status` with `status`;
+    /// `None` leaves an item out of the result.
+    fn judge(renew: Option<Verdict>, status: Option<Verdict>) -> impl Fn(&EvidencePacket) -> ChildResultV1 + Send {
+        move |p| ChildResultV1 {
+            version: 1,
+            packet_id: p.packet_id.clone(),
+            assessments: p
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let verdict = if item.safe_text.contains("renew") { renew.clone() } else { status.clone() };
+                    Some(ItemAssessmentV1 {
+                        item_id: item.item_id.clone(),
+                        verdict: verdict?,
+                        confidence: Confidence::High,
+                        claims: vec![],
+                        missing: vec![],
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn inspected(state: &serde_json::Value) -> Vec<&str> {
+        state["last_inspection"]["items"].as_array().unwrap().iter().map(|i| i["safe_text"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn select_passes_on_the_items_with_the_chosen_verdicts() {
+        use Verdict::*;
+        let state = select_through(judge(Some(Supports), Some(Irrelevant)), vec![Supports]);
+        assert_eq!(inspected(&state), ["certbot renew --nginx -d example.com"]);
+        // One verdict flipped, nothing else changed.
+        let state = select_through(judge(Some(Irrelevant), Some(Irrelevant)), vec![Supports]);
+        assert_eq!(inspected(&state), Vec::<&str>::new());
+        let state = select_through(judge(Some(Irrelevant), Some(Supports)), vec![Supports]);
+        assert_eq!(inspected(&state), ["certbot status"]);
+    }
+
+    #[test]
+    fn an_item_the_child_skipped_never_passes_select() {
+        use Verdict::*;
+        let state = select_through(judge(Some(Contradicts), None), vec![Supports, Contradicts, Unclear, Irrelevant]);
+        assert_eq!(inspected(&state), ["certbot renew --nginx -d example.com"]);
+        let assessed = state["handles"].as_array().unwrap().iter().find(|h| h["kind"] == "AssessmentSet").unwrap();
+        assert_eq!(
+            assessed["verdicts"],
+            serde_json::json!({"supports": 0, "contradicts": 1, "unclear": 0, "irrelevant": 0, "unassessed": 1})
+        );
+    }
+
+    fn plan(ops: serde_json::Value) -> RootActionV1 {
+        serde_json::from_value(serde_json::json!({"version": 1, "expected_state_version": 0, "kind": "plan", "plan": {"ops": ops}})).unwrap()
+    }
+
+    #[test]
+    fn cancel_before_the_start_makes_no_root_call() {
+        let mut store = Store::open_memory().unwrap();
+        seed_corpus(&mut store);
+        let model = FakeModel::new();
+        model.add_root_response(plan(serde_json::json!([{"op": "search", "op_id": "s1", "terms": ["certbot"], "match": "any", "limit": 5}])));
+
+        let mut events = Vec::new();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &cancel, &mut |p| events.push(p));
+        assert_eq!((result.status, result.turns), (InvestigationStatus::Cancelled, 0));
+        assert!(model.root_states().is_empty() && events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_root_reply_after_cancel_is_dropped() {
+        let mut store = Store::open_memory().unwrap();
+        seed_corpus(&mut store);
+        let model = FakeModel::new();
+        let finish = FinishV1 {
+            status: AnswerStatus::Abstained,
+            answer: String::new(),
+            claims: vec![],
+            procedure: vec![],
+            contradictions: vec![],
+            missing: vec!["m".into()],
+        };
+        model.add_root_response(RootActionV1 { version: 1, expected_state_version: 0, kind: RootActionKind::Finish, plan: None, finish: Some(finish) });
+
+        // Ctrl-C while the root call is out.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &cancel, &mut |_| cancel.store(true, Ordering::Relaxed));
+        assert_eq!(model.root_states().len(), 1, "the call was made");
+        assert_eq!(result.status, InvestigationStatus::Cancelled);
+        assert!(result.finish.is_none());
+    }
+
+    #[test]
+    fn cancel_during_a_child_call_admits_no_other() {
+        let mut store = Store::open_memory().unwrap();
+        seed_corpus(&mut store);
+        let model = FakeModel::new();
+        // 8 items: two packets of 4.
+        model.add_root_response(plan(serde_json::json!([
+            {"op": "search", "op_id": "s1", "terms": ["generic"], "match": "any", "limit": 8},
+            {"op": "assess", "op_id": "a1", "input": {"output": "s1"}, "objective": "o", "max_items": 8},
+        ])));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let honest = FakeModel::default_supports_handler();
+        let flag = Arc::clone(&cancel);
+        // Ctrl-C while the first child is out.
+        model.add_child_response(move |p| {
+            flag.store(true, Ordering::Relaxed);
+            honest(p)
+        });
+        model.add_child_response(FakeModel::default_supports_handler());
+
+        let mut events = Vec::new();
+        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &cancel, &mut |p| events.push(p));
+        assert_eq!((result.status, result.child_calls), (InvestigationStatus::Cancelled, 1));
+        assert_eq!(
+            events,
+            [
+                Progress::RootCall { turn: 1 },
+                Progress::Op { op_id: "s1".into() },
+                Progress::Op { op_id: "a1".into() },
+                Progress::ChildCall { op_id: "a1".into(), packet_id: "pkt_00".into() },
+            ]
+        );
     }
 
     #[test]
@@ -531,6 +732,7 @@ mod tests {
                     item_id: format!("item_{i}"),
                     evidence_id: format!("ev1_{i:016x}"),
                     safe_text: format!("Long command text for item {i} with extra detail"),
+                    truncation: None,
                 })
                 .collect(),
         };
@@ -540,6 +742,7 @@ mod tests {
             3,
             &registry,
             &Some(inspection),
+            &[],
             &ledger,
             &store,
         );
@@ -577,7 +780,7 @@ mod tests {
         let mut budget = BudgetV1::prototype_default();
         budget.root_calls = 0;
 
-        let result = run_investigation("test", &store, &model, budget);
+        let result = run_investigation("test", &store, &model, budget, &Arc::default(), &mut |_| {});
         assert_eq!(result.status, InvestigationStatus::BudgetExhausted);
         assert_eq!(result.turns, 0);
     }
@@ -608,6 +811,8 @@ mod tests {
             &store,
             &model,
             BudgetV1::prototype_default(),
+            &Arc::default(),
+            &mut |_| {},
         );
         assert_eq!(result.status, InvestigationStatus::Abstained);
         assert_eq!(result.turns, 1);
