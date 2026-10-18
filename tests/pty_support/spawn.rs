@@ -13,13 +13,17 @@
 //! passes SIGHUP on to the job, as zsh and bash do when a terminal window
 //! closes; [`Hup::Ignore`] is `nohup`, where the program has to notice the
 //! dead terminal by itself.
+//!
+//! Like a shell with job control, the supervisor takes the terminal back
+//! when the job stops, and on [`Supervised::fg`] hands it back and sends
+//! SIGCONT.
 
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,6 +34,13 @@ pub enum Hup {
 
 /// The job's process group, for the supervisor's SIGHUP handler.
 static JOB: AtomicI32 = AtomicI32::new(0);
+
+/// Set by SIGUSR1: the test asked for `fg`.
+static FG: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_fg(_: libc::c_int) {
+    FG.store(true, Ordering::SeqCst);
+}
 
 extern "C" fn forward_hup(_: libc::c_int) {
     let job = JOB.load(Ordering::SeqCst);
@@ -128,6 +139,12 @@ impl Supervised {
         // each value with one 4-byte write, which a pipe delivers whole.
         let n = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 4) };
         (n == 4).then(|| i32::from_ne_bytes(b))
+    }
+
+    /// The shell's `fg`: the job gets the terminal back and SIGCONT.
+    pub fn fg(&self) {
+        // SAFETY: kill(2) to the supervisor, which handles SIGUSR1.
+        unsafe { libc::kill(self.sup, libc::SIGUSR1) };
     }
 
     pub fn kill(&self, sig: libc::c_int) {
@@ -239,10 +256,25 @@ unsafe fn supervise(
             JOB.store(pid, Ordering::SeqCst);
             libc::signal(libc::SIGHUP, forward_hup as *const () as libc::sighandler_t);
         }
+        libc::signal(libc::SIGUSR1, request_fg as *const () as libc::sighandler_t);
         say(pid);
         let mut st = 0;
-        // EINTR when SIGHUP arrives: keep waiting for the job.
-        while libc::waitpid(pid, &mut st, 0) == -1 {}
+        // Polled, so an `fg` request is seen whenever it arrives.
+        let tick = libc::timespec { tv_sec: 0, tv_nsec: 5_000_000 };
+        loop {
+            if FG.swap(false, Ordering::SeqCst) {
+                libc::tcsetpgrp(slave, pid);
+                libc::kill(-pid, libc::SIGCONT);
+            }
+            match libc::waitpid(pid, &mut st, libc::WNOHANG | libc::WUNTRACED) {
+                0 | -1 => {}
+                _ if libc::WIFSTOPPED(st) => {
+                    libc::tcsetpgrp(slave, libc::getpgrp());
+                }
+                _ => break,
+            }
+            libc::nanosleep(&tick, std::ptr::null_mut());
+        }
         say(st);
         let mut b = 0u8;
         libc::read(control, (&raw mut b).cast(), 1);

@@ -106,7 +106,7 @@ mod tui {
         s.with(|o| assert!(!o.screen.in_alt(), "{}", pty_support::dump(o)));
         // Re-entering the alternate screen blanks it: only a full redraw
         // brings the rows back.
-        s.signal(libc::SIGCONT);
+        s.fg();
         s.wait_screen("fixture-cmd-40");
         s.with(|o| assert!(o.screen.in_alt(), "{}", pty_support::dump(o)));
         // Typing works again: the reader was resumed.

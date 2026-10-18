@@ -266,12 +266,15 @@ impl Session {
         }
     }
 
-    /// Waits until the job is stopped (Ctrl-Z), as `ps` reports it.
+    /// Waits until the job is stopped (Ctrl-Z) and the shell has taken the
+    /// terminal back, as `ps` reports them.
     pub fn wait_stopped(&mut self) {
         let pid = self.pid().to_string();
         while Instant::now() < self.deadline {
-            let out = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid]).output().unwrap();
-            if String::from_utf8_lossy(&out.stdout).trim_start().starts_with('T') {
+            let out = std::process::Command::new("ps").args(["-o", "stat=,tpgid=", "-p", &pid]).output().unwrap();
+            let out = String::from_utf8_lossy(&out.stdout);
+            let mut fields = out.split_whitespace();
+            if fields.next().is_some_and(|st| st.starts_with('T')) && fields.next() != Some(pid.as_str()) {
                 return;
             }
             if let Some(s) = self.try_exit() {
@@ -365,6 +368,11 @@ impl Session {
 
     pub fn signal(&self, sig: libc::c_int) {
         self.proc.kill(sig);
+    }
+
+    /// The shell's `fg` after Ctrl-Z.
+    pub fn fg(&self) {
+        self.proc.fg();
     }
 
     /// Closes every master fd: the terminal disconnects.
