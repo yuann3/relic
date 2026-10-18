@@ -17,12 +17,9 @@ pub enum ExecError {
     HandleNotFound(String),
     /// A handle reference named a set of the wrong kind for its operator.
     WrongKind { handle: String, expected: HandleKind },
-    Model(crate::rlm::model::ModelError),
     Budget(BudgetExhausted),
     /// The investigation's cancel flag was set.
     Cancelled,
-    /// A request the egress seam refused for its size.
-    Egress(String),
 }
 
 /// Why a child result was rejected whole (ADR 0009).
