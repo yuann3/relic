@@ -5,9 +5,9 @@ mod fake_fzf;
 use std::time::Duration;
 
 use fake_fzf::{FakeFzf, page};
-use relic::picker::{PickError, pick_with};
+use relic::picker::{Pick, PickError, PickMode, pick_with};
 
-fn protocol_error(r: Result<Option<i64>, PickError>) -> String {
+fn protocol_error(r: Result<Pick, PickError>) -> String {
     match r {
         Err(PickError::Protocol(m)) => m,
         other => panic!("expected a protocol error, got {other:?}"),
@@ -18,7 +18,7 @@ fn protocol_error(r: Result<Option<i64>, PickError>) -> String {
 fn returns_the_selected_page_member() {
     let fzf =
         FakeFzf::new("cat > \"$D/stdin\"; printf '12\\t2023-11-14 22:13\\tzsh\\tanything\\0'");
-    assert_eq!(pick_with(&page(&[11, 12, 13]), &fzf.path).unwrap(), Some(12));
+    assert_eq!(pick_with(&page(&[11, 12, 13]), &fzf.path, PickMode::Inline).unwrap(), Pick::Chosen(12));
     fzf.assert_reaped();
 }
 
@@ -27,23 +27,23 @@ fn sends_fixed_argv_and_never_the_query() {
     let fzf = FakeFzf::new("cat > \"$D/stdin\"; printf '11\\t\\0'");
     let mut p = page(&[11]);
     p.query = "deploy --prod $(rm -rf ~)".into();
-    pick_with(&p, &fzf.path).unwrap();
+    let fixed = [
+        "--read0",
+        "--print0",
+        "--no-multi",
+        "--delimiter=\t",
+        "--with-nth=2..",
+        "--nth=2..",
+        "--layout=reverse",
+        "--border",
+    ];
+    pick_with(&p, &fzf.path, PickMode::Inline).unwrap();
     let argv = fzf.argv();
-    assert_eq!(
-        argv,
-        [
-            "--read0",
-            "--print0",
-            "--no-multi",
-            "--delimiter=\t",
-            "--with-nth=2..",
-            "--nth=2..",
-            "--height=80%",
-            "--layout=reverse",
-            "--border",
-        ]
-    );
+    assert_eq!(argv, [&fixed[..], &["--height=80%"]].concat());
     assert!(!argv.iter().any(|a| a.contains("deploy")));
+    // Full screen: fzf takes its own alternate screen, not the shell's.
+    pick_with(&p, &fzf.path, PickMode::FullScreen).unwrap();
+    assert_eq!(fzf.argv(), fixed);
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn records_are_nul_framed_sanitized_and_capped() {
     p.hits[1].observed_at_ms = None;
     p.hits[2].text = "€".repeat(1000); // 3 bytes each: the cap falls mid-char
     p.hits[3].text = "plain".into();
-    assert_eq!(pick_with(&p, &fzf.path).unwrap(), None);
+    assert_eq!(pick_with(&p, &fzf.path, PickMode::Inline).unwrap(), Pick::Cancelled);
 
     let stdin = fzf.read("stdin");
     assert_eq!(stdin.last(), Some(&0));
@@ -63,7 +63,7 @@ fn records_are_nul_framed_sanitized_and_capped() {
     let fields = |r: &[u8]| -> Vec<String> {
         String::from_utf8(r.to_vec()).unwrap().split('\t').map(String::from).collect()
     };
-    assert_eq!(fields(records[0]), ["1", "2023-11-14 22:13", "zsh", "a b c d\u{FFFD}e\u{FFFD}[31mf\u{FFFD}g\u{FFFD}h\u{FFFD}i j"]);
+    assert_eq!(fields(records[0]), ["1", "2023-11-14 22:13", "zsh", "a b c d?e?[31mf?g?h?i j"]);
     assert_eq!(fields(records[1])[1], "unknown time");
     assert!(records[2].len() < 2048, "record plus NUL fits 2 KiB: {}", records[2].len());
     assert!(records[2].len() > 2048 - 4, "cap wastes at most one partial char");
@@ -73,10 +73,10 @@ fn records_are_nul_framed_sanitized_and_capped() {
 }
 
 #[test]
-fn cancel_and_no_match_are_not_errors() {
-    for code in [130, 1] {
+fn cancel_and_no_match_are_distinct_and_not_errors() {
+    for (code, want) in [(130, Pick::Cancelled), (1, Pick::NoMatch)] {
         let fzf = FakeFzf::new(&format!("exit {code}"));
-        assert_eq!(pick_with(&page(&[1]), &fzf.path).unwrap(), None, "exit {code}");
+        assert_eq!(pick_with(&page(&[1]), &fzf.path, PickMode::Inline).unwrap(), want, "exit {code}");
         fzf.assert_reaped();
     }
 }
@@ -84,7 +84,7 @@ fn cancel_and_no_match_are_not_errors() {
 #[test]
 fn fzf_failure_is_a_protocol_error() {
     let fzf = FakeFzf::new("printf '1\\t\\0'; exit 2");
-    assert!(protocol_error(pick_with(&page(&[1]), &fzf.path)).contains("exit status: 2"));
+    assert!(protocol_error(pick_with(&page(&[1]), &fzf.path, PickMode::Inline)).contains("exit status: 2"));
     fzf.assert_reaped();
 }
 
@@ -103,7 +103,7 @@ fn rejects_malformed_selections() {
     ];
     for (body, want) in cases {
         let fzf = FakeFzf::new(body);
-        let msg = protocol_error(pick_with(&page(&[1, 2]), &fzf.path));
+        let msg = protocol_error(pick_with(&page(&[1, 2]), &fzf.path, PickMode::Inline));
         assert!(msg.contains(want), "{body}: {msg}");
         fzf.assert_reaped();
     }
@@ -118,8 +118,8 @@ fn early_exit_without_reading_stdin_still_selects() {
         h.text = "x".repeat(400);
     }
     assert_eq!(
-        fake_fzf::within(Duration::from_secs(10), move || pick_with(&p, &fzf.path)).unwrap(),
-        Some(4999)
+        fake_fzf::within(Duration::from_secs(10), move || pick_with(&p, &fzf.path, PickMode::Inline)).unwrap(),
+        Pick::Chosen(4999)
     );
 }
 
@@ -138,7 +138,7 @@ fn oversize_output_is_cut_off_and_the_child_reaped() {
             h.text = "x".repeat(400);
         }
         let path = fzf.path.clone();
-        let r = fake_fzf::within(Duration::from_secs(10), move || pick_with(&p, &path));
+        let r = fake_fzf::within(Duration::from_secs(10), move || pick_with(&p, &path, PickMode::Inline));
         assert!(protocol_error(r).contains("more than 2048 bytes"), "{body}");
         fzf.assert_reaped();
     }
@@ -155,8 +155,8 @@ fn version_gate() {
         ("", false),
     ] {
         let fzf = FakeFzf::with_version(version, "printf '1\\t\\0'");
-        match pick_with(&page(&[1]), &fzf.path) {
-            Ok(Some(1)) if ok => {}
+        match pick_with(&page(&[1]), &fzf.path, PickMode::Inline) {
+            Ok(Pick::Chosen(1)) if ok => {}
             Err(PickError::TooOld { found, minimum }) if !ok => {
                 assert_eq!(minimum, "0.27.2");
                 assert_eq!(
@@ -173,7 +173,7 @@ fn version_gate() {
 #[test]
 fn failing_version_probe_is_unknown() {
     let fzf = FakeFzf::new_raw("echo 0.74.4; exit 2");
-    match pick_with(&page(&[1]), &fzf.path) {
+    match pick_with(&page(&[1]), &fzf.path, PickMode::Inline) {
         Err(PickError::TooOld { found, .. }) => assert_eq!(found, "unknown"),
         other => panic!("{other:?}"),
     }
@@ -182,6 +182,6 @@ fn failing_version_probe_is_unknown() {
 #[test]
 fn missing_binary_is_unavailable() {
     let dir = tempfile::tempdir().unwrap();
-    let r = pick_with(&page(&[1]), &dir.path().join("fzf"));
+    let r = pick_with(&page(&[1]), &dir.path().join("fzf"), PickMode::Inline);
     assert!(matches!(r, Err(PickError::Unavailable)), "{r:?}");
 }

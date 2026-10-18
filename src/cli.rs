@@ -6,13 +6,19 @@ use std::path::PathBuf;
 
 use crate::import::SourceKind;
 
-pub const USAGE: &str = "\
+// `concat!` takes only literals, so the `ui` line is spliced in by a macro:
+// a headless build must not advertise a command it cannot run.
+macro_rules! usage {
+    ($ui:literal) => {
+        concat!(
+            "\
 relic — recall what you did in the terminal, with evidence
 
 USAGE:
     relic search <QUERY>... [--db PATH] [--limit N] [--prefix] [--rank] [--json | --fzf]
-    relic ui [--db PATH]
-    relic import <HISTORY_FILE> [--shell zsh|bash] [--db PATH]
+",
+            $ui,
+            "    relic import <HISTORY_FILE> [--shell zsh|bash] [--db PATH]
     relic forget <ID>... [--db PATH]
     relic --help | --version
 
@@ -31,7 +37,23 @@ OPTIONS:
     --shell       History format for import. Default: what the file was imported
                   as before, else what its content or name shows. A --shell
                   that differs from the stored one replaces that file's records
-";
+
+EXIT STATUS:
+    0             Success; search found a match
+    1             Search found no match, or nothing matched in fzf
+    2             Error, including bad arguments, a busy store and a query
+                  with nothing to search for
+    130           The fzf picker was cancelled
+    128+n         Killed by signal n
+"
+        )
+    };
+}
+
+#[cfg(feature = "tui")]
+pub const USAGE: &str = usage!("    relic ui [--db PATH]\n");
+#[cfg(not(feature = "tui"))]
+pub const USAGE: &str = usage!("");
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -76,6 +98,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             let mut db = None;
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
+                    "-h" | "--help" => return Ok(Command::Help),
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
                     _ => return Err(format!("unexpected argument for ui: {a}")),
                 }
@@ -86,6 +109,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             let (mut path, mut shell, mut db) = (None, None, None);
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
+                    "-h" | "--help" => return Ok(Command::Help),
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
                     "--shell" => {
                         shell = Some(match value(&mut args, "--shell")?.as_str() {
@@ -106,6 +130,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             let (mut ids, mut db) = (Vec::new(), None);
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
+                    "-h" | "--help" => return Ok(Command::Help),
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
                     f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
                     // As the TUI shows it (`#42`) or bare.
@@ -135,6 +160,7 @@ fn parse_search(
         match a.as_str() {
             _ if options_done => words.push(a),
             "--" => options_done = true,
+            "-h" | "--help" => return Ok(Command::Help),
             "--db" => db = Some(value(&mut args, "--db")?.into()),
             "--limit" => {
                 let n: usize = value(&mut args, "--limit")?
@@ -192,8 +218,11 @@ fn resolve_db_from(
     if let Some(p) = explicit.or_else(|| nonempty("RELIC_DB").map(PathBuf::from)) {
         return Ok(p);
     }
+    // The XDG spec says to ignore a relative value; honouring it would put the
+    // database wherever the command happened to run.
     let data = nonempty("XDG_DATA_HOME")
         .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
         .or_else(|| nonempty("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .ok_or("cannot locate a database: pass --db or set RELIC_DB")?;
     Ok(data.join("relic").join("relic.db"))
@@ -220,6 +249,29 @@ mod tests {
         assert_eq!(p(&["-h"]).unwrap(), Command::Help);
         assert_eq!(p(&["--help"]).unwrap(), Command::Help);
         assert_eq!(p(&["--version"]).unwrap(), Command::Version);
+    }
+
+    #[test]
+    fn usage_lists_ui_only_when_built_with_it() {
+        assert_eq!(USAGE.contains("relic ui"), cfg!(feature = "tui"));
+    }
+
+    #[test]
+    fn subcommands_accept_help_flags() {
+        for args in [
+            &["ui", "--help"][..],
+            &["ui", "--db", "x.db", "-h"],
+            &["import", "--help"],
+            &["import", "h.txt", "-h"],
+            &["forget", "--help"],
+            &["forget", "7", "-h"],
+            &["search", "--help"],
+            &["search", "git", "-h", "--db", "x.db"],
+        ] {
+            assert_eq!(p(args), Ok(Command::Help), "{args:?}");
+        }
+        // After `--` it is a query word like any other.
+        assert_eq!(search(&["search", "--", "-h"]).query, "-h");
     }
 
     #[test]
@@ -280,5 +332,8 @@ mod tests {
             PathBuf::from("/h/.local/share/relic/relic.db")
         );
         assert!(resolve_db_from(None, env(&[])).is_err());
+        let relative = env(&[("XDG_DATA_HOME", "rel"), ("HOME", "/h")]);
+        assert_eq!(resolve_db_from(None, relative).unwrap(), PathBuf::from("/h/.local/share/relic/relic.db"));
+        assert!(resolve_db_from(None, env(&[("XDG_DATA_HOME", "rel")])).is_err());
     }
 }

@@ -198,7 +198,7 @@ fn forget_deletes_a_record_for_good_and_says_so() {
 
     // Forgetting it again is an error that names it; so is an id never seen.
     let (code, stderr) = relic(dir.path(), &["forget", &id.to_string(), "--db", "data/relic.db"]);
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains(&format!("no such record: #{id}")), "{stderr}");
 
     // An unchanged or appended-to file does not bring it back.

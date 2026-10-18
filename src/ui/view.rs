@@ -20,6 +20,12 @@ pub const MIN_HEIGHT: u16 = 10;
 /// Under this width the three columns become named panes switched with Tab.
 pub const NARROW_WIDTH: u16 = 100;
 const MAX_STEPS_SHOWN: usize = 8;
+/// Characters of a command one list row looks at; a row shows at most a
+/// pane's width. The whole of a 1 MiB command took ~40 ms every frame.
+const ROW_CHARS: usize = 1024;
+/// Bytes of a command the evidence pane wraps, for the same reason. The
+/// rest is counted on screen, not silently dropped.
+const EVIDENCE_BYTES: usize = 16 * 1024;
 
 
 struct Theme {
@@ -60,9 +66,37 @@ impl Theme {
 }
 
 pub fn view(frame: &mut Frame, m: &UiModel) {
+    workspace(frame, m);
+    if m.ascii {
+        for cell in frame.buffer_mut().content.iter_mut() {
+            if !cell.symbol().is_ascii() {
+                let c = ascii_for(cell.symbol());
+                cell.set_char(c);
+            }
+        }
+    }
+}
+
+/// What a terminal in a non-UTF-8 locale gets for a symbol it cannot show.
+fn ascii_for(symbol: &str) -> char {
+    match symbol {
+        "─" | "━" => '-',
+        "│" | "┃" => '|',
+        "┌" | "┐" | "└" | "┘" | "┏" | "┓" | "┗" | "┛" => '+',
+        "…" => '.',
+        "·" => '-',
+        "→" => '>',
+        "↑" => '^',
+        "↓" => 'v',
+        _ => '?',
+    }
+}
+
+fn workspace(frame: &mut Frame, m: &UiModel) {
     let t = Theme::new(m.mono);
     let area = frame.area();
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+    m.too_small.set(area.width < MIN_WIDTH || area.height < MIN_HEIGHT);
+    if m.too_small.get() {
         let msg = format!(
             "terminal too small ({}x{}); relic needs at least {MIN_WIDTH}x{MIN_HEIGHT}. Ctrl-C twice quits.",
             area.width, area.height
@@ -150,18 +184,40 @@ fn query_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let focused = m.focus == Focus::Query;
     let block = pane(t, "Query · local index · offline".into(), focused);
     let inner = block.inner(area);
-    let mut spans = vec![
-        Span::styled("> ", t.title),
-        Span::raw(display_line(&m.query)),
-    ];
+    // Room after the prompt, keeping a cell for the cursor.
+    let shown = tail(&display_line(&m.query), usize::from(inner.width).saturating_sub(3));
+    let mut spans = vec![Span::styled("> ", t.title), Span::raw(shown.clone())];
     if m.query.is_empty() {
         spans.push(Span::styled("type to search your history", t.dim));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     if focused && m.modal.is_none() {
-        let x = inner.x + 2 + ratatui::text::Line::raw(display_line(&m.query)).width() as u16;
+        let x = inner.x + 2 + Line::raw(shown).width() as u16;
         frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
     }
+}
+
+/// The start of `text` a list row can show, neutralized.
+fn row_text(text: &str) -> String {
+    text.chars().take(ROW_CHARS).map(crate::app::display_char).collect()
+}
+
+/// The end of `text` that fits in `room` columns, behind '…' when cut:
+/// typing and Backspace act at the end, so the end must stay in view.
+fn tail(text: &str, room: usize) -> String {
+    if Line::raw(text).width() <= room {
+        return text.to_string();
+    }
+    let (mut width, mut start) = (1, text.len());
+    for (i, c) in text.char_indices().rev() {
+        let w = Span::raw(&text[i..i + c.len_utf8()]).width();
+        if width + w > room {
+            break;
+        }
+        width += w;
+        start = i;
+    }
+    format!("…{}", &text[start..])
 }
 
 fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
@@ -223,7 +279,7 @@ fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
                 Span::styled(h.when().label(), t.dim),
                 Span::raw(format!(" {:<5} ", h.source)),
             ];
-            spans.extend(safe_spans(&display_line(&h.text), t));
+            spans.extend(safe_spans(&row_text(&h.text), t));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -231,8 +287,11 @@ fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         .block(block)
         .highlight_style(t.selected)
         .highlight_symbol("> ");
-    let mut state = ListState::default().with_selected(Some(s.selected));
+    let mut state = ListState::default()
+        .with_offset(s.list_offset.get())
+        .with_selected(Some(s.selected));
     frame.render_stateful_widget(list, area, &mut state);
+    s.list_offset.set(state.offset());
 }
 
 fn timeline(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
@@ -263,7 +322,7 @@ fn timeline(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             };
             // Month-day is enough beside neighbors; the detail pane has the year.
             let mut spans = vec![mark, Span::styled(v.when(o).short(), t.dim), Span::raw(" ")];
-            spans.extend(safe_spans(&display_line(&o.safe_text), t));
+            spans.extend(safe_spans(&row_text(&o.safe_text), t));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -271,8 +330,11 @@ fn timeline(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         .block(pane(t, title, focused))
         .highlight_style(t.selected)
         .highlight_symbol("> ");
-    let mut state = ListState::default().with_selected(Some(m.evidence.cursor));
+    let mut state = ListState::default()
+        .with_offset(m.evidence.list_offset.get())
+        .with_selected(Some(m.evidence.cursor));
     frame.render_stateful_widget(list, area, &mut state);
+    m.evidence.list_offset.set(state.offset());
 }
 
 fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
@@ -313,8 +375,18 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         Line::raw(""),
         Line::styled("exact text, redacted at import:", t.title),
     ];
-    for l in o.safe_text.split('\n') {
+    let shown = o.safe_text.floor_char_boundary(EVIDENCE_BYTES);
+    for l in o.safe_text[..shown].split('\n') {
         lines.push(Line::from(safe_spans(&display_line(l), t)));
+    }
+    if shown < o.safe_text.len() {
+        lines.push(Line::styled(
+            format!(
+                "… {} more bytes not shown; `relic search --json` prints all of it",
+                o.safe_text.len() - shown
+            ),
+            t.dim,
+        ));
     }
     let inner = block.inner(area);
     let p = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
@@ -382,9 +454,12 @@ fn recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             lines.push(Line::styled("Enter here opens the cited evidence", t.dim));
         }
     }
-    let p = Paragraph::new(Text::from(lines))
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let inner = block.inner(area);
+    let p = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let rows = p.line_count(inner.width);
+    let max = u16::try_from(rows.saturating_sub(usize::from(inner.height))).unwrap_or(u16::MAX);
+    r.scroll_max.set(max);
+    let p = p.block(block).scroll((r.scroll.unwrap_or(max).min(max), 0));
     frame.render_widget(p, area);
 }
 
@@ -418,10 +493,10 @@ fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     }
     let hints = match m.focus {
         Focus::Query => {
-            "type to search · ↑/↓ select · Enter open · Tab pane (then ? help) · ^F fzf · ^R recall · Esc quit"
+            "↑/↓ select · Enter open · Tab pane, then ? help · ^F fzf · ^R recall · Esc quit"
         }
         _ => {
-            "j/k move · Enter open · Tab pane · / search · f fzf · r recall · ? help · Esc back · q quit"
+            "j/k move · Enter open · Tab pane · / search · f fzf · r recall · ? help · q quit"
         }
     };
     let [a, b] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
@@ -441,6 +516,7 @@ fn help(frame: &mut Frame, t: &Theme, area: Rect) {
         ("r  or ^R", "start (asks first) or cancel a recall"),
         ("Esc", "close dialog, cancel recall, back, then quit"),
         ("^C ^C", "cancel or clear; twice within 1 s quits"),
+        ("^Z", "suspend to the shell; fg comes back"),
         ("q", "quit when not typing"),
     ];
     let lines: Vec<Line> = rows
@@ -715,6 +791,54 @@ mod tests {
         }
     }
 
+    /// The list scrolls only when the highlight reaches an edge: moving
+    /// back up from the bottom moves the highlight, not the rows.
+    #[test]
+    fn the_highlight_moves_inside_a_scrolled_list() {
+        let rows: Vec<String> = (0..60).map(|i| format!("echo row-{i:02}")).collect();
+        let store = store_with(&rows.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut m = typed(&store, "", false);
+        drive(&mut m, &store, UiAction::Start);
+        drive(&mut m, &store, UiAction::Key(Key::Tab));
+        let mut screen = |m: &UiModel| {
+            term.draw(|f| view(f, m)).unwrap();
+            text(term.backend().buffer())
+        };
+        let row_of = |s: &str, needle: &str| s.lines().position(|l| l.contains(needle));
+        for _ in 0..25 {
+            drive(&mut m, &store, UiAction::Key(Key::Char('j')));
+            screen(&m);
+        }
+        let s = screen(&m);
+        let bottom = row_of(&s, ">  2023").unwrap();
+        for _ in 0..3 {
+            drive(&mut m, &store, UiAction::Key(Key::Char('k')));
+        }
+        let s = screen(&m);
+        assert_eq!(row_of(&s, ">  2023"), Some(bottom - 3), "{s}");
+        assert_eq!(row_of(&s, "row-34"), Some(bottom), "the rows stayed put:\n{s}");
+    }
+
+    /// At 80 columns the hints end in how to quit, and a long query keeps
+    /// its end, where typing happens, in view.
+    #[test]
+    fn hints_fit_80_columns_and_a_long_query_shows_its_end() {
+        let store = store_with(NGINX);
+        let long = "certbot renew --deploy-hook 'systemctl reload nginx' --cert-name example.com zz";
+        let mut m = typed(&store, long, false);
+        let s = text(&render(&m, 80, 24));
+        let lines: Vec<&str> = s.lines().collect();
+        assert!(lines[1].contains("…") && lines[1].contains("example.com zz"), "{s}");
+        assert!(lines[23].trim_end().ends_with("Esc quit"), "{s}");
+        drive(&mut m, &store, UiAction::Key(Key::Tab));
+        let s = text(&render(&m, 80, 24));
+        assert!(s.lines().last().unwrap().trim_end().ends_with("q quit"), "{s}");
+        // A query that fits is shown whole, with no '…'.
+        let s = text(&render(&typed(&store, "certb", false), 80, 24));
+        assert!(s.contains("> certb") && !s.contains('…'), "{s}");
+    }
+
     #[test]
     fn narrow_layout_switches_named_panes_with_tab() {
         let store = store_with(NGINX);
@@ -768,6 +892,38 @@ mod tests {
         // short one: one line of text wraps to many rows here.
         let s = text(&render(&m, 100, 14));
         assert!(s.contains("TAILWORD"), "{s}");
+    }
+
+    /// A command longer than the pane wraps is cut at a stated point, and
+    /// the pane says how much it left out.
+    #[test]
+    fn evidence_counts_the_bytes_of_a_huge_command_it_does_not_show() {
+        let long = format!("huge {}", "x".repeat(EVIDENCE_BYTES * 3));
+        let store = store_with(&["ls", &long]);
+        let mut m = typed(&store, "huge", false);
+        drive(&mut m, &store, UiAction::Key(Key::Enter));
+        render(&m, 120, 40);
+        for _ in 0..2000 {
+            drive(&mut m, &store, UiAction::Key(Key::PageDown));
+        }
+        let s = text(&render(&m, 120, 40));
+        let left_out = long.len() - EVIDENCE_BYTES;
+        assert!(s.contains(&format!("… {left_out} more bytes not shown")), "{s}");
+    }
+
+    /// In a non-UTF-8 locale every cell is ASCII, and the frame keeps its
+    /// shape: corners, edges and separators have ASCII stand-ins.
+    #[test]
+    fn a_non_utf8_locale_draws_ascii() {
+        let store = store_with(&["echo 部署 café", "ls"]);
+        let mut m = typed(&store, "echo", false);
+        m.ascii = true;
+        let s = text(&render(&m, 120, 30));
+        assert!(s.is_ascii(), "{s}");
+        let first = s.lines().next().unwrap();
+        assert!(first.starts_with("+[ Query - local index - offline ]---") && first.ends_with('+'), "{s}");
+        // A wide glyph keeps its two columns, so the rows stay aligned.
+        assert!(s.contains("echo ??  caf?"), "{s}");
     }
 
     #[test]
@@ -860,6 +1016,7 @@ mod tests {
             deferred: None,
             words_dropped: 0,
             order: crate::app::Order::RecentlyImported,
+            filtered: true,
             hits: vec![hit],
         };
         let generation = m.search.generation;
@@ -1007,6 +1164,16 @@ mod tests {
         ] {
             assert!(s.contains(want), "missing {want:?} in\n{s}");
         }
+
+        // At 120x26 the pane is shorter than its text: it follows the end,
+        // so the finding is in view, and k scrolls back to the start.
+        let s = text(&render(&m, 120, 26));
+        assert!(s.contains("claim-end") && !s.contains("status: finished"), "{s}");
+        for _ in 0..20 {
+            drive(&mut m, &store, UiAction::Key(Key::Char('k')));
+        }
+        let s = text(&render(&m, 120, 26));
+        assert!(s.contains("status: finished") && !s.contains("claim-end"), "{s}");
     }
 
     #[test]

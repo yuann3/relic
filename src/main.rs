@@ -2,11 +2,12 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use relic::app::{self, Budget, MatchMode, Order, SearchError, SearchRequest};
+use relic::app::{self, Budget, MatchMode, Order, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
 use relic::import::{History, ImportError, ImportResult, Outcome, SourceKind};
-use relic::picker::PickError;
-use relic::store::{Store, StoreError};
+use relic::picker::{Pick, PickError, PickMode};
+use relic::store::Store;
+use serde::Serialize;
 
 fn main() -> ExitCode {
     // Before anything is created: the database, its WAL, the key and any file
@@ -16,7 +17,8 @@ fn main() -> ExitCode {
     let cmd = match cli::parse(std::env::args_os().skip(1)) {
         Ok(cmd) => cmd,
         Err(e) => {
-            eprintln!("relic: {e}\n\n{}", cli::USAGE);
+            // Parse errors quote argv, which is as hostile as history text.
+            eprintln!("relic: {}\n\n{}", app::display_line(&e), cli::USAGE);
             return ExitCode::from(2);
         }
     };
@@ -24,12 +26,8 @@ fn main() -> ExitCode {
         Ok(code) => code,
         // `relic search … | head` closing the pipe early is not a failure.
         Err(e) if broken_pipe(e.as_ref()) => ExitCode::SUCCESS,
-        // Whichever command met the busy store: "could not look", not "found nothing".
-        Err(e) if matches!(e.downcast_ref(), Some(StoreError::Busy)) => could_not_look(e.as_ref()),
-        Err(e) => {
-            eprintln!("relic: {e}");
-            ExitCode::FAILURE
-        }
+        // Exit 1 is "found nothing"; any error is "could not look" (ADR 0011).
+        Err(e) => could_not_look(e.as_ref()),
     }
 }
 
@@ -45,13 +43,14 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn run(cmd: Command) -> Result<ExitCode> {
     match cmd {
-        Command::Help => print!("{}", cli::USAGE),
+        // `print!` panics on a closed pipe; a write error reaches `broken_pipe`.
+        Command::Help => std::io::stdout().lock().write_all(cli::USAGE.as_bytes())?,
         Command::Version => {
             // The gate harness reads the build from here: nothing else tells a
             // headless, full or debug binary apart from outside.
             let build = if cfg!(feature = "tui") { "tui" } else { "headless" };
             let debug = if cfg!(debug_assertions) { ", debug" } else { "" };
-            println!("relic {} ({build}{debug})", env!("CARGO_PKG_VERSION"));
+            writeln!(std::io::stdout().lock(), "relic {} ({build}{debug})", env!("CARGO_PKG_VERSION"))?;
         }
         Command::Search(args) => return search(args),
         Command::Ui { db } => ui(&existing_db(db)?)?,
@@ -87,12 +86,12 @@ fn run(cmd: Command) -> Result<ExitCode> {
             tighten(&db, owns_dir);
             let r = match import(&db, &history, shell) {
                 Err(ImportError::Busy) => {
-                    eprintln!("relic: busy: another import is writing {}; try again", db.display());
+                    eprintln!("relic: busy: another import is writing {}; try again", shown(&db));
                     return Ok(ExitCode::from(2));
                 }
                 r => r?,
             };
-            let (name, n) = (path.display(), r.records_stored);
+            let (name, n) = (shown(&path), r.records_stored);
             if r.rescrubbed > 0 {
                 eprintln!(
                     "relic: redaction rules changed since they were stored: re-redacted {} stored commands",
@@ -121,11 +120,11 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 eprintln!("relic: note: {name}: the last record is incomplete and was not stored");
             }
             if let Some(warning) = &r.key_warning {
-                eprintln!("relic: note: {warning}");
+                eprintln!("relic: note: {}", app::display_line(warning));
             }
             match r.outcome {
                 Outcome::Unchanged => eprintln!("{name}: unchanged since last import"),
-                Outcome::First => eprintln!("{name}: stored {n} {} commands in {}", r.kind, db.display()),
+                Outcome::First => eprintln!("{name}: stored {n} {} commands in {}", r.kind, shown(&db)),
                 Outcome::Appended => eprintln!("{name}: added {n} new commands"),
                 Outcome::Aligned => {
                     eprintln!("{name}: the file was rewritten; added {n} new commands and kept the earlier ones")
@@ -159,11 +158,11 @@ fn tighten(db: &Path, owns_dir: bool) {
     for (path, mode) in dir.into_iter().chain(files) {
         let Ok(meta) = std::fs::metadata(&path) else { continue };
         if meta.uid() != me {
-            eprintln!("relic: warning: {} is owned by another user", path.display());
+            eprintln!("relic: warning: {} is owned by another user", shown(&path));
         } else if meta.mode() & 0o077 != 0
             && let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
         {
-            eprintln!("relic: warning: could not make {} owner-only: {e}", path.display());
+            eprintln!("relic: warning: could not make {} owner-only: {e}", shown(&path));
         }
     }
 }
@@ -185,14 +184,29 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
     let default_limit = if args.output == Output::Fzf { app::MAX_PAGE } else { 20 };
     let limit = args.limit.unwrap_or(default_limit);
     let req = SearchRequest { query: args.query, limit, mode, order };
-    let page = match app::search(&store, &req, &Budget::start()) {
-        Err(e @ (SearchError::TooBroad | SearchError::Cancelled)) => return Ok(could_not_look(&e)),
-        page => page?,
-    };
+    let page = app::search(&store, &req, &Budget::start())?;
+    // Recent commands are what a typing surface shows; to a script they would
+    // pass for matches. A query that searched nothing is a usage error.
+    if !page.filtered {
+        let why = match &page.deferred {
+            Some(w) if w.chars().any(char::is_alphanumeric) => format!(
+                "\"{}\" is too short; type {}+ characters",
+                app::display_line(w),
+                app::MIN_PREFIX_CHARS
+            ),
+            _ if page.words_dropped > 0 => format!(
+                "every word was ignored: a query uses at most {} words of at most {} parts each",
+                app::MAX_QUERY_WORDS,
+                app::MAX_WORD_TOKENS
+            ),
+            _ => "search matches words of letters or digits".into(),
+        };
+        return Err(format!("nothing to search for in \"{}\": {why}", app::display_line(&page.query)).into());
+    }
     let mut out = std::io::stdout().lock();
     match args.output {
         Output::Json => {
-            serde_json::to_writer(&mut out, &page)?;
+            page.serialize(&mut serde_json::Serializer::with_formatter(&mut out, TerminalSafe))?;
             writeln!(out)?;
         }
         Output::Text => print_page(&mut out, &page)?,
@@ -206,9 +220,11 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
             page_notes(&page);
-            let id = match relic::picker::pick(&page) {
-                Ok(Some(id)) => id,
-                Ok(None) => return Ok(ExitCode::from(130)),
+            relic::signal::install();
+            let id = match relic::picker::pick(&page, PickMode::Inline) {
+                Ok(Pick::Chosen(id)) => id,
+                Ok(Pick::NoMatch) => return Ok(ExitCode::FAILURE),
+                Ok(Pick::Cancelled) => return Ok(ExitCode::from(130)),
                 // The picker is optional: indexed results are still complete.
                 Err(e @ (PickError::Unavailable | PickError::TooOld { .. })) => {
                     eprintln!("relic: {e}");
@@ -232,8 +248,36 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
 
 /// "Could not look" is not "nothing found": exit 2, not 1 (ADR 0011).
 fn could_not_look(e: &dyn std::error::Error) -> ExitCode {
-    eprintln!("relic: {e}");
+    // Errors carry paths and argv; neither may drive the terminal.
+    eprintln!("relic: {}", app::display_line(&e.to_string()));
     ExitCode::from(2)
+}
+
+/// A path as it may reach the terminal.
+fn shown(path: &Path) -> String {
+    app::display_line(&path.display().to_string())
+}
+
+/// serde_json escapes only what JSON requires, so C1 controls, bidi overrides
+/// and line separators would reach a terminal that shows the output raw.
+/// Escaping whatever `display_char` neutralizes keeps the decoded text exact.
+struct TerminalSafe;
+
+impl serde_json::ser::Formatter for TerminalSafe {
+    fn write_string_fragment<W: ?Sized + Write>(&mut self, w: &mut W, fragment: &str) -> std::io::Result<()> {
+        let mut start = 0;
+        for (i, c) in fragment.char_indices() {
+            if app::display_char(c) == c {
+                continue;
+            }
+            w.write_all(&fragment.as_bytes()[start..i])?;
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                write!(w, "\\u{unit:04x}")?;
+            }
+            start = i + c.len_utf8();
+        }
+        w.write_all(&fragment.as_bytes()[start..])
+    }
 }
 
 fn print_page(out: &mut impl Write, page: &app::SearchPage) -> Result<()> {

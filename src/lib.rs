@@ -7,6 +7,7 @@ pub mod key;
 pub mod picker;
 pub mod redact;
 pub mod rlm;
+pub mod signal;
 pub mod source;
 pub mod store;
 #[cfg(feature = "tui")]

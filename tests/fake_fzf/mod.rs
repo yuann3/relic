@@ -70,6 +70,7 @@ pub fn page(ids: &[i64]) -> SearchPage {
         deferred: None,
         words_dropped: 0,
         order: relic::app::Order::RecentlyImported,
+        filtered: true,
         hits: ids
             .iter()
             .map(|&id| PageHit {

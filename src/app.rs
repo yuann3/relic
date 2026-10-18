@@ -126,6 +126,10 @@ pub struct SearchPage {
     /// [`MAX_WORD_TOKENS`] tokens.
     pub words_dropped: usize,
     pub order: Order,
+    /// A word was searched. When none was, the hits are not matches: they
+    /// are the most recently imported commands a typing surface shows.
+    #[serde(skip)]
+    pub filtered: bool,
     pub hits: Vec<PageHit>,
 }
 
@@ -247,6 +251,7 @@ pub fn search(store: &Store, req: &SearchRequest, budget: &Budget) -> Result<Sea
         deferred,
         words_dropped,
         order,
+        filtered: !words.is_empty(),
         hits: hits
             .into_iter()
             .map(|h| PageHit {

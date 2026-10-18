@@ -14,6 +14,7 @@ pub const PAGE_LIMIT: usize = 200;
 /// Bounds the query so a huge paste cannot become a huge FTS expression.
 pub const QUERY_MAX_CHARS: usize = 256;
 pub const DOUBLE_INTERRUPT: Duration = Duration::from_secs(1);
+const INTERRUPT_HINT: &str = "press Ctrl-C again within 1 s to quit";
 
 /// Budget the confirmation promises. The fake recall stays inside it so the
 /// meter reads like the real one will.
@@ -101,6 +102,8 @@ pub enum UiAction {
         event: RecallEvent,
     },
     InputClosed,
+    /// Ctrl-Z, but SIGTSTP was ignored when Relic started.
+    SuspendRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +146,8 @@ pub enum UiEffect {
     CancelRecall {
         op: u64,
     },
+    /// Ctrl-Z: give the terminal back and stop until the shell's `fg`.
+    Suspend,
     Exit,
 }
 
@@ -159,6 +164,10 @@ pub struct SearchState {
     /// The newest query ran out of its budget, and `page` is still the one
     /// for an earlier query (ADR 0007).
     pub too_broad: bool,
+    /// First list row on screen, kept by the view between frames so the
+    /// highlight moves inside the pane and the list scrolls only at its
+    /// edges. Back to the top for each new page.
+    pub list_offset: Cell<usize>,
 }
 
 impl SearchState {
@@ -184,6 +193,8 @@ pub struct EvidenceState {
     /// back rather than `update` estimating and stopping short of the end.
     pub scroll_max: Cell<u16>,
     pub error: Option<String>,
+    /// Like [`SearchState::list_offset`], for the timeline.
+    pub list_offset: Cell<usize>,
 }
 
 impl EvidenceState {
@@ -238,6 +249,11 @@ pub struct RecallState {
     pub started_at: Option<Instant>,
     pub now: Option<Instant>,
     pub finding: Option<Finding>,
+    /// `None` follows the newest line, so progress and then the finding stay
+    /// in view; scrolling up pins a row until it is back at the end.
+    pub scroll: Option<u16>,
+    /// Like [`EvidenceState::scroll_max`]: only the view knows the wrap.
+    pub scroll_max: Cell<u16>,
 }
 
 impl RecallState {
@@ -265,6 +281,8 @@ impl Default for RecallState {
             started_at: None,
             now: None,
             finding: None,
+            scroll: None,
+            scroll_max: Cell::new(0),
         }
     }
 }
@@ -281,6 +299,11 @@ pub struct UiModel {
     pub notice: Option<String>,
     /// `NO_COLOR`: styles use modifiers only.
     pub mono: bool,
+    /// The locale is not UTF-8: draw in ASCII.
+    pub ascii: bool,
+    /// Set by the view on each draw. While the workspace is replaced by the
+    /// "too small" message, keys would act on panes the user cannot see.
+    pub too_small: Cell<bool>,
     pub dirty: bool,
     last_interrupt: Option<Instant>,
 }
@@ -296,9 +319,17 @@ impl UiModel {
             modal: None,
             notice: None,
             mono,
+            ascii: false,
+            too_small: Cell::new(false),
             dirty: true,
             last_interrupt: None,
         }
+    }
+
+    /// When the double-Ctrl-C window closes, so the runtime wakes to take
+    /// its notice down.
+    pub fn interrupt_expires(&self) -> Option<Instant> {
+        self.last_interrupt.map(|t| t + DOUBLE_INTERRUPT)
     }
 }
 
@@ -307,6 +338,9 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
         UiAction::Start => query_changed(m),
         UiAction::Key(key) => {
             m.dirty = true;
+            if m.too_small.get() && key != Key::Ctrl('z') {
+                return vec![];
+            }
             on_key(m, key)
         }
         UiAction::Interrupt(at) => {
@@ -315,7 +349,7 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
         }
         UiAction::Paste(text) => {
             m.dirty = true;
-            if m.modal.is_some() {
+            if m.modal.is_some() || m.too_small.get() {
                 return vec![];
             }
             m.focus = Focus::Query;
@@ -335,6 +369,14 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
             if m.recall.running() {
                 m.recall.now = Some(now);
                 m.dirty = true;
+            }
+            // The double-Ctrl-C window closed: its notice would now lie.
+            if m.interrupt_expires().is_some_and(|end| now >= end) {
+                m.last_interrupt = None;
+                if m.notice.as_deref().is_some_and(|n| n.ends_with(INTERRUPT_HINT)) {
+                    m.notice = None;
+                    m.dirty = true;
+                }
             }
             vec![]
         }
@@ -360,6 +402,7 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
                 Ok(page) => {
                     m.search.error = None;
                     m.search.selected = 0;
+                    m.search.list_offset.set(0);
                     let first = page.hits.first().map(|h| h.id);
                     m.search.page = Some(page);
                     // Evidence the user opened while this search ran stays put.
@@ -393,6 +436,7 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
             match result {
                 Ok(Some(view)) => {
                     m.evidence.cursor = view.timeline.iter().position(|o| o.id == id).unwrap_or(0);
+                    m.evidence.list_offset.set(0);
                     m.evidence.view = Some(view);
                     m.evidence.error = None;
                 }
@@ -439,10 +483,20 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
         }
         UiAction::Recall { op, event } => on_recall_event(m, op, event),
         UiAction::InputClosed => vec![UiEffect::Exit],
+        UiAction::SuspendRefused => {
+            m.dirty = true;
+            m.notice = Some("not suspending: Ctrl-Z was ignored when relic started".into());
+            vec![]
+        }
     }
 }
 
 fn on_key(m: &mut UiModel, key: Key) -> Vec<UiEffect> {
+    // Raw mode turns off the tty's own Ctrl-Z, so it arrives as a key and
+    // must suspend from anywhere, as it would without the TUI.
+    if key == Key::Ctrl('z') {
+        return vec![UiEffect::Suspend];
+    }
     match m.modal {
         Some(Modal::Help) => {
             if matches!(key, Key::Esc | Key::Char('?' | 'q')) {
@@ -451,15 +505,15 @@ fn on_key(m: &mut UiModel, key: Key) -> Vec<UiEffect> {
             return vec![];
         }
         Some(Modal::ConfirmRecall) => {
-            return match key {
-                Key::Char('y' | 'Y') => start_recall(m),
-                Key::Char('n' | 'N') | Key::Esc => {
-                    m.modal = None;
-                    m.notice = Some("recall not started".into());
-                    vec![]
-                }
-                _ => vec![],
-            };
+            // Anything but y is a no: a dialog that ignored other keys stayed
+            // open while the user typed on, so the 'y' of "ruby", whose 'r'
+            // opened it, gave consent.
+            if matches!(key, Key::Char('y' | 'Y')) {
+                return start_recall(m);
+            }
+            m.modal = None;
+            m.notice = Some("recall not started".into());
+            return vec![];
         }
         None => {}
     }
@@ -533,7 +587,7 @@ fn on_interrupt(m: &mut UiModel, at: Instant) -> Vec<UiEffect> {
         return vec![UiEffect::Exit];
     }
     m.last_interrupt = Some(at);
-    let hint = "press Ctrl-C again within 1 s to quit";
+    let hint = INTERRUPT_HINT;
     let effects = if let Some(op) = m.recall.active {
         let e = cancel_recall(m, op);
         m.notice = Some(format!("recall cancelled; {hint}"));
@@ -601,7 +655,12 @@ fn move_by(m: &mut UiModel, delta: isize) -> Vec<UiEffect> {
                 .min(m.evidence.scroll_max.get());
             vec![]
         }
-        Focus::Recall => vec![],
+        Focus::Recall => {
+            let max = m.recall.scroll_max.get();
+            let to = m.recall.scroll.unwrap_or(max).saturating_add_signed(delta as i16).min(max);
+            m.recall.scroll = (to < max).then_some(to);
+            vec![]
+        }
     }
 }
 
@@ -760,6 +819,7 @@ mod tests {
             deferred: None,
             words_dropped: 0,
             order: crate::app::Order::RecentlyImported,
+            filtered: true,
             hits: ids
                 .iter()
                 .map(|&id| hit(id, &format!("{query} cmd {id}")))
@@ -1165,15 +1225,24 @@ mod tests {
         let e = update(&mut m, UiAction::Key(Key::Char('r')));
         assert!(e.is_empty());
         assert_eq!(m.modal, Some(Modal::ConfirmRecall));
-        // Keys other than y/n/Esc do nothing while the budget is on screen.
-        for k in [Key::Enter, Key::Char('r'), Key::Down, Key::Char('q')] {
+        // Any key but y declines, and is spent on declining: typing "ruby"
+        // in a pane never starts a recall.
+        for k in [Key::Esc, Key::Char('n'), Key::Enter, Key::Down, Key::Char('u')] {
+            if m.modal.is_none() {
+                update(&mut m, UiAction::Key(Key::Char('r')));
+            }
+            assert_eq!(m.modal, Some(Modal::ConfirmRecall), "{k:?}");
             assert!(update(&mut m, UiAction::Key(k)).is_empty(), "{k:?}");
-            assert_eq!(m.modal, Some(Modal::ConfirmRecall));
+            assert_eq!(m.modal, None, "{k:?}");
+            assert_eq!(m.notice.as_deref(), Some("recall not started"), "{k:?}");
         }
-        let e = update(&mut m, UiAction::Key(Key::Esc));
-        assert!(e.is_empty());
-        assert_eq!(m.modal, None);
+        for c in "ruby".chars() {
+            m.focus = Focus::Results;
+            let e = update(&mut m, UiAction::Key(Key::Char(c)));
+            assert!(!e.iter().any(|e| matches!(e, UiEffect::StartRecall { .. })), "{c}");
+        }
         assert!(!m.recall.running());
+        m.focus = Focus::Results;
 
         update(&mut m, UiAction::Key(Key::Ctrl('r')));
         let e = update(&mut m, UiAction::Key(Key::Char('y')));
@@ -1187,7 +1256,8 @@ mod tests {
         else {
             panic!("{e:?}")
         };
-        assert_eq!((op, query.as_str(), cite), (1, "git", 10));
+        // The keys after the "r" were query text: "git" became "gitby".
+        assert_eq!((op, query.as_str(), cite), (1, "gitby", 10));
         assert_eq!(m.recall.status, RecallStatus::Running);
     }
 
@@ -1400,6 +1470,7 @@ mod tests {
             Key::Ctrl('r'),
             Key::Ctrl('f'),
             Key::Ctrl('u'),
+            Key::Ctrl('z'),
             Key::Up,
             Key::Down,
             Key::Enter,
@@ -1433,6 +1504,7 @@ mod tests {
                 let is_y = matches!(action, UiAction::Key(Key::Char('y' | 'Y')));
                 let picker_key = matches!(action, UiAction::Key(Key::Ctrl('f')))
                     || (matches!(action, UiAction::Key(Key::Char('f'))) && m.focus != Focus::Query);
+                let suspend_key = matches!(action, UiAction::Key(Key::Ctrl('z')));
                 for e in update(&mut m, action) {
                     match e {
                         UiEffect::StartRecall { op, .. } => {
@@ -1444,6 +1516,7 @@ mod tests {
                             ops.push(op);
                         }
                         UiEffect::OpenPicker(_) => assert!(picker_key, "run {run} step {step}"),
+                        UiEffect::Suspend => assert!(suspend_key, "run {run} step {step}"),
                         UiEffect::Search { .. }
                         | UiEffect::OpenEvidence { .. }
                         | UiEffect::CancelRecall { .. }

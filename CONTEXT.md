@@ -23,7 +23,7 @@ Relic imports local experience artifacts: shell history, shell hooks, Git and ag
 | Validation | Owns verifier runs and validation records. | none yet (`validation/` reserved) | [0012](docs/adr/0012-validation-boundary.md) |
 | Skill Catalog | Owns skill compilation, CAS bundles, `catalog.db`, activation and rollback. | none yet (`catalog/` reserved) | [0013](docs/adr/0013-skill-catalog-direction.md) |
 | Reuse Evaluation | Owns the acceptance fixture, the seeded investigations, the reuse gate and the gate harness. | `src/fixture.rs`, `benches/{gates,fixture_db,interactive_fts}.rs` | [0016](docs/adr/0016-acceptance-fixture-and-reuse-gate.md), [0014](docs/adr/0014-performance-contract.md) |
-| Presentation | Owns the CLI and versioned JSON, the TUI, the terminal, signals and exit codes. | `src/main.rs`, `src/cli.rs`, `src/app.rs` (the use-case layer shared by CLI and TUI), `src/ui/{mod,model,view,term,fake_recall}.rs` | [0011](docs/adr/0011-terminal-and-cli-contract.md) |
+| Presentation | Owns the CLI and versioned JSON, the TUI, the terminal, signals and exit codes. | `src/main.rs`, `src/cli.rs`, `src/app.rs` (the use-case layer shared by CLI and TUI), `src/signal.rs` (fatal signals for the TUI and `search --fzf`), `src/ui/{mod,model,view,term,fake_recall}.rs` | [0011](docs/adr/0011-terminal-and-cli-contract.md) |
 
 ## Context map
 

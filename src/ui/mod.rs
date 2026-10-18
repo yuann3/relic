@@ -25,10 +25,12 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 
 use crate::app::{self, Budget, MatchMode, Order, SearchRequest};
-use crate::picker::{self, PickError};
+use crate::picker::{self, Pick, PickError, PickMode};
 use crate::store::Store;
 use model::{PAGE_LIMIT, PickOutcome, UiAction, UiEffect, UiModel, update};
 use term::{InputReader, TerminalGuard};
+
+pub(crate) use term::emergency_restore;
 
 /// Quiet period before a keystroke becomes a query. Zero: with newest-first
 /// FTS every keystroke costs under 8 ms, the newest-wins mailbox already
@@ -46,6 +48,13 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub fn run(db: &Path) -> Result<()> {
     let started = Instant::now();
+    // A dumb terminal (an Emacs shell buffer, a CI log) would get raw escape
+    // sequences instead of a workspace.
+    if std::env::var_os("TERM").is_none_or(|t| t.is_empty() || t == "dumb") {
+        return Err("ui needs a terminal that can draw full screen, and TERM is dumb or unset; \
+                    use `relic search <words>` instead"
+            .into());
+    }
     // Evidence loads are single indexed lookups, cheap enough for the main
     // thread; searches get their own connection and thread. Both open before
     // the terminal is taken, so a store that cannot be read is an error on
@@ -53,8 +62,10 @@ pub fn run(db: &Path) -> Result<()> {
     let store = Store::open_read_only(db)?;
     let worker_store = Store::open_read_only(db)?;
     let mono = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    let ascii = !utf8_locale(|k| std::env::var_os(k));
     let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
 
+    crate::signal::install();
     let mut guard = TerminalGuard::enter()?;
     // Spawned only once the terminal is ours, so a failed entry has no
     // thread to stop.
@@ -63,11 +74,14 @@ pub fn run(db: &Path) -> Result<()> {
         let (mb, tx) = (Arc::clone(&mailbox), tx.clone());
         std::thread::Builder::new()
             .name("relic-search".into())
-            .spawn(move || search_worker(&worker_store, &mb, &tx, debounce()))?
+            .spawn(move || {
+                crate::signal::block_in_this_thread();
+                search_worker(&worker_store, &mb, &tx, debounce())
+            })?
     };
     let outcome = (|| {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        terminal.clear()?;
+        redraw_all(&mut terminal)?;
         let input = InputReader::spawn(tx.clone());
         let mut rt = Runtime {
             store,
@@ -81,7 +95,9 @@ pub fn run(db: &Path) -> Result<()> {
             awaiting_frame: None,
             started,
         };
-        let r = rt.event_loop(&mut guard, &rx, UiModel::new(mono));
+        let mut model = UiModel::new(mono);
+        model.ascii = ascii;
+        let r = rt.event_loop(&mut guard, &rx, model);
         if let Some((_, cancel)) = rt.recall.take() {
             cancel.store(true, Ordering::SeqCst);
         }
@@ -95,6 +111,24 @@ pub fn run(db: &Path) -> Result<()> {
     outcome?;
     restored?;
     Ok(())
+}
+
+/// Takes the terminal's current size and repaints every cell on the next
+/// draw. Not `Terminal::clear`: it asks the terminal for the cursor position
+/// and stalls 2 s, then fails, on one that does not answer (ADR 0011).
+fn redraw_all<B: Backend>(terminal: &mut Terminal<B>) -> std::result::Result<(), B::Error> {
+    let size = terminal.size()?;
+    terminal.resize(ratatui::layout::Rect::from((ratatui::layout::Position::ORIGIN, size)))
+}
+
+/// Whether the locale says the terminal speaks UTF-8, picking the variable
+/// as setlocale(LC_CTYPE) does: LC_ALL, then LC_CTYPE, then LANG, the first
+/// set and non-empty. None set is the C locale: ASCII.
+fn utf8_locale(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["LC_ALL", "LC_CTYPE", "LANG"].into_iter().filter_map(var).find(|v| !v.is_empty()).is_some_and(|v| {
+        let v = v.to_string_lossy().to_ascii_lowercase();
+        v.contains("utf-8") || v.contains("utf8")
+    })
 }
 
 /// Closes the mailbox and joins the search worker. The receiver goes first:
@@ -166,23 +200,32 @@ where
             }
 
             if queue.is_empty() {
-                let action = if m.recall.running() {
-                    let now = Instant::now();
-                    if now >= next_tick {
-                        next_tick = now + PROGRESS_TICK;
-                        UiAction::Tick(now)
-                    } else {
-                        match rx.recv_timeout(next_tick - now) {
-                            Ok(a) => a,
-                            Err(RecvTimeoutError::Timeout) => continue,
-                            Err(RecvTimeoutError::Disconnected) => return Ok(()),
-                        }
-                    }
-                } else {
-                    // Idle: block until something happens. No frame timer.
-                    match rx.recv() {
+                // Wake for the progress meter while a recall runs, and once
+                // when the double-Ctrl-C window closes. Otherwise block until
+                // something happens: no frame timer.
+                let wake = [m.recall.running().then_some(next_tick), m.interrupt_expires()]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                let action = match wake {
+                    None => match rx.recv() {
                         Ok(a) => a,
                         Err(_) => return Ok(()),
+                    },
+                    Some(at) => {
+                        let now = Instant::now();
+                        if now >= at {
+                            if now >= next_tick {
+                                next_tick = now + PROGRESS_TICK;
+                            }
+                            UiAction::Tick(now)
+                        } else {
+                            match rx.recv_timeout(at - now) {
+                                Ok(a) => a,
+                                Err(RecvTimeoutError::Timeout) => continue,
+                                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                            }
+                        }
                     }
                 };
                 queue.push_back(action);
@@ -196,6 +239,7 @@ where
             }
 
             while let Some(action) = queue.pop_front() {
+                let resized = matches!(action, UiAction::Resize);
                 if let UiAction::SearchDone {
                     generation,
                     elapsed,
@@ -211,6 +255,12 @@ where
                         UiEffect::Exit => return Ok(()),
                         e => queue.extend(self.run_effect(e, guard)?),
                     }
+                }
+                // Draw the new size before the keys queued behind it: the
+                // view decides whether the workspace still fits, and keys
+                // act only on what is on screen.
+                if resized {
+                    break;
                 }
             }
         }
@@ -242,12 +292,10 @@ where
                 // Never two terminal readers: park ours before fzf starts.
                 self.input.pause();
                 guard.restore()?;
-                let picked = picker::pick(&page);
+                let picked = picker::pick(&page, PickMode::FullScreen);
                 guard.resume()?;
-                // The size may have changed while fzf ran; autoresize picks
-                // it up, and clear forces every cell to be redrawn.
-                self.terminal.autoresize()?;
-                self.terminal.clear()?;
+                // The size may have changed while fzf ran.
+                redraw_all(&mut self.terminal)?;
                 self.input.resume();
                 vec![UiAction::PickerReturned(pick_outcome(picked))]
             }
@@ -269,15 +317,42 @@ where
                 }
                 vec![]
             }
+            UiEffect::Suspend => {
+                // An inherited SIG_IGN is the user's choice, as for the fatal
+                // signals: whoever started Relic may have no `fg` to offer.
+                // SAFETY: sigaction with a null new action only reads.
+                let ignored = unsafe {
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut old);
+                    old.sa_sigaction == libc::SIG_IGN
+                };
+                if ignored {
+                    return Ok(vec![UiAction::SuspendRefused]);
+                }
+                // The fzf hand-off, with the shell as the program that
+                // takes the terminal (ADR 0011).
+                self.input.pause();
+                guard.restore()?;
+                // SAFETY: SIG_DFL stops the whole process here; the shell's
+                // `fg` continues it after the raise.
+                unsafe {
+                    libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+                    libc::raise(libc::SIGTSTP);
+                }
+                guard.resume()?;
+                redraw_all(&mut self.terminal)?;
+                self.input.resume();
+                vec![UiAction::Resize]
+            }
             UiEffect::Exit => unreachable!("handled by the loop"),
         })
     }
 }
 
-fn pick_outcome(r: std::result::Result<Option<i64>, PickError>) -> PickOutcome {
+fn pick_outcome(r: std::result::Result<Pick, PickError>) -> PickOutcome {
     match r {
-        Ok(Some(id)) => PickOutcome::Picked(id),
-        Ok(None) => PickOutcome::Cancelled,
+        Ok(Pick::Chosen(id)) => PickOutcome::Picked(id),
+        Ok(Pick::NoMatch | Pick::Cancelled) => PickOutcome::Cancelled,
         Err(e @ PickError::Unavailable) => PickOutcome::Failed(e.to_string()),
         Err(e @ PickError::TooOld { .. }) => {
             PickOutcome::Failed(format!("{e}; using indexed search"))
@@ -429,6 +504,19 @@ impl Trace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_locale_reads_the_variable_setlocale_would() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.into())
+        };
+        assert!(utf8_locale(env(&[("LANG", "en_SG.UTF-8")])));
+        assert!(utf8_locale(env(&[("LC_CTYPE", "C.utf8"), ("LANG", "C")])));
+        assert!(!utf8_locale(env(&[])));
+        // LC_ALL overrides a UTF-8 LANG; an empty one does not count.
+        assert!(!utf8_locale(env(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")])));
+        assert!(utf8_locale(env(&[("LC_ALL", ""), ("LANG", "en_US.UTF-8")])));
+    }
 
     fn job(generation: u64, query: &str, issued: Instant) -> SearchJob {
         SearchJob {
@@ -635,7 +723,7 @@ mod tests {
             };
             assert!(msg.contains(want), "{msg}");
         }
-        assert_eq!(pick_outcome(Ok(None)), PickOutcome::Cancelled);
-        assert_eq!(pick_outcome(Ok(Some(9))), PickOutcome::Picked(9));
+        assert_eq!(pick_outcome(Ok(Pick::Cancelled)), PickOutcome::Cancelled);
+        assert_eq!(pick_outcome(Ok(Pick::Chosen(9))), PickOutcome::Picked(9));
     }
 }

@@ -23,7 +23,7 @@ mod headless {
         let _s = serial();
         let fx = Fixture::new();
         let mut s = Session::spawn(&fx.db, &[]);
-        s.assert_exit_code(1);
+        s.assert_exit_code(2);
         s.assert_restored();
         s.with(|o| {
             assert!(
@@ -43,8 +43,8 @@ mod tui {
     use std::time::Duration;
 
     use super::pty_support::{
-        self, COLS, DEADLINE, ENTER_ALT, Fixture, Hup, LEAVE_ALT, Output, ROWS, Session, path_with,
-        serial, wait_gone,
+        self, COLS, DEADLINE, ENTER_ALT, Fixture, Hup, LEAVE_ALT, Output, RELIC, ROWS, Session,
+        path_with, serial, wait_gone,
     };
 
     use super::fake_fzf::FakeFzf;
@@ -80,6 +80,89 @@ mod tui {
         quits_cleanly(s, b"\tq");
     }
 
+    /// Esc and a letter that reach relic in one read are still two keys:
+    /// Esc leaves the results pane and the letter is query text.
+    #[test]
+    fn esc_then_a_letter_in_one_read_is_both_keys() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let mut s = ready(&fx, &[]);
+        s.send(b"\t");
+        s.send(b"\x1bw");
+        s.wait_screen("> w ");
+        quits_cleanly(s, b"\x1b");
+    }
+
+    /// Ctrl-Z gives the shell its terminal back and stops relic; `fg`
+    /// (SIGCONT to the foreground job) brings the workspace back whole.
+    #[test]
+    fn ctrl_z_suspends_and_fg_redraws_the_whole_workspace() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let mut s = ready(&fx, &[]);
+        s.send(b"\x1a");
+        s.wait_stopped();
+        s.assert_given_back();
+        s.with(|o| assert!(!o.screen.in_alt(), "{}", pty_support::dump(o)));
+        // Re-entering the alternate screen blanks it: only a full redraw
+        // brings the rows back.
+        s.fg();
+        s.wait_screen("fixture-cmd-40");
+        s.with(|o| assert!(o.screen.in_alt(), "{}", pty_support::dump(o)));
+        // Typing works again: the reader was resumed.
+        s.send(b"zz");
+        s.wait_screen("> zz ");
+        quits_cleanly(s, b"\x1b");
+    }
+
+    /// `kill %1` on a stopped relic sends TERM then CONT while the shell
+    /// owns the terminal: relic dies of TERM, and putting the tty back from
+    /// the background must not stop it again.
+    #[test]
+    fn a_fatal_signal_after_ctrl_z_kills_relic_from_the_background() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let mut s = ready(&fx, &[]);
+        s.send(b"\x1a");
+        s.wait_stopped();
+        s.signal(libc::SIGTERM);
+        s.signal(libc::SIGCONT);
+        let status = s.wait_exit();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{}", pty_support::describe(status));
+        s.assert_restored();
+    }
+
+    /// Ctrl-Z ignored by whoever started relic stays ignored: relic says so
+    /// and keeps running.
+    #[test]
+    fn ctrl_z_under_an_inherited_ignored_sigtstp_does_not_suspend() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let script = "trap '' TSTP; exec \"$0\" ui --db \"$1\"";
+        let args = ["-c".as_ref(), script.as_ref(), RELIC.as_ref(), fx.db.as_os_str()];
+        let mut s = Session::spawn_program("/bin/sh".as_ref(), &args, &[]);
+        s.wait_ready();
+        s.send(b"\x1a");
+        s.wait_screen("not suspending");
+        s.send(b"zz");
+        s.wait_screen("> zz ");
+        quits_cleanly(s, b"\x1b");
+    }
+
+    /// A dumb terminal gets a message, not escape sequences it cannot draw.
+    #[test]
+    fn a_dumb_terminal_is_refused_without_touching_it() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let mut s = Session::spawn(&fx.db, &[("TERM", "dumb".as_ref())]);
+        s.assert_exit_code(2);
+        s.assert_restored();
+        s.with(|o| {
+            assert!(o.contains("TERM is dumb or unset"), "{}", pty_support::dump(o));
+            assert_eq!(o.count(ENTER_ALT), 0);
+        });
+    }
+
     #[test]
     fn double_ctrl_c_quits() {
         let _s = serial();
@@ -94,8 +177,10 @@ mod tui {
         let mut s = ready(&fx, &[]);
         s.send(b"\x03");
         s.wait_screen("press Ctrl-C again within 1 s to quit");
+        // The notice goes when the window closes, with no key pressed.
+        s.wait_for("the notice to expire", |o| !o.screen.text().contains("Ctrl-C again"));
         // Past the 1 s window a second press is a first press again.
-        s.assert_alive_for(Duration::from_millis(1300));
+        s.assert_alive_for(Duration::from_millis(300));
         s.send(b"\x03");
         s.assert_alive_for(Duration::from_millis(300));
         quits_cleanly(s, b"\x1b");
@@ -163,6 +248,29 @@ mod tui {
         let text = o.screen.text();
         let top = text.lines().next().unwrap_or("");
         o.screen.in_alt() && top.chars().count() == 80 && top.ends_with('┓')
+    }
+
+    /// While the workspace is replaced by "too small", keys do nothing to
+    /// panes the user cannot see: q in the results pane does not quit, and
+    /// typing does not reach the query.
+    #[test]
+    fn keys_do_nothing_while_the_terminal_is_too_small() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let mut s = ready(&fx, &[]);
+        s.send(b"\t");
+        s.resize(8, 30);
+        s.signal(libc::SIGWINCH);
+        s.wait_screen("terminal too small");
+        s.send(b"qx");
+        s.assert_alive_for(Duration::from_millis(300));
+        s.resize(24, 80);
+        s.signal(libc::SIGWINCH);
+        s.wait_for("the workspace back at 80 columns", |o| {
+            o.screen.text().lines().next().is_some_and(|top| top.chars().count() == 80)
+        });
+        s.with(|o| assert!(!o.screen.text().contains("> x"), "{}", pty_support::dump(o)));
+        quits_cleanly(s, b"q");
     }
 
     #[test]
@@ -237,6 +345,79 @@ mod tui {
             "{}",
             pty_support::describe(status)
         );
+    }
+
+    /// A fatal signal sent to relic alone (`kill`, `timeout`, a supervisor)
+    /// leaves the terminal as it was and relic dead of that signal.
+    #[test]
+    fn a_fatal_signal_restores_the_terminal_and_exits_by_that_signal() {
+        let _s = serial();
+        let fx = Fixture::new();
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            let mut s = ready(&fx, &[]);
+            s.signal(sig);
+            let status = s.wait_exit();
+            assert_eq!(status.signal(), Some(sig), "{}", pty_support::describe(status));
+            s.assert_restored();
+        }
+    }
+
+    /// An fzf that ignores SIGTERM and leaves the tty raw: relic kills it
+    /// and still gives the shell back the terminal it had.
+    const STUBBORN_PICKER: &str = "cat > /dev/null\n\
+        trap '' TERM\n\
+        stty raw -echo < /dev/tty\n\
+        printf 'FAKE-FZF-READY\\r\\n' > /dev/tty\n\
+        IFS= read -r line < /dev/tty";
+
+    fn signal_while_fzf_runs(mut s: Session, fzf: &FakeFzf) {
+        s.wait_for("the fake fzf to wait on /dev/tty", |o| o.contains("FAKE-FZF-READY"));
+        s.signal(libc::SIGTERM);
+        let status = s.wait_exit();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{}", pty_support::describe(status));
+        s.assert_restored();
+        let pids = String::from_utf8(fzf.read("pids")).unwrap();
+        for p in pids.lines() {
+            let p: libc::pid_t = p.parse().unwrap();
+            assert!(wait_gone(p, Duration::from_secs(1)), "fake fzf pid {p} outlived relic");
+        }
+    }
+
+    #[test]
+    fn a_fatal_signal_while_fzf_runs_in_the_tui_stops_fzf_and_restores() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let fzf = FakeFzf::new(STUBBORN_PICKER);
+        let path = path_with(fzf.dir.path());
+        let s = ready(&fx, &[("PATH", &path)]);
+        s.send(b"\x06");
+        signal_while_fzf_runs(s, &fzf);
+    }
+
+    #[test]
+    fn a_fatal_signal_while_search_fzf_runs_stops_fzf_and_restores() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let fzf = FakeFzf::new(STUBBORN_PICKER);
+        let path = path_with(fzf.dir.path());
+        let args = ["search", "fixture", "--fzf", "--db"].map(OsStr::new);
+        let s = Session::spawn_args(&[&args[..], &[fx.db.as_os_str()]].concat(), &[("PATH", &path)]);
+        signal_while_fzf_runs(s, &fzf);
+    }
+
+    /// A signal the user's shell left ignored (`nohup`, `trap '' TERM`)
+    /// stays ignored.
+    #[test]
+    fn an_inherited_ignored_signal_stays_ignored() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let script = "trap '' TERM; exec \"$0\" ui --db \"$1\"";
+        let args = ["-c".as_ref(), script.as_ref(), RELIC.as_ref(), fx.db.as_os_str()];
+        let mut s = Session::spawn_program("/bin/sh".as_ref(), &args, &[]);
+        s.wait_ready();
+        s.signal(libc::SIGTERM);
+        s.assert_alive_for(Duration::from_millis(300));
+        quits_cleanly(s, b"\x1b");
     }
 
     /// The same disconnect under `nohup`: no signal, so relic must notice
@@ -364,6 +545,9 @@ mod tui {
             let first = position(o, ENTER_ALT, 0).unwrap();
             let again = position(o, ENTER_ALT, first + 1).unwrap();
             assert!(first < left && left < ran && ran < again, "{shown}");
+            // Neither startup nor the resume asked where the cursor is: a
+            // terminal that does not answer would stall them 2 s.
+            assert_eq!(o.count(b"\x1b[6n"), 0, "{shown}");
         });
         fzf.assert_reaped();
         quits_cleanly(s, b"q");
@@ -439,6 +623,26 @@ mod tui {
             "cat > /dev/null; kill -9 $$",
             "fzf returned an invalid selection",
         );
+    }
+
+    /// `search --fzf` keeps fzf's own answers apart: a pick is 0, Enter
+    /// with nothing matching is 1, and a cancel is 130 (ADR 0011).
+    #[test]
+    fn search_fzf_exits_0_on_a_pick_1_on_no_match_and_130_on_cancel() {
+        let _s = serial();
+        let fx = Fixture::new();
+        for (body, code) in [
+            ("cat > /dev/null; printf '1\\t\\0'", 0),
+            ("cat > /dev/null; exit 1", 1),
+            ("cat > /dev/null; exit 130", 130),
+        ] {
+            let fzf = FakeFzf::new(body);
+            let path = path_with(fzf.dir.path());
+            let args = ["search", "fixture", "--fzf", "--db"].map(OsStr::new);
+            let mut s = Session::spawn_args(&[&args[..], &[fx.db.as_os_str()]].concat(), &[("PATH", &path)]);
+            s.assert_exit_code(code);
+            fzf.assert_reaped();
+        }
     }
 
     #[test]

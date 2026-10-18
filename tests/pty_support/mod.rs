@@ -47,6 +47,8 @@ pub fn serial() -> MutexGuard<'static, ()> {
 
 /// A small history imported through relic's own importer, newest last:
 /// `fixture-cmd-01` .. `fixture-cmd-40`.
+pub const RELIC: &str = env!("CARGO_BIN_EXE_relic");
+
 pub struct Fixture {
     _dir: tempfile::TempDir,
     pub db: PathBuf,
@@ -114,19 +116,35 @@ pub struct Session {
 }
 
 impl Session {
-    /// `relic ui --db <db>` with only `env` (plus `TERM`, a scratch `HOME`
+    /// `relic ui --db <db>` with only `env` (plus `TERM`, a UTF-8 `LANG`, a scratch `HOME`
     /// and, unless given, a system-only `PATH`) in its environment.
     pub fn spawn(db: &Path, env: &[(&str, &OsStr)]) -> Self {
         Self::spawn_with(db, env, Hup::Forward)
     }
 
     pub fn spawn_with(db: &Path, env: &[(&str, &OsStr)], hup: Hup) -> Self {
+        Self::start(RELIC.as_ref(), &["ui".as_ref(), "--db".as_ref(), db.as_os_str()], env, hup)
+    }
+
+    /// `relic <args>` on the terminal, with the environment of [`Self::spawn`].
+    pub fn spawn_args(args: &[&OsStr], env: &[(&str, &OsStr)]) -> Self {
+        Self::start(RELIC.as_ref(), args, env, Hup::Forward)
+    }
+
+    /// `program <args>`, for a wrapper that sets something up and then
+    /// execs [`RELIC`] in the same process.
+    pub fn spawn_program(program: &OsStr, args: &[&OsStr], env: &[(&str, &OsStr)]) -> Self {
+        Self::start(program, args, env, Hup::Forward)
+    }
+
+    fn start(program: &OsStr, args: &[&OsStr], env: &[(&str, &OsStr)], hup: Hup) -> Self {
         let (master, slave) = open_pty(ROWS, COLS);
         let before = termios(slave.as_raw_fd()).expect("tcgetattr before launch");
         let home = std::env::temp_dir();
         let mut vars: Vec<(&OsStr, &OsStr)> = vec![
             ("PATH".as_ref(), "/usr/bin:/bin".as_ref()),
             ("TERM".as_ref(), "xterm-256color".as_ref()),
+            ("LANG".as_ref(), "en_US.UTF-8".as_ref()),
             ("HOME".as_ref(), home.as_os_str()),
         ];
         for (k, v) in env {
@@ -134,8 +152,8 @@ impl Session {
             vars.push((k.as_ref(), v));
         }
         let proc = Supervised::start(
-            env!("CARGO_BIN_EXE_relic").as_ref(),
-            &["ui".as_ref(), "--db".as_ref(), db.as_os_str()],
+            program,
+            args,
             &vars,
             slave.as_raw_fd(),
             master.as_raw_fd(),
@@ -248,6 +266,25 @@ impl Session {
         }
     }
 
+    /// Waits until the job is stopped (Ctrl-Z) and the shell has taken the
+    /// terminal back, as `ps` reports them.
+    pub fn wait_stopped(&mut self) {
+        let pid = self.pid().to_string();
+        while Instant::now() < self.deadline {
+            let out = std::process::Command::new("ps").args(["-o", "stat=,tpgid=", "-p", &pid]).output().unwrap();
+            let out = String::from_utf8_lossy(&out.stdout);
+            let mut fields = out.split_whitespace();
+            if fields.next().is_some_and(|st| st.starts_with('T')) && fields.next() != Some(pid.as_str()) {
+                return;
+            }
+            if let Some(s) = self.try_exit() {
+                panic!("relic exited with {s} instead of stopping\n{}", self.with(dump));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("relic did not stop before the deadline\n{}", self.with(dump));
+    }
+
     /// The child is still running after `period`.
     pub fn assert_alive_for(&mut self, period: Duration) {
         let end = Instant::now() + period;
@@ -271,7 +308,13 @@ impl Session {
     /// bracketed paste off after it was last enabled. Call after exit.
     pub fn assert_restored(&self) {
         assert!(self.exited.is_some(), "check restoration after exit");
-        let now = termios(self.slave.as_raw_fd()).expect("tcgetattr after exit");
+        self.assert_given_back();
+    }
+
+    /// The terminal as [`Self::assert_restored`] wants it, while relic is
+    /// still alive: suspended, or running another program.
+    pub fn assert_given_back(&self) {
+        let now = termios(self.slave.as_raw_fd()).expect("tcgetattr");
         let b = &self.before;
         let lost: Vec<&str> = [
             (libc::ICANON, "ICANON"),
@@ -325,6 +368,11 @@ impl Session {
 
     pub fn signal(&self, sig: libc::c_int) {
         self.proc.kill(sig);
+    }
+
+    /// The shell's `fg` after Ctrl-Z.
+    pub fn fg(&self) {
+        self.proc.fg();
     }
 
     /// Closes every master fd: the terminal disconnects.
@@ -451,14 +499,10 @@ fn read_master(fd: RawFd, shared: &Shared, stop: &AtomicBool) {
             }
             return;
         }
-        let replies = {
-            let mut out = shared.out.lock().unwrap();
-            out.raw.extend_from_slice(&buf[..n as usize]);
-            out.screen.feed(&buf[..n as usize]);
-            shared.cv.notify_all();
-            out.screen.take_replies()
-        };
-        write_all(fd, &replies);
+        let mut out = shared.out.lock().unwrap();
+        out.raw.extend_from_slice(&buf[..n as usize]);
+        out.screen.feed(&buf[..n as usize]);
+        shared.cv.notify_all();
     }
 }
 

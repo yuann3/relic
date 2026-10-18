@@ -177,7 +177,7 @@ fn install_panic_hook() {
 /// Runs inside the panic hook, possibly while another frame holds stdout's
 /// lock or crossterm's raw-mode mutex, so it takes neither: raw `write(2)`
 /// of the reset sequences and `tcsetattr` with the termios saved at entry.
-fn emergency_restore() {
+pub(crate) fn emergency_restore() {
     #[cfg(unix)]
     {
         let write = |bytes: &[u8]| {
@@ -248,7 +248,10 @@ impl InputReader {
         let g = Arc::clone(&gate);
         let handle = std::thread::Builder::new()
             .name("relic-input".into())
-            .spawn(move || read_loop(&g, &tx, &mut next))
+            .spawn(move || {
+                crate::signal::block_in_this_thread();
+                read_loop(&g, &tx, &mut next)
+            })
             .expect("spawn input thread");
         Self {
             gate,
@@ -291,20 +294,19 @@ fn read_loop(
     tx: &SyncSender<UiAction>,
     next: &mut impl FnMut() -> io::Result<Option<Event>>,
 ) {
-    while wait_while_paused(gate) {
-        let action = match next() {
+    'read: while wait_while_paused(gate) {
+        let actions = match next() {
             Ok(None) => continue,
-            Ok(Some(ev)) => match translate(ev, Instant::now()) {
-                Some(a) => a,
-                None => continue,
-            },
+            Ok(Some(ev)) => translate(ev, Instant::now()),
             Err(_) => {
                 send(gate, tx, UiAction::InputClosed);
                 break;
             }
         };
-        if !send(gate, tx, action) {
-            break;
+        for action in actions {
+            if !send(gate, tx, action) {
+                break 'read;
+            }
         }
     }
     // However the loop ended, a pause in progress must return and later
@@ -354,8 +356,24 @@ fn send(gate: &(Mutex<Gate>, Condvar), tx: &SyncSender<UiAction>, mut a: UiActio
     }
 }
 
-/// Crossterm event -> UI action. Pure, so the key map is testable.
-pub fn translate(ev: Event, now: Instant) -> Option<UiAction> {
+/// Crossterm event -> UI actions. Pure, so the key map is testable.
+///
+/// crossterm reads Esc and the next byte that arrives in the same `read()`
+/// as Alt+key (crossterm-rs/crossterm#993). Relic binds no Alt chords, so
+/// Alt+key is split back into the Esc and the key that were typed.
+pub fn translate(ev: Event, now: Instant) -> Vec<UiAction> {
+    match ev {
+        Event::Key(k) if k.kind != KeyEventKind::Release && k.modifiers.contains(KeyModifiers::ALT) => {
+            let key = KeyEvent { modifiers: k.modifiers - KeyModifiers::ALT, ..k };
+            let mut actions = vec![UiAction::Key(Key::Esc)];
+            actions.extend(translate_one(Event::Key(key), now));
+            actions
+        }
+        ev => translate_one(ev, now).into_iter().collect(),
+    }
+}
+
+fn translate_one(ev: Event, now: Instant) -> Option<UiAction> {
     match ev {
         Event::Key(KeyEvent {
             code,
@@ -367,11 +385,10 @@ pub fn translate(ev: Event, now: Instant) -> Option<UiAction> {
                 return None;
             }
             let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-            if modifiers.contains(KeyModifiers::ALT) {
-                return None;
-            }
             let key = match code {
                 KeyCode::Char('c') if ctrl => return Some(UiAction::Interrupt(now)),
+                // ^H is the terminal's other Backspace (byte 0x08).
+                KeyCode::Char('h' | 'H') if ctrl => Key::Backspace,
                 KeyCode::Char(c) if ctrl => Key::Ctrl(c.to_ascii_lowercase()),
                 KeyCode::Char(c) => Key::Char(c),
                 KeyCode::Up => Key::Up,
@@ -475,41 +492,53 @@ mod tests {
                 Some(Key::Char('Q')),
             ),
             (key(KeyCode::Char('n'), ctrl), Some(Key::Ctrl('n'))),
+            (key(KeyCode::Char('h'), ctrl), Some(Key::Backspace)),
+            (key(KeyCode::Backspace, none), Some(Key::Backspace)),
             (
                 key(KeyCode::Char('F'), ctrl | KeyModifiers::SHIFT),
                 Some(Key::Ctrl('f')),
             ),
-            (key(KeyCode::Char('x'), KeyModifiers::ALT), None),
             (
                 key(KeyCode::BackTab, KeyModifiers::SHIFT),
                 Some(Key::BackTab),
             ),
             (key(KeyCode::F(5), none), None),
         ];
+        let keys = |ev: Event| -> Vec<Key> {
+            translate(ev.clone(), now)
+                .into_iter()
+                .map(|a| match a {
+                    UiAction::Key(k) => k,
+                    other => panic!("{ev:?} -> {other:?}"),
+                })
+                .collect()
+        };
         for (ev, want) in cases {
-            let got = match translate(ev.clone(), now) {
-                Some(UiAction::Key(k)) => Some(k),
-                None => None,
-                other => panic!("{ev:?} -> {other:?}"),
-            };
-            assert_eq!(got, *want, "{ev:?}");
+            assert_eq!(keys(ev.clone()), want.iter().cloned().collect::<Vec<_>>(), "{ev:?}");
         }
-        assert!(
-            matches!(translate(key(KeyCode::Char('c'), ctrl), now), Some(UiAction::Interrupt(t)) if t == now)
-        );
+        // Esc then a letter in one read arrives as Alt+letter: both keys,
+        // in order, and never the letter alone.
+        let alt = KeyModifiers::ALT;
+        assert_eq!(keys(key(KeyCode::Char('j'), alt)), [Key::Esc, Key::Char('j')]);
+        assert_eq!(keys(key(KeyCode::Char('n'), alt | ctrl)), [Key::Esc, Key::Ctrl('n')]);
+        assert_eq!(keys(key(KeyCode::F(5), alt)), [Key::Esc]);
+        assert!(matches!(
+            &translate(key(KeyCode::Char('c'), ctrl), now)[..],
+            [UiAction::Interrupt(t)] if *t == now
+        ));
         let release = Event::Key(KeyEvent {
             code: KeyCode::Char('a'),
             modifiers: none,
             kind: KeyEventKind::Release,
             state: KeyEventState::NONE,
         });
-        assert!(translate(release, now).is_none());
+        assert!(translate(release, now).is_empty());
         assert!(
-            matches!(translate(Event::Paste("a\nb".into()), now), Some(UiAction::Paste(s)) if s == "a\nb")
+            matches!(&translate(Event::Paste("a\nb".into()), now)[..], [UiAction::Paste(s)] if s == "a\nb")
         );
         assert!(matches!(
-            translate(Event::Resize(80, 24), now),
-            Some(UiAction::Resize)
+            &translate(Event::Resize(80, 24), now)[..],
+            [UiAction::Resize]
         ));
     }
 }

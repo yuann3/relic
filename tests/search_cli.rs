@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn relic(args: &[&str], db: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_relic")).args(args).arg("--db").arg(db).output().unwrap()
+    // `ui` refuses a dumb or missing TERM before it opens the store.
+    Command::new(env!("CARGO_BIN_EXE_relic")).args(args).arg("--db").arg(db).env("TERM", "xterm").output().unwrap()
 }
 
 fn store_with(dir: &Path, commands: &[&str]) -> PathBuf {
@@ -71,6 +72,50 @@ fn words_past_the_cap_are_ignored_and_the_page_says_how_many() {
     assert_eq!(whole["words_dropped"], 0);
 }
 
+/// JSON escapes only what it must, so `--json` escapes what a terminal would
+/// act on as well; the decoded text is still exactly what was stored.
+#[test]
+fn json_escapes_controls_a_terminal_would_act_on_and_keeps_the_text_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let hostile = "echo a\u{85}b\u{202e}c\u{2028}d\u{e0041}e café";
+    let db = store_with(dir.path(), &[hostile]);
+    let out = relic(&["search", "--json", "echo"], &db);
+    let raw = String::from_utf8(out.stdout.clone()).unwrap();
+    assert!(!raw.contains(['\u{85}', '\u{202e}', '\u{2028}', '\u{e0041}']), "{raw}");
+    assert!(raw.contains(r"\u0085") && raw.contains(r"\udb40\udc41") && raw.contains("café"), "{raw}");
+    assert_eq!(texts(&page(&out)), [hostile]);
+}
+
+/// Exit 0 is a match, 1 is no match, and a query that searches no word is a
+/// usage error: never the recent commands passed off as matches (ADR 0011).
+#[test]
+fn exit_status_tells_a_match_from_no_match_from_a_query_with_nothing_to_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store_with(dir.path(), &["git push", "gh pr list"]);
+    let long_word = ["a"; 17].join("/");
+    let letters = "search matches words of letters or digits";
+    let cases: &[(&[&str], i32, &str)] = &[
+        (&["search", "git"], 0, ""),
+        (&["search", "--prefix", "git", "p"], 0, ""),
+        (&["search", "nomatch"], 1, ""),
+        (&["search", "--json", "nomatch"], 1, ""),
+        (&["search", "&&"], 2, letters),
+        (&["search", "--json", "&&"], 2, letters),
+        (&["search", "--prefix", "&&"], 2, letters),
+        (&["search", "--prefix", "g"], 2, "\"g\" is too short; type 2+ characters"),
+        (&["search", &long_word], 2, "every word was ignored"),
+    ];
+    for &(args, code, why) in cases {
+        let out = relic(args, &db);
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(code), "{args:?}: {stderr}");
+        if code == 2 {
+            assert!(stdout.is_empty(), "{args:?} printed rows: {stdout}");
+            assert!(stderr.contains("nothing to search for") && stderr.contains(why), "{args:?}: {stderr}");
+        }
+    }
+}
+
 #[test]
 fn search_reads_while_an_import_holds_the_write_lock() {
     let dir = tempfile::tempdir().unwrap();
@@ -117,8 +162,10 @@ fn a_store_that_stays_locked_gets_one_traced_retry_then_exit_2() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert_eq!(stderr.matches("trying once more").count(), 1, "{stderr}");
     assert!(stderr.contains("relic: busy: "), "{stderr}");
-    // Busy is exit 2 from every command that meets it.
-    for other in [&["ui"][..], &["forget", "1"]] {
+    // Busy is exit 2 from every command that meets it. A headless `ui`
+    // refuses before it opens the store.
+    let ui: &[&[&str]] = if cfg!(feature = "tui") { &[&["ui"]] } else { &[] };
+    for other in ui.iter().copied().chain([&["forget", "1"][..]]) {
         let out = relic(other, &db);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{other:?}: {stderr}");

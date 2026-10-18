@@ -42,7 +42,6 @@ const ARGS: &[&str] = &[
     "--delimiter=\t",
     "--with-nth=2..",
     "--nth=2..",
-    "--height=80%",
     "--layout=reverse",
     "--border",
 ];
@@ -90,30 +89,59 @@ impl From<std::io::Error> for PickError {
     }
 }
 
-/// Let the user pick one hit with the `fzf` on PATH. `Ok(None)` means they
-/// cancelled or nothing matched.
-pub fn pick(page: &SearchPage) -> Result<Option<i64>, PickError> {
+/// Where fzf draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickMode {
+    /// Below the prompt (`--height=80%`), with the shell's output above it:
+    /// `search --fzf`.
+    Inline,
+    /// fzf's own alternate screen. From the TUI, inline would draw on the
+    /// primary screen the TUI just handed back, over the user's shell.
+    FullScreen,
+}
+
+/// What the user did in fzf. No match and cancel stay apart, as fzf keeps
+/// them: a script must tell "nothing matched" from "the user gave up".
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pick {
+    Chosen(i64),
+    /// Enter with nothing matching: fzf's exit 1.
+    NoMatch,
+    /// Esc or Ctrl-C: fzf's exit 130.
+    Cancelled,
+}
+
+/// Let the user pick one hit with the `fzf` on PATH.
+pub fn pick(page: &SearchPage, mode: PickMode) -> Result<Pick, PickError> {
     let fzf = find_on_path(std::env::var_os("PATH").as_deref()).ok_or(PickError::Unavailable)?;
-    pick_with(page, &fzf)
+    pick_with(page, &fzf, mode)
 }
 
 /// [`pick`] with an explicit fzf binary.
-pub fn pick_with(page: &SearchPage, fzf: &Path) -> Result<Option<i64>, PickError> {
+pub fn pick_with(page: &SearchPage, fzf: &Path, mode: PickMode) -> Result<Pick, PickError> {
     check_version(fzf)?;
     let records = encode(&page.hits);
-    let child = command(fzf)
-        .args(ARGS)
+    let mut cmd = command(fzf);
+    cmd.args(ARGS);
+    if mode == PickMode::Inline {
+        cmd.arg("--height=80%");
+    }
+    let child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .map_err(spawn_error)?;
+    crate::signal::set_child(child.id() as libc::pid_t);
     let mut child = Reaped(child);
     let mut stdin = child.0.stdin.take().expect("stdin is piped");
     let mut stdout = child.0.stdout.take().expect("stdout is piped");
 
     // Feeding stdin from this thread while fzf blocks on a full stdout pipe
     // (or never reads) would deadlock; a writer thread keeps both moving.
-    let writer = std::thread::spawn(move || stdin.write_all(&records));
+    let writer = std::thread::spawn(move || {
+        crate::signal::block_in_this_thread();
+        stdin.write_all(&records)
+    });
 
     let mut out = Vec::new();
     let read = (&mut stdout).take(OUTPUT_MAX as u64 + 1).read_to_end(&mut out);
@@ -123,7 +151,9 @@ pub fn pick_with(page: &SearchPage, fzf: &Path) -> Result<Option<i64>, PickError
         // Stop a child that is still talking; we are not listening any more.
         let _ = child.0.kill();
     }
-    let status = child.0.wait()?;
+    let status = child.0.wait();
+    crate::signal::set_child(0);
+    let status = status?;
     let written = writer.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 
     read?;
@@ -136,9 +166,9 @@ pub fn pick_with(page: &SearchPage, fzf: &Path) -> Result<Option<i64>, PickError
         _ => {}
     }
     match status.code() {
-        Some(0) => parse_selection(&out, page).map(Some),
-        // 1: Enter with no match. 130: Esc or CTRL-C.
-        Some(1 | 130) => Ok(None),
+        Some(0) => parse_selection(&out, page).map(Pick::Chosen),
+        Some(1) => Ok(Pick::NoMatch),
+        Some(130) => Ok(Pick::Cancelled),
         _ => Err(PickError::Protocol(format!("fzf exited with {status}"))),
     }
 }
@@ -153,6 +183,7 @@ impl Drop for Reaped {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+        crate::signal::set_child(0);
     }
 }
 
@@ -211,7 +242,9 @@ fn parse_version(token: &str) -> Option<(u32, u32, u32)> {
     parts.next().is_none().then_some((major, minor, patch))
 }
 
-/// `<id>\t<YYYY-MM-DD HH:MM>\t<source>\t<summary>\0` per hit.
+/// `<id>\t<YYYY-MM-DD HH:MM>\t<source>\t<summary>\0` per hit. Neutralized
+/// characters become '?', not U+FFFD: fzf (0.74.4) draws nothing for U+FFFD,
+/// so a backspace overwrite would read as clean text.
 fn encode(hits: &[PageHit]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(hits.len() * 96);
     for h in hits {
@@ -221,7 +254,11 @@ fn encode(hits: &[PageHit]) -> Vec<u8> {
         write!(buf, "{}\t{when}\t{}\t", h.id, app::display_line(h.source)).expect("Vec write");
         let mut budget = RECORD_MAX - 1 - (buf.len() - start);
         let mut utf8 = [0; 4];
-        for c in h.text.chars().map(app::display_char) {
+        let shown = |c| match app::display_char(c) {
+            '\u{FFFD}' => '?',
+            c => c,
+        };
+        for c in h.text.chars().map(shown) {
             if c.len_utf8() > budget {
                 break;
             }
@@ -279,6 +316,7 @@ mod tests {
             deferred: None,
             words_dropped: 0,
             order: app::Order::RecentlyImported,
+            filtered: true,
             hits,
         }
     }
@@ -322,8 +360,12 @@ mod tests {
             return;
         };
         check_version(&fzf).unwrap();
-        let p =
-            page(vec![hit(41, "make check"), hit(42, "cargo\tbuild\n--release"), hit(43, "ls")]);
+        let p = page(vec![
+            hit(41, "make check"),
+            hit(42, "cargo\tbuild\n--release"),
+            hit(43, "ls"),
+            hit(44, "echo secret\x08\x08public"),
+        ]);
         let filter = |q: &str| {
             let mut child = command(&fzf)
                 .args(ARGS)
@@ -341,6 +383,9 @@ mod tests {
         // Ids and timestamps are not searchable; the source is.
         assert_eq!(filter("41").status.code(), Some(1));
         assert_eq!(filter("2023").status.code(), Some(1));
-        assert_eq!(filter("zsh").stdout.iter().filter(|&&b| b == 0).count(), 3);
+        assert_eq!(filter("zsh").stdout.iter().filter(|&&b| b == 0).count(), 4);
+        // The backspaces are in what fzf matches and shows, not dropped.
+        assert_eq!(filter("'secret??public").status.code(), Some(0));
+        assert_eq!(filter("'secretpublic").status.code(), Some(1));
     }
 }
