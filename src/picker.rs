@@ -228,7 +228,9 @@ fn parse_version(token: &str) -> Option<(u32, u32, u32)> {
     parts.next().is_none().then_some((major, minor, patch))
 }
 
-/// `<id>\t<YYYY-MM-DD HH:MM>\t<source>\t<summary>\0` per hit.
+/// `<id>\t<YYYY-MM-DD HH:MM>\t<source>\t<summary>\0` per hit. Neutralized
+/// characters become '?', not U+FFFD: fzf (0.74.4) draws nothing for U+FFFD,
+/// so a backspace overwrite would read as clean text.
 fn encode(hits: &[PageHit]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(hits.len() * 96);
     for h in hits {
@@ -238,7 +240,11 @@ fn encode(hits: &[PageHit]) -> Vec<u8> {
         write!(buf, "{}\t{when}\t{}\t", h.id, app::display_line(h.source)).expect("Vec write");
         let mut budget = RECORD_MAX - 1 - (buf.len() - start);
         let mut utf8 = [0; 4];
-        for c in h.text.chars().map(app::display_char) {
+        let shown = |c| match app::display_char(c) {
+            '\u{FFFD}' => '?',
+            c => c,
+        };
+        for c in h.text.chars().map(shown) {
             if c.len_utf8() > budget {
                 break;
             }
@@ -340,8 +346,12 @@ mod tests {
             return;
         };
         check_version(&fzf).unwrap();
-        let p =
-            page(vec![hit(41, "make check"), hit(42, "cargo\tbuild\n--release"), hit(43, "ls")]);
+        let p = page(vec![
+            hit(41, "make check"),
+            hit(42, "cargo\tbuild\n--release"),
+            hit(43, "ls"),
+            hit(44, "echo secret\x08\x08public"),
+        ]);
         let filter = |q: &str| {
             let mut child = command(&fzf)
                 .args(ARGS)
@@ -359,6 +369,9 @@ mod tests {
         // Ids and timestamps are not searchable; the source is.
         assert_eq!(filter("41").status.code(), Some(1));
         assert_eq!(filter("2023").status.code(), Some(1));
-        assert_eq!(filter("zsh").stdout.iter().filter(|&&b| b == 0).count(), 3);
+        assert_eq!(filter("zsh").stdout.iter().filter(|&&b| b == 0).count(), 4);
+        // The backspaces are in what fzf matches and shows, not dropped.
+        assert_eq!(filter("'secret??public").status.code(), Some(0));
+        assert_eq!(filter("'secretpublic").status.code(), Some(1));
     }
 }
