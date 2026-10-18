@@ -115,6 +115,23 @@ mod tui {
         quits_cleanly(s, b"\x1b");
     }
 
+    /// `kill %1` on a stopped relic sends TERM then CONT while the shell
+    /// owns the terminal: relic dies of TERM, and putting the tty back from
+    /// the background must not stop it again.
+    #[test]
+    fn a_fatal_signal_after_ctrl_z_kills_relic_from_the_background() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let mut s = ready(&fx, &[]);
+        s.send(b"\x1a");
+        s.wait_stopped();
+        s.signal(libc::SIGTERM);
+        s.signal(libc::SIGCONT);
+        let status = s.wait_exit();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{}", pty_support::describe(status));
+        s.assert_restored();
+    }
+
     /// A dumb terminal gets a message, not escape sequences it cannot draw.
     #[test]
     fn a_dumb_terminal_is_refused_without_touching_it() {

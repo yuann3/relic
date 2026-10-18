@@ -37,11 +37,13 @@ pub fn install() {
         }
         // SAFETY: installs an async-signal-safe handler with every fatal
         // signal masked while it runs, so a second one cannot interrupt it.
+        // SIGTTOU too: after Ctrl-Z and `kill %1` the handler runs in the
+        // background, and its tcsetattr would otherwise stop Relic again.
         unsafe {
             let mut act: libc::sigaction = std::mem::zeroed();
             act.sa_sigaction = on_fatal as *const () as libc::sighandler_t;
             libc::sigemptyset(&mut act.sa_mask);
-            for s in FATAL {
+            for s in FATAL.into_iter().chain([libc::SIGTTOU]) {
                 libc::sigaddset(&mut act.sa_mask, s);
             }
             libc::sigaction(sig, &act, std::ptr::null_mut());
@@ -114,14 +116,19 @@ fn stop_child() {
     if pid <= 0 {
         return;
     }
-    // SAFETY: kill, waitpid and nanosleep are async-signal-safe; `st` and
-    // `tick` live on this stack frame.
+    // SAFETY: kill, waitpid, nanosleep and write are async-signal-safe;
+    // `st` and `tick` live on this stack frame.
     unsafe {
-        libc::kill(pid, libc::SIGTERM);
         let mut st = 0;
+        // Checked before any kill: once the main thread has reaped fzf the
+        // pid may be another process's. Only the main thread reaps, and this
+        // handler runs on it, so nothing reaps between check and kill.
+        if libc::waitpid(pid, &mut st, libc::WNOHANG) != 0 {
+            return;
+        }
+        libc::kill(pid, libc::SIGTERM);
         let tick = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
         for _ in 0..GRACE_MS / 10 {
-            // Reaped here, or already by the main thread (ECHILD).
             if libc::waitpid(pid, &mut st, libc::WNOHANG) != 0 {
                 return;
             }
@@ -129,5 +136,9 @@ fn stop_child() {
         }
         libc::kill(pid, libc::SIGKILL);
         libc::waitpid(pid, &mut st, 0);
+        // A killed fzf leaves its screen behind: mouse reporting, its
+        // alternate screen and a hidden cursor.
+        let reset = b"\x1b[?1000l\x1b[?1006l\x1b[?1049l\x1b[?25h";
+        libc::write(libc::STDOUT_FILENO, reset.as_ptr().cast(), reset.len());
     }
 }
