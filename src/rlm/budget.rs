@@ -15,6 +15,9 @@ struct Counters {
     evidence_handles: u32,
     local_materialized_bytes: u64,
     model_egress_bytes: u64,
+    provider_attempts: u16,
+    output_tokens: u64,
+    cost_microusd: u64,
 }
 
 /// Which budget dimension was exhausted.
@@ -27,6 +30,10 @@ pub enum BudgetExhausted {
     EvidenceHandles,
     LocalMaterializedBytes,
     ModelEgressBytes,
+    ProviderAttempts,
+    OutputTokens,
+    Cost,
+    WallClock,
 }
 
 impl std::fmt::Display for BudgetExhausted {
@@ -47,6 +54,11 @@ pub struct Reservation {
     pub evidence_handles: u32,
     pub local_materialized_bytes: u64,
     pub model_egress_bytes: u64,
+    pub provider_attempts: u16,
+    pub output_tokens: u64,
+    /// Zero when the profile has no prices: the cost is then unknown, not
+    /// fenced (research, budget and cost lease).
+    pub cost_microusd: u64,
 }
 
 impl BudgetLedger {
@@ -85,6 +97,15 @@ impl BudgetLedger {
         {
             return Err(BudgetExhausted::ModelEgressBytes);
         }
+        if self.consumed.provider_attempts + res.provider_attempts > self.limits.provider_attempts {
+            return Err(BudgetExhausted::ProviderAttempts);
+        }
+        if self.consumed.output_tokens + res.output_tokens > self.limits.reserved_output_tokens {
+            return Err(BudgetExhausted::OutputTokens);
+        }
+        if self.limits.max_cost_microusd.is_some_and(|max| self.consumed.cost_microusd + res.cost_microusd > max) {
+            return Err(BudgetExhausted::Cost);
+        }
 
         // All checks passed — consume atomically.
         self.consumed.root_calls += res.root_calls;
@@ -94,7 +115,17 @@ impl BudgetLedger {
         self.consumed.evidence_handles += res.evidence_handles;
         self.consumed.local_materialized_bytes += res.local_materialized_bytes;
         self.consumed.model_egress_bytes += res.model_egress_bytes;
+        self.consumed.provider_attempts += res.provider_attempts;
+        self.consumed.output_tokens += res.output_tokens;
+        self.consumed.cost_microusd += res.cost_microusd;
         Ok(())
+    }
+
+    /// Give back what a call reserved but its provider-reported usage shows
+    /// it did not spend. Only authoritative usage may release a reservation.
+    pub fn release_output(&mut self, tokens: u64, cost_microusd: u64) {
+        self.consumed.output_tokens = self.consumed.output_tokens.saturating_sub(tokens);
+        self.consumed.cost_microusd = self.consumed.cost_microusd.saturating_sub(cost_microusd);
     }
 
     /// Release unused portion of a previous reservation.
@@ -109,7 +140,7 @@ impl BudgetLedger {
             root_calls: self.limits.root_calls - self.consumed.root_calls,
             plan_ops: self.limits.plan_ops - self.consumed.plan_ops,
             child_calls: self.limits.child_calls - self.consumed.child_calls,
-            provider_attempts: self.limits.provider_attempts,
+            provider_attempts: self.limits.provider_attempts - self.consumed.provider_attempts,
             max_concurrency: self.limits.max_concurrency,
             max_depth: self.limits.max_depth,
             rows_returned: self.limits.rows_returned - self.consumed.rows_returned,
@@ -119,8 +150,8 @@ impl BudgetLedger {
             model_egress_bytes: self.limits.model_egress_bytes
                 - self.consumed.model_egress_bytes,
             estimated_input_tokens: self.limits.estimated_input_tokens,
-            reserved_output_tokens: self.limits.reserved_output_tokens,
-            max_cost_microusd: self.limits.max_cost_microusd,
+            reserved_output_tokens: self.limits.reserved_output_tokens - self.consumed.output_tokens,
+            max_cost_microusd: self.limits.max_cost_microusd.map(|max| max - self.consumed.cost_microusd),
         }
     }
 }

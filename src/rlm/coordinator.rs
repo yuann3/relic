@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
 use crate::rlm::evidence::{HandleId, HandleRegistry};
 use crate::rlm::executor::{self, ExecError};
-use crate::rlm::model::egress::{EgressError, EgressRequest, PayloadAudit, Role};
+use crate::rlm::calls::{Calls, Job, Stop, call_all};
+use crate::rlm::model::egress::{PayloadAudit, Role};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary, ModelError, parse_output};
 use crate::rlm::protocol::*;
 use crate::rlm::validate::{self, HandleKind, Op, ValidationError};
@@ -44,6 +45,8 @@ pub enum Progress {
     Egress(PayloadAudit),
     /// A model call came back; `returned_model` is what actually answered.
     Replied { role: Role, returned_model: Option<String> },
+    /// A failed call is sent again, as the retry rule allows once.
+    Retry { role: Role, attempt: u8, reason: String },
 }
 
 #[derive(Debug)]
@@ -66,7 +69,7 @@ impl std::error::Error for CoordinatorError {}
 /// What one investigation's steps share.
 struct Run<'a> {
     store: &'a Store,
-    model: &'a dyn ModelBoundary,
+    model: Arc<dyn ModelBoundary>,
     registry: HandleRegistry,
     ledger: BudgetLedger,
     turns: u32,
@@ -78,11 +81,25 @@ struct Run<'a> {
     progress: &'a mut dyn FnMut(Progress),
     /// When `wall_ms` runs out; every model call gives up by then.
     deadline: Instant,
+    /// Most child calls in flight at once.
+    concurrency: usize,
 }
 
 impl Run<'_> {
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    fn calls(&mut self) -> Calls<'_> {
+        Calls {
+            model: &self.model,
+            ledger: &mut self.ledger,
+            cancel: self.cancel,
+            progress: &mut *self.progress,
+            deadline: self.deadline,
+            concurrency: self.concurrency,
+            child_calls: &mut self.child_calls,
+        }
     }
 }
 
@@ -92,7 +109,7 @@ impl Run<'_> {
 pub fn run_investigation(
     question: &str,
     store: &Store,
-    model: &dyn ModelBoundary,
+    model: Arc<dyn ModelBoundary>,
     budget: BudgetV1,
     cancel: &Arc<AtomicBool>,
     progress: &mut dyn FnMut(Progress),
@@ -105,6 +122,7 @@ pub fn run_investigation(
         store,
         model,
         deadline,
+        concurrency: usize::from(budget.max_concurrency),
         registry: HandleRegistry::new(investigation_id, installation_key, budget.evidence_handles as usize),
         ledger: BudgetLedger::new(budget),
         turns: 0,
@@ -121,14 +139,6 @@ pub fn run_investigation(
 fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<FinishV1>) {
     let mut state_version: u32 = 0;
     loop {
-        if run.cancelled() {
-            return (InvestigationStatus::Cancelled, None);
-        }
-        // Reserve budget for a root call.
-        if run.ledger.reserve(&Reservation { root_calls: 1, ..Default::default() }).is_err() {
-            return (InvestigationStatus::BudgetExhausted, None);
-        }
-
         let state = build_root_state(
             question,
             state_version,
@@ -138,21 +148,14 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
             &run.ledger,
             run.store,
         );
-        let progress = &mut run.progress;
-        let target = run.model.target();
-        let req = match EgressRequest::new(Role::Root, state, &target, &mut run.ledger, &mut |a| progress(Progress::Egress(a))) {
-            Ok(req) => req,
-            Err(EgressError::Budget(_)) => return (InvestigationStatus::BudgetExhausted, None),
-            Err(e) => return (InvestigationStatus::Failed(e.to_string()), None),
-        };
-
-        (run.progress)(Progress::RootCall { turn: run.turns + 1 });
-        let reply = match run.model.call(&req, run.deadline) {
-            Ok(reply) => reply,
-            Err(e) => return (InvestigationStatus::Failed(format!("model error: {e}")), None),
+        let job = Job { role: Role::Root, payload: state, admitted: Progress::RootCall { turn: run.turns + 1 } };
+        let reply = match call_all(&mut run.calls(), vec![job]).map(|mut r| r.remove(0)) {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => return (InvestigationStatus::Failed(format!("model error: {e}")), None),
+            Err(Stop::Cancelled) => return (InvestigationStatus::Cancelled, None),
+            Err(Stop::Budget(_)) => return (InvestigationStatus::BudgetExhausted, None),
         };
         run.turns += 1;
-        (run.progress)(Progress::Replied { role: Role::Root, returned_model: reply.returned_model.clone() });
         let action: RootActionV1 = match parse_output(&reply.body, ROOT_RESULT_MAX) {
             Ok(action) => action,
             Err(e) => return (InvestigationStatus::Failed(format!("root action: {e:?}")), None),
@@ -230,7 +233,8 @@ fn execute_op(
     op: &Op,
     plan_outputs: &HashMap<String, HandleId>,
 ) -> Result<Option<(String, HandleId)>, CoordinatorError> {
-    let Run { store, model, registry, ledger, child_calls, last_inspection, notes, cancel, progress, deadline, .. } = run;
+    let Run { store, model, registry, ledger, child_calls, last_inspection, notes, cancel, progress, deadline, concurrency, .. } =
+        run;
     match op {
         Op::Search(s) => {
             // Reserve rows.
@@ -287,25 +291,31 @@ fn execute_op(
 
             // One child call admitted at a time, so a later stop leaves the
             // rest unsent.
-            let target = model.target();
-            let mut call_child = |packet: &EvidencePacket, objective: &str| {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(ExecError::Cancelled);
-                }
-                ledger.reserve(&Reservation { child_calls: 1, ..Default::default() }).map_err(ExecError::Budget)?;
-                let payload = executor::child_payload(objective, packet);
-                let req = EgressRequest::new(Role::Child, payload, &target, ledger, &mut |a| progress(Progress::Egress(a)))
-                    .map_err(|e| match e {
-                        EgressError::Budget(b) => ExecError::Budget(b),
-                        e => ExecError::Egress(e.to_string()),
-                    })?;
-                progress(Progress::ChildCall { op_id: a.op_id.clone(), packet_id: packet.packet_id.clone() });
-                let reply = model.call(&req, *deadline).map_err(ExecError::Model)?;
-                *child_calls += 1;
-                progress(Progress::Replied { role: Role::Child, returned_model: reply.returned_model.clone() });
-                Ok(reply.body)
+            let mut call_children = |packets: &[EvidencePacket], objective: &str| {
+                let jobs = packets
+                    .iter()
+                    .map(|p| Job {
+                        role: Role::Child,
+                        payload: executor::child_payload(objective, p),
+                        admitted: Progress::ChildCall { op_id: a.op_id.clone(), packet_id: p.packet_id.clone() },
+                    })
+                    .collect();
+                let mut calls = Calls {
+                    model,
+                    ledger,
+                    cancel,
+                    progress: &mut **progress,
+                    deadline: *deadline,
+                    concurrency: *concurrency,
+                    child_calls,
+                };
+                let replies = call_all(&mut calls, jobs).map_err(|stop| match stop {
+                    Stop::Cancelled => ExecError::Cancelled,
+                    Stop::Budget(b) => ExecError::Budget(b),
+                })?;
+                Ok(replies.into_iter().map(|r| r.map(|reply| reply.body)).collect())
             };
-            let hid = executor::execute_assess(a, registry, plan_outputs, &mut call_child, notes)
+            let hid = executor::execute_assess(a, registry, plan_outputs, &mut call_children, notes)
                 .map_err(CoordinatorError::Execution)?;
 
             Ok(Some((a.op_id.clone(), hid)))
@@ -467,7 +477,7 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         seed_corpus(&mut store);
 
-        let model = FakeModel::new();
+        let model = Arc::new(FakeModel::new());
 
         // Turn 1: search → expand → assess → inspect.
         model.add_root_response(RootActionV1 {
@@ -542,7 +552,7 @@ mod tests {
         let result = run_investigation(
             "What certificate renewal steps were observed?",
             &store,
-            &model,
+            model.clone(),
             budget,
             &Arc::default(),
             &mut |_| {},
@@ -568,7 +578,7 @@ mod tests {
     ) -> serde_json::Value {
         let mut store = Store::open_memory().unwrap();
         seed_corpus(&mut store);
-        let model = FakeModel::new();
+        let model = Arc::new(FakeModel::new());
         let op = |json: serde_json::Value| serde_json::from_value::<PlanOpV1>(json).unwrap();
         model.add_root_response(RootActionV1 {
             version: 1,
@@ -599,7 +609,7 @@ mod tests {
                 missing: vec!["test".into()],
             }),
         });
-        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
+        let result = run_investigation("q", &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
         assert_eq!(result.status, InvestigationStatus::Abstained);
         serde_json::from_str(&model.root_states()[1]).unwrap()
     }
@@ -663,14 +673,14 @@ mod tests {
     fn secrets_are_redacted_on_the_way_to_the_model_and_back() {
         let mut store = Store::open_memory().unwrap();
         seed_corpus(&mut store);
-        let model = FakeModel::new();
+        let model = Arc::new(FakeModel::new());
         let finish = serde_json::json!({"version": 1, "expected_state_version": 0, "kind": "finish", "plan": null, "finish": {
             "status": "partial", "answer": "run mysql --password=modelsaid42 first",
             "claims": [], "procedure": [], "contradictions": [], "missing": ["m"]}});
         model.add_root_raw(finish.to_string());
 
         let q = "why did mysql --password=hunter2hunter2 fail?";
-        let result = run_investigation(q, &store, &model, BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
+        let result = run_investigation(q, &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
         let sent = model.requests();
         assert!(sent.iter().all(|r| !r.user().contains("hunter2hunter2")), "{:?}", sent[0].user());
         let answer = result.finish.unwrap().answer;
@@ -681,12 +691,12 @@ mod tests {
     fn cancel_before_the_start_makes_no_root_call() {
         let mut store = Store::open_memory().unwrap();
         seed_corpus(&mut store);
-        let model = FakeModel::new();
+        let model = Arc::new(FakeModel::new());
         model.add_root_response(plan(serde_json::json!([{"op": "search", "op_id": "s1", "terms": ["certbot"], "match": "any", "limit": 5}])));
 
         let mut events = Vec::new();
         let cancel = Arc::new(AtomicBool::new(true));
-        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &cancel, &mut |p| events.push(p));
+        let result = run_investigation("q", &store, model.clone(), BudgetV1::prototype_default(), &cancel, &mut |p| events.push(p));
         assert_eq!((result.status, result.turns), (InvestigationStatus::Cancelled, 0));
         assert!(model.root_states().is_empty() && events.is_empty(), "{events:?}");
     }
@@ -695,7 +705,7 @@ mod tests {
     fn a_root_reply_after_cancel_is_dropped() {
         let mut store = Store::open_memory().unwrap();
         seed_corpus(&mut store);
-        let model = FakeModel::new();
+        let model = Arc::new(FakeModel::new());
         let finish = FinishV1 {
             status: AnswerStatus::Abstained,
             answer: String::new(),
@@ -708,7 +718,7 @@ mod tests {
 
         // Ctrl-C while the root call is out.
         let cancel = Arc::new(AtomicBool::new(false));
-        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &cancel, &mut |_| cancel.store(true, Ordering::Relaxed));
+        let result = run_investigation("q", &store, model.clone(), BudgetV1::prototype_default(), &cancel, &mut |_| cancel.store(true, Ordering::Relaxed));
         assert_eq!(model.root_states().len(), 1, "the call was made");
         assert_eq!(result.status, InvestigationStatus::Cancelled);
         assert!(result.finish.is_none());
@@ -718,7 +728,7 @@ mod tests {
     fn cancel_during_a_child_call_admits_no_other() {
         let mut store = Store::open_memory().unwrap();
         seed_corpus(&mut store);
-        let model = FakeModel::new();
+        let model = Arc::new(FakeModel::new());
         // 8 items: two packets of 4.
         model.add_root_response(plan(serde_json::json!([
             {"op": "search", "op_id": "s1", "terms": ["generic"], "match": "any", "limit": 8},
@@ -735,7 +745,9 @@ mod tests {
         model.add_child_response(FakeModel::default_supports_handler());
 
         let mut events = Vec::new();
-        let result = run_investigation("q", &store, &model, BudgetV1::prototype_default(), &cancel, &mut |p| events.push(p));
+        // One child at a time, so there is a next one to hold back.
+        let budget = BudgetV1 { max_concurrency: 1, ..BudgetV1::prototype_default() };
+        let result = run_investigation("q", &store, model.clone(), budget, &cancel, &mut |p| events.push(p));
         assert_eq!((result.status, result.child_calls), (InvestigationStatus::Cancelled, 1));
         events.retain(|e| !matches!(e, Progress::Egress(_) | Progress::Replied { .. }));
         assert_eq!(
@@ -810,7 +822,7 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         seed_corpus(&mut store);
 
-        let model = FakeModel::new();
+        let model = Arc::new(FakeModel::new());
         // Model would return a plan, but budget is exhausted before the call.
         model.add_root_response(RootActionV1 {
             version: 1,
@@ -831,7 +843,7 @@ mod tests {
         let mut budget = BudgetV1::prototype_default();
         budget.root_calls = 0;
 
-        let result = run_investigation("test", &store, &model, budget, &Arc::default(), &mut |_| {});
+        let result = run_investigation("test", &store, model.clone(), budget, &Arc::default(), &mut |_| {});
         assert_eq!(result.status, InvestigationStatus::BudgetExhausted);
         assert_eq!(result.turns, 0);
     }
@@ -841,7 +853,7 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         seed_corpus(&mut store);
 
-        let model = FakeModel::new();
+        let model = Arc::new(FakeModel::new());
         model.add_root_response(RootActionV1 {
             version: 1,
             expected_state_version: 0,
@@ -860,7 +872,7 @@ mod tests {
         let result = run_investigation(
             "How was the database migrated?",
             &store,
-            &model,
+            model.clone(),
             BudgetV1::prototype_default(),
             &Arc::default(),
             &mut |_| {},

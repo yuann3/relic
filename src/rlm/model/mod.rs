@@ -33,6 +33,29 @@ pub trait ModelBoundary: Send + Sync {
     /// The model's reply body, unparsed: the kernel caps and checks it.
     /// Must give up by `deadline`.
     fn call(&self, req: &EgressRequest, deadline: Instant) -> Result<Reply, ModelError>;
+
+    /// What a token costs, when the profile says; `None` leaves the cost
+    /// unknown rather than zero.
+    fn prices(&self) -> Option<Prices> {
+        None
+    }
+}
+
+/// Micro-US-dollars per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Prices {
+    pub input_per_mtok: u64,
+    pub output_per_mtok: u64,
+}
+
+impl Prices {
+    /// Micro-US-dollars for these token counts, rounded up.
+    pub fn cost(self, input_tokens: u64, output_tokens: u64) -> u64 {
+        input_tokens
+            .saturating_mul(self.input_per_mtok)
+            .saturating_add(output_tokens.saturating_mul(self.output_per_mtok))
+            .div_ceil(1_000_000)
+    }
 }
 
 /// One completed model call.
