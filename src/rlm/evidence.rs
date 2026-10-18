@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::domain::StoredObservation;
+use crate::rlm::protocol::ItemAssessmentV1;
 use crate::rlm::validate::HandleKind;
 
 /// A unique investigation identifier.
@@ -122,6 +123,9 @@ struct RegistryEntry {
     handle: ResultHandleV1,
     observations: Vec<StoredObservation>,
     evidence_handles: Vec<EvidenceHandleV1>,
+    /// One per observation in an assessment set; `None` is unassessed.
+    /// Empty for an evidence set.
+    assessments: Vec<Option<ItemAssessmentV1>>,
 }
 
 /// Manages result handles for one investigation.
@@ -150,15 +154,25 @@ impl HandleRegistry {
 
     /// Insert an evidence set. Returns the handle ID.
     pub fn insert_evidence_set(&mut self, observations: Vec<StoredObservation>) -> HandleId {
-        self.insert(HandleKind::EvidenceSet, observations)
+        self.insert(HandleKind::EvidenceSet, observations, Vec::new())
     }
 
-    /// Insert an assessment set. Returns the handle ID.
-    pub fn insert_assessment_set(&mut self, observations: Vec<StoredObservation>) -> HandleId {
-        self.insert(HandleKind::AssessmentSet, observations)
+    /// Insert an assessment set: `assessments[i]` is the verdict on
+    /// `observations[i]`. Returns the handle ID.
+    pub fn insert_assessment_set(
+        &mut self,
+        observations: Vec<StoredObservation>,
+        assessments: Vec<Option<ItemAssessmentV1>>,
+    ) -> HandleId {
+        self.insert(HandleKind::AssessmentSet, observations, assessments)
     }
 
-    fn insert(&mut self, kind: HandleKind, observations: Vec<StoredObservation>) -> HandleId {
+    fn insert(
+        &mut self,
+        kind: HandleKind,
+        observations: Vec<StoredObservation>,
+        assessments: Vec<Option<ItemAssessmentV1>>,
+    ) -> HandleId {
         let id = format!("h_{}", self.next_handle);
         self.next_handle += 1;
 
@@ -179,6 +193,7 @@ impl HandleRegistry {
             handle,
             observations,
             evidence_handles,
+            assessments,
         });
 
         id
@@ -197,6 +212,11 @@ impl HandleRegistry {
     /// Get the evidence handles for a result handle.
     pub fn get_evidence_handles(&self, handle_id: &str) -> Option<&[EvidenceHandleV1]> {
         self.entries.get(handle_id).map(|e| e.evidence_handles.as_slice())
+    }
+
+    /// The verdicts of an assessment set, aligned with its observations.
+    pub fn get_assessments(&self, handle_id: &str) -> Option<&[Option<ItemAssessmentV1>]> {
+        self.entries.get(handle_id).map(|e| e.assessments.as_slice())
     }
 
     /// Check if a specific evidence ID exists in any handle of this investigation.

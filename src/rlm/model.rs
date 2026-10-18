@@ -17,11 +17,12 @@ pub struct EvidenceItem {
 
 /// Trait for the model boundary. Implemented by FakeModel for tests.
 pub trait ModelBoundary {
+    /// The child's reply body, unparsed: the kernel caps and checks it.
     fn child_call(
         &self,
         packet: &EvidencePacket,
         objective: &str,
-    ) -> Result<ChildResultV1, ModelError>;
+    ) -> Result<String, ModelError>;
 
     fn root_call(
         &self,
@@ -43,7 +44,7 @@ impl std::fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
-type ChildHandler = Box<dyn Fn(&EvidencePacket) -> ChildResultV1 + Send>;
+type ChildHandler = Box<dyn Fn(&EvidencePacket) -> String + Send>;
 
 /// A fake model that returns scripted responses for testing.
 #[derive(Default)]
@@ -64,6 +65,14 @@ impl FakeModel {
     pub fn add_child_response<F>(&self, f: F)
     where
         F: Fn(&EvidencePacket) -> ChildResultV1 + Send + 'static,
+    {
+        self.add_child_raw(move |p| serde_json::to_string(&f(p)).unwrap());
+    }
+
+    /// Add a child reply body exactly as the model would send it.
+    pub fn add_child_raw<F>(&self, f: F)
+    where
+        F: Fn(&EvidencePacket) -> String + Send + 'static,
     {
         self.child_responses.lock().unwrap().push(Box::new(f));
     }
@@ -103,7 +112,7 @@ impl ModelBoundary for FakeModel {
         &self,
         packet: &EvidencePacket,
         _objective: &str,
-    ) -> Result<ChildResultV1, ModelError> {
+    ) -> Result<String, ModelError> {
         let mut responses = self.child_responses.lock().unwrap();
         if responses.is_empty() {
             return Err(ModelError::Refused("no more scripted child responses".into()));

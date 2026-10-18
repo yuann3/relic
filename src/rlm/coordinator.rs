@@ -5,7 +5,7 @@ use crate::rlm::evidence::{HandleId, HandleRegistry};
 use crate::rlm::executor::{self, ExecError};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary, ModelError};
 use crate::rlm::protocol::*;
-use crate::rlm::validate::{self, Op, ValidationError};
+use crate::rlm::validate::{self, HandleKind, Op, ValidationError};
 use crate::store::Store;
 
 /// Terminal result of an investigation.
@@ -63,6 +63,8 @@ pub fn run_investigation(
     let mut turns: u32 = 0;
     let mut total_child_calls: u16 = 0;
     let mut last_inspection: Option<EvidencePacket> = None;
+    // What the host tells the root about the last plan, besides its handles.
+    let mut notes: Vec<String> = Vec::new();
 
     loop {
         // Reserve budget for a root call.
@@ -84,6 +86,7 @@ pub fn run_investigation(
             state_version,
             &registry,
             &last_inspection,
+            &std::mem::take(&mut notes),
             &ledger,
             store,
         );
@@ -143,6 +146,7 @@ pub fn run_investigation(
                         &mut ledger,
                         &mut total_child_calls,
                         &mut last_inspection,
+                        &mut notes,
                     ) {
                         Ok(Some((op_id, handle_id))) => {
                             plan_outputs.insert(op_id, handle_id);
@@ -205,6 +209,7 @@ fn execute_op(
     ledger: &mut BudgetLedger,
     child_calls: &mut u16,
     last_inspection: &mut Option<EvidencePacket>,
+    notes: &mut Vec<String>,
 ) -> Result<Option<(String, HandleId)>, CoordinatorError> {
     match op {
         Op::Search(s) => {
@@ -259,7 +264,7 @@ fn execute_op(
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let hid = executor::execute_assess(a, registry, plan_outputs, model, ledger, child_calls)
+            let hid = executor::execute_assess(a, registry, plan_outputs, model, ledger, child_calls, notes)
                 .map_err(CoordinatorError::Execution)?;
 
             Ok(Some((a.op_id.clone(), hid)))
@@ -310,12 +315,26 @@ fn execute_op(
     }
 }
 
+/// How many items of an assessment set got each verdict. Unassessed items
+/// are counted apart, never as support (ADR 0009).
+fn verdict_counts(slots: &[Option<ItemAssessmentV1>]) -> serde_json::Value {
+    let count = |v: Option<Verdict>| slots.iter().filter(|s| s.as_ref().map(|a| a.verdict.clone()) == v).count();
+    serde_json::json!({
+        "supports": count(Some(Verdict::Supports)),
+        "contradicts": count(Some(Verdict::Contradicts)),
+        "unclear": count(Some(Verdict::Unclear)),
+        "irrelevant": count(Some(Verdict::Irrelevant)),
+        "unassessed": count(None),
+    })
+}
+
 /// Build a JSON root state for the model. Must stay under 64 KiB.
 fn build_root_state_json(
     question: &str,
     state_version: u32,
     registry: &HandleRegistry,
     last_inspection: &Option<EvidencePacket>,
+    notes: &[String],
     ledger: &BudgetLedger,
     store: &Store,
 ) -> String {
@@ -328,12 +347,17 @@ fn build_root_state_json(
         "state_version": state_version,
         "corpus": { "observation_count": obs_count },
         "handles": summaries.iter().map(|s| {
-            serde_json::json!({
+            let mut h = serde_json::json!({
                 "id": s.id,
                 "kind": format!("{:?}", s.kind),
                 "count": s.count,
-            })
+            });
+            if let Some(slots) = registry.get_assessments(&s.id).filter(|_| s.kind == HandleKind::AssessmentSet) {
+                h["verdicts"] = verdict_counts(slots);
+            }
+            h
         }).collect::<Vec<_>>(),
+        "notes": notes,
         "budget_remaining": {
             "root_calls": remaining.root_calls,
             "child_calls": remaining.child_calls,
@@ -524,6 +548,7 @@ mod tests {
             3,
             &registry,
             &Some(inspection),
+            &[],
             &ledger,
             &store,
         );

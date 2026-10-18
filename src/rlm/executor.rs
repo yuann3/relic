@@ -14,7 +14,34 @@ pub enum ExecError {
     NoObservationsForExpand,
     Model(crate::rlm::model::ModelError),
     Budget(BudgetExhausted),
-    ChildAllowlistViolation { item_id: String, bad_evidence_id: String },
+}
+
+/// Why a child result was rejected whole (ADR 0009).
+#[derive(Debug, PartialEq)]
+pub enum ChildRejection {
+    Oversize { bytes: usize },
+    Malformed(String),
+    Version(u8),
+    PacketId(String),
+    UnknownItem(String),
+    DuplicateItem(String),
+    Citation { item_id: String, evidence_id: String },
+}
+
+impl std::fmt::Display for ChildRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Oversize { bytes } => write!(f, "{bytes} bytes, over the {CHILD_RESULT_MAX}-byte cap"),
+            Self::Malformed(e) => write!(f, "not a child result: {e}"),
+            Self::Version(v) => write!(f, "version {v}, not 1"),
+            Self::PacketId(id) => write!(f, "packet_id {id:?} is not the packet sent"),
+            Self::UnknownItem(id) => write!(f, "item_id {id:?} is not in the packet"),
+            Self::DuplicateItem(id) => write!(f, "item_id {id:?} assessed twice"),
+            Self::Citation { item_id, evidence_id } => {
+                write!(f, "{item_id:?} cites {evidence_id:?}, which is not in the packet")
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for ExecError {
@@ -100,6 +127,46 @@ pub const CHILD_ITEMS_MAX: usize = 4;
 /// ADR 0004. The adapter's template and schema must fit in it too (S6).
 pub const CHILD_PACKET_MAX: usize = 24 * 1024;
 
+/// Most bytes of one note to the root; root state has a 64 KiB cap.
+const NOTE_MAX: usize = 256;
+
+/// Most bytes of a child's reply. Checked before parsing, so a huge body
+/// costs nothing to refuse (research, security boundary 7).
+pub const CHILD_RESULT_MAX: usize = 16 * 1024;
+
+/// The verdicts in `raw` on each item of `packet`, in packet order; `None`
+/// where the child skipped an item. Any fault rejects the whole result.
+pub fn check_child_result(
+    packet: &EvidencePacket,
+    raw: &str,
+) -> Result<Vec<Option<ItemAssessmentV1>>, ChildRejection> {
+    if raw.len() > CHILD_RESULT_MAX {
+        return Err(ChildRejection::Oversize { bytes: raw.len() });
+    }
+    let result: ChildResultV1 = serde_json::from_str(raw).map_err(|e| ChildRejection::Malformed(e.to_string()))?;
+    if result.version != 1 {
+        return Err(ChildRejection::Version(result.version));
+    }
+    if result.packet_id != packet.packet_id {
+        return Err(ChildRejection::PacketId(result.packet_id));
+    }
+    let mut slots: Vec<Option<ItemAssessmentV1>> = vec![None; packet.items.len()];
+    for a in result.assessments {
+        let Some(i) = packet.items.iter().position(|item| item.item_id == a.item_id) else {
+            return Err(ChildRejection::UnknownItem(a.item_id));
+        };
+        let cited = a.claims.iter().flat_map(|c| c.supports.iter().chain(&c.contradicts));
+        if let Some(bad) = cited.into_iter().find(|ev| !packet.items.iter().any(|item| &item.evidence_id == *ev)) {
+            return Err(ChildRejection::Citation { item_id: a.item_id, evidence_id: bad.clone() });
+        }
+        if slots[i].is_some() {
+            return Err(ChildRejection::DuplicateItem(a.item_id));
+        }
+        slots[i] = Some(a);
+    }
+    Ok(slots)
+}
+
 /// Encoded size of what one child call is sent.
 fn packet_bytes(objective: &str, packet: &EvidencePacket) -> usize {
     serde_json::to_vec(&(objective, packet)).expect("strings and integers serialize").len()
@@ -164,6 +231,7 @@ pub fn execute_assess(
     model: &dyn ModelBoundary,
     ledger: &mut BudgetLedger,
     child_calls_made: &mut u16,
+    notes: &mut Vec<String>,
 ) -> Result<HandleId, ExecError> {
     let source_handle_id = resolve_input(&assess.input, plan_outputs)?;
     let source_obs = registry
@@ -176,12 +244,6 @@ pub fn execute_assess(
 
     // Select up to max_items observations.
     let selected_count = source_obs.len().min(assess.max_items as usize);
-
-    // Build allowlist of evidence IDs for this assess.
-    let allowlist: std::collections::HashSet<&str> = evidence_handles[..selected_count]
-        .iter()
-        .map(|eh| eh.id.as_str())
-        .collect();
 
     let items = (0..selected_count)
         .map(|i| EvidenceItem {
@@ -197,36 +259,28 @@ pub fn execute_assess(
         .reserve(&Reservation { child_calls, ..Default::default() })
         .map_err(ExecError::Budget)?;
 
-    // Collect all child assessments.
-    let mut all_assessments: Vec<ItemAssessmentV1> = Vec::new();
-
+    let mut assessments = Vec::with_capacity(selected_count);
     for packet in &packets {
-        let child_result = model
+        let raw = model
             .child_call(packet, &assess.objective)
             .map_err(ExecError::Model)?;
         *child_calls_made += 1;
-
-        // Validate child response: packet_id must match, all citation IDs in allowlist.
-        for assessment in &child_result.assessments {
-            for claim in &assessment.claims {
-                for ev_id in claim.supports.iter().chain(claim.contradicts.iter()) {
-                    if !allowlist.contains(ev_id.as_str()) {
-                        return Err(ExecError::ChildAllowlistViolation {
-                            item_id: assessment.item_id.clone(),
-                            bad_evidence_id: ev_id.clone(),
-                        });
-                    }
-                }
+        match check_child_result(packet, &raw) {
+            Ok(slots) => assessments.extend(slots),
+            // The other packets' verdicts stand; this one's items stay
+            // unassessed and the root is told why.
+            Err(why) => {
+                let mut note = format!("{}: child result for {} rejected: {why}", assess.op_id, packet.packet_id);
+                // It quotes the model's ids, which only the 16 KiB body cap bounds.
+                note.truncate(note.floor_char_boundary(NOTE_MAX));
+                notes.push(note);
+                assessments.extend(packet.items.iter().map(|_| None));
             }
         }
-
-        all_assessments.extend(child_result.assessments);
     }
 
-    // Store the assessment result — reuse the same observations for now.
-    // The assessment metadata is carried in the child results, not in observations.
     let assessed_obs = source_obs[..selected_count].to_vec();
-    Ok(registry.insert_assessment_set(assessed_obs))
+    Ok(registry.insert_assessment_set(assessed_obs, assessments))
 }
 
 /// Resolve an InputRefV1 to a HandleId.
@@ -507,6 +561,7 @@ mod tests {
             &model,
             &mut ledger,
             &mut child_calls,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -520,60 +575,92 @@ mod tests {
     }
 
     #[test]
-    fn assess_rejects_bad_citation_in_child_response() {
+    fn child_result_rejected_whole_on_any_fault() {
+        let packet = EvidencePacket { packet_id: "pkt_00".into(), items: vec![item(0, "a".into()), item(1, "b".into())] };
+        let (ev0, ev1) = (packet.items[0].evidence_id.clone(), packet.items[1].evidence_id.clone());
+        let good = serde_json::json!({"version": 1, "packet_id": "pkt_00", "assessments": [
+            {"item_id": "item_0", "verdict": "supports", "confidence": "high",
+             "claims": [{"text": "t", "supports": [ev0], "contradicts": [ev1]}]},
+            {"item_id": "item_1", "verdict": "irrelevant", "confidence": "low", "claims": []},
+        ]});
+        let with = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = good.clone();
+            edit(&mut v);
+            check_child_result(&packet, &v.to_string())
+        };
+
+        let verdicts = |r: Result<Vec<Option<ItemAssessmentV1>>, _>| {
+            r.unwrap().into_iter().map(|a| a.map(|a| a.verdict)).collect::<Vec<_>>()
+        };
+        assert_eq!(verdicts(with(&|_| {})), [Some(Verdict::Supports), Some(Verdict::Irrelevant)]);
+        let omitted = with(&|v| drop(v["assessments"].as_array_mut().unwrap().pop()));
+        assert_eq!(verdicts(omitted), [Some(Verdict::Supports), None], "a skipped item is unassessed");
+
+        let foreign = item(9, String::new()).evidence_id;
+        assert_eq!(with(&|v| v["packet_id"] = "pkt_01".into()), Err(ChildRejection::PacketId("pkt_01".into())));
+        assert_eq!(with(&|v| v["version"] = 2.into()), Err(ChildRejection::Version(2)));
+        assert_eq!(
+            with(&|v| v["assessments"][1]["item_id"] = "item_9".into()),
+            Err(ChildRejection::UnknownItem("item_9".into()))
+        );
+        assert_eq!(
+            with(&|v| v["assessments"][1]["item_id"] = "item_0".into()),
+            Err(ChildRejection::DuplicateItem("item_0".into()))
+        );
+        let cited = |field: &'static str| {
+            with(&|v| v["assessments"][0]["claims"][0][field] = serde_json::json!([foreign]))
+        };
+        let outside = Err(ChildRejection::Citation { item_id: "item_0".into(), evidence_id: foreign.clone() });
+        assert_eq!(cited("supports"), outside);
+        assert_eq!(cited("contradicts"), outside);
+        assert!(matches!(
+            with(&|v| v["assessments"][1]["note"] = "x".into()),
+            Err(ChildRejection::Malformed(e)) if e.contains("unknown field")
+        ));
+        // A valid result padded past the cap: refused for its size alone.
+        let padded = format!("{good}{}", " ".repeat(CHILD_RESULT_MAX));
+        assert_eq!(check_child_result(&packet, &padded), Err(ChildRejection::Oversize { bytes: padded.len() }));
+    }
+
+    #[test]
+    fn a_rejected_child_result_leaves_its_packet_unassessed() {
         use crate::rlm::model::FakeModel;
 
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
-        insert_commands(&mut store, rev_id, &["cargo build"]);
-
+        let cmds: Vec<String> = (0..8).map(|i| format!("cargo task_{i}")).collect();
+        insert_commands(&mut store, rev_id, &cmds.iter().map(String::as_str).collect::<Vec<_>>());
         let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
-        let search = SearchV1 {
-            op_id: "s1".to_string(),
-            terms: vec!["cargo".to_string()],
-            match_mode: MatchMode::Any,
-            limit: 10,
-        };
+        let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into()], match_mode: MatchMode::Any, limit: 50 };
         let s_hid = execute_search(&store, &search, &mut registry).unwrap();
+        // Packet 1's evidence, which packet 0's child was never sent.
+        let other_packet = registry.get_evidence_handles(&s_hid).unwrap()[4].id.clone();
 
-        // Fake model returns a citation that's not in the allowlist.
         let model = FakeModel::new();
-        model.add_child_response(|packet: &EvidencePacket| ChildResultV1 {
-            version: 1,
-            packet_id: packet.packet_id.clone(),
-            assessments: vec![ItemAssessmentV1 {
-                item_id: "item_0".to_string(),
-                verdict: Verdict::Supports,
-                confidence: Confidence::High,
-                claims: vec![ClaimV1 {
-                    text: "forged claim".to_string(),
-                    supports: vec!["ev1_FORGED".to_string()],
-                    contradicts: vec![],
-                }],
-                missing: vec![],
-            }],
+        let honest = FakeModel::default_supports_handler();
+        model.add_child_response(move |p| {
+            let mut r = honest(p);
+            r.assessments[0].claims[0].supports.push(other_packet.clone());
+            r
         });
+        model.add_child_response(FakeModel::default_supports_handler());
 
-        let assess = AssessV1 {
-            op_id: "a1".to_string(),
-            input: InputRefV1::Output("s1".to_string()),
-            objective: "test".to_string(),
-            max_items: 1,
-        };
-        let mut plan_outputs = HashMap::new();
-        plan_outputs.insert("s1".to_string(), s_hid);
-
-        let mut child_calls = 0u16;
-        let mut ledger = BudgetLedger::new(BudgetV1::prototype_default());
-        let result = execute_assess(
+        let assess = AssessV1 { op_id: "a1".into(), input: InputRefV1::Handle(s_hid), objective: "o".into(), max_items: 8 };
+        let mut notes = Vec::new();
+        let a_hid = execute_assess(
             &assess,
             &mut registry,
-            &plan_outputs,
+            &HashMap::new(),
             &model,
-            &mut ledger,
-            &mut child_calls,
-        );
+            &mut BudgetLedger::new(BudgetV1::prototype_default()),
+            &mut 0,
+            &mut notes,
+        )
+        .unwrap();
 
-        assert!(matches!(result, Err(ExecError::ChildAllowlistViolation { .. })));
+        let verdicts: Vec<_> = registry.get_assessments(&a_hid).unwrap().iter().map(|a| a.as_ref().map(|a| a.verdict.clone())).collect();
+        assert_eq!(verdicts, [vec![None; 4], vec![Some(Verdict::Supports); 4]].concat());
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("pkt_00") && notes[0].contains("not in the packet"), "{}", notes[0]);
     }
 }
