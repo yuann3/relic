@@ -48,6 +48,13 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub fn run(db: &Path) -> Result<()> {
     let started = Instant::now();
+    // A dumb terminal (an Emacs shell buffer, a CI log) would get raw escape
+    // sequences instead of a workspace.
+    if std::env::var_os("TERM").is_none_or(|t| t.is_empty() || t == "dumb") {
+        return Err("ui needs a terminal that can draw full screen, and TERM is dumb or unset; \
+                    use `relic search <words>` instead"
+            .into());
+    }
     // Evidence loads are single indexed lookups, cheap enough for the main
     // thread; searches get their own connection and thread. Both open before
     // the terminal is taken, so a store that cannot be read is an error on
@@ -55,6 +62,7 @@ pub fn run(db: &Path) -> Result<()> {
     let store = Store::open_read_only(db)?;
     let worker_store = Store::open_read_only(db)?;
     let mono = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    let ascii = !utf8_locale(|k| std::env::var_os(k));
     let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
 
     crate::signal::install();
@@ -87,7 +95,9 @@ pub fn run(db: &Path) -> Result<()> {
             awaiting_frame: None,
             started,
         };
-        let r = rt.event_loop(&mut guard, &rx, UiModel::new(mono));
+        let mut model = UiModel::new(mono);
+        model.ascii = ascii;
+        let r = rt.event_loop(&mut guard, &rx, model);
         if let Some((_, cancel)) = rt.recall.take() {
             cancel.store(true, Ordering::SeqCst);
         }
@@ -109,6 +119,16 @@ pub fn run(db: &Path) -> Result<()> {
 fn redraw_all<B: Backend>(terminal: &mut Terminal<B>) -> std::result::Result<(), B::Error> {
     let size = terminal.size()?;
     terminal.resize(ratatui::layout::Rect::from((ratatui::layout::Position::ORIGIN, size)))
+}
+
+/// Whether the locale says the terminal speaks UTF-8, picking the variable
+/// as setlocale(LC_CTYPE) does: LC_ALL, then LC_CTYPE, then LANG, the first
+/// set and non-empty. None set is the C locale: ASCII.
+fn utf8_locale(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["LC_ALL", "LC_CTYPE", "LANG"].into_iter().filter_map(var).find(|v| !v.is_empty()).is_some_and(|v| {
+        let v = v.to_string_lossy().to_ascii_lowercase();
+        v.contains("utf-8") || v.contains("utf8")
+    })
 }
 
 /// Closes the mailbox and joins the search worker. The receiver goes first:
@@ -473,6 +493,19 @@ impl Trace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_locale_reads_the_variable_setlocale_would() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.into())
+        };
+        assert!(utf8_locale(env(&[("LANG", "en_SG.UTF-8")])));
+        assert!(utf8_locale(env(&[("LC_CTYPE", "C.utf8"), ("LANG", "C")])));
+        assert!(!utf8_locale(env(&[])));
+        // LC_ALL overrides a UTF-8 LANG; an empty one does not count.
+        assert!(!utf8_locale(env(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")])));
+        assert!(utf8_locale(env(&[("LC_ALL", ""), ("LANG", "en_US.UTF-8")])));
+    }
 
     fn job(generation: u64, query: &str, issued: Instant) -> SearchJob {
         SearchJob {

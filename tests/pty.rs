@@ -115,6 +115,20 @@ mod tui {
         quits_cleanly(s, b"\x1b");
     }
 
+    /// A dumb terminal gets a message, not escape sequences it cannot draw.
+    #[test]
+    fn a_dumb_terminal_is_refused_without_touching_it() {
+        let _s = serial();
+        let fx = Fixture::new();
+        let mut s = Session::spawn(&fx.db, &[("TERM", "dumb".as_ref())]);
+        s.assert_exit_code(2);
+        s.assert_restored();
+        s.with(|o| {
+            assert!(o.contains("TERM is dumb or unset"), "{}", pty_support::dump(o));
+            assert_eq!(o.count(ENTER_ALT), 0);
+        });
+    }
+
     #[test]
     fn double_ctrl_c_quits() {
         let _s = serial();

@@ -297,6 +297,8 @@ pub struct UiModel {
     pub notice: Option<String>,
     /// `NO_COLOR`: styles use modifiers only.
     pub mono: bool,
+    /// The locale is not UTF-8: draw in ASCII.
+    pub ascii: bool,
     /// Set by the view on each draw. While the workspace is replaced by the
     /// "too small" message, keys would act on panes the user cannot see.
     pub too_small: Cell<bool>,
@@ -315,6 +317,7 @@ impl UiModel {
             modal: None,
             notice: None,
             mono,
+            ascii: false,
             too_small: Cell::new(false),
             dirty: true,
             last_interrupt: None,

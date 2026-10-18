@@ -66,6 +66,33 @@ impl Theme {
 }
 
 pub fn view(frame: &mut Frame, m: &UiModel) {
+    workspace(frame, m);
+    if m.ascii {
+        for cell in frame.buffer_mut().content.iter_mut() {
+            if !cell.symbol().is_ascii() {
+                let c = ascii_for(cell.symbol());
+                cell.set_char(c);
+            }
+        }
+    }
+}
+
+/// What a terminal in a non-UTF-8 locale gets for a symbol it cannot show.
+fn ascii_for(symbol: &str) -> char {
+    match symbol {
+        "─" | "━" => '-',
+        "│" | "┃" => '|',
+        "┌" | "┐" | "└" | "┘" | "┏" | "┓" | "┗" | "┛" => '+',
+        "…" => '.',
+        "·" => '-',
+        "→" => '>',
+        "↑" => '^',
+        "↓" => 'v',
+        _ => '?',
+    }
+}
+
+fn workspace(frame: &mut Frame, m: &UiModel) {
     let t = Theme::new(m.mono);
     let area = frame.area();
     m.too_small.set(area.width < MIN_WIDTH || area.height < MIN_HEIGHT);
@@ -882,6 +909,21 @@ mod tests {
         let s = text(&render(&m, 120, 40));
         let left_out = long.len() - EVIDENCE_BYTES;
         assert!(s.contains(&format!("… {left_out} more bytes not shown")), "{s}");
+    }
+
+    /// In a non-UTF-8 locale every cell is ASCII, and the frame keeps its
+    /// shape: corners, edges and separators have ASCII stand-ins.
+    #[test]
+    fn a_non_utf8_locale_draws_ascii() {
+        let store = store_with(&["echo 部署 café", "ls"]);
+        let mut m = typed(&store, "echo", false);
+        m.ascii = true;
+        let s = text(&render(&m, 120, 30));
+        assert!(s.is_ascii(), "{s}");
+        let first = s.lines().next().unwrap();
+        assert!(first.starts_with("+[ Query - local index - offline ]---") && first.ends_with('+'), "{s}");
+        // A wide glyph keeps its two columns, so the rows stay aligned.
+        assert!(s.contains("echo ??  caf?"), "{s}");
     }
 
     #[test]

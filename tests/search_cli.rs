@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn relic(args: &[&str], db: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_relic")).args(args).arg("--db").arg(db).output().unwrap()
+    // `ui` refuses a dumb or missing TERM before it opens the store.
+    Command::new(env!("CARGO_BIN_EXE_relic")).args(args).arg("--db").arg(db).env("TERM", "xterm").output().unwrap()
 }
 
 fn store_with(dir: &Path, commands: &[&str]) -> PathBuf {

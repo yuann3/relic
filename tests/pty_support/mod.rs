@@ -116,7 +116,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// `relic ui --db <db>` with only `env` (plus `TERM`, a scratch `HOME`
+    /// `relic ui --db <db>` with only `env` (plus `TERM`, a UTF-8 `LANG`, a scratch `HOME`
     /// and, unless given, a system-only `PATH`) in its environment.
     pub fn spawn(db: &Path, env: &[(&str, &OsStr)]) -> Self {
         Self::spawn_with(db, env, Hup::Forward)
@@ -144,6 +144,7 @@ impl Session {
         let mut vars: Vec<(&OsStr, &OsStr)> = vec![
             ("PATH".as_ref(), "/usr/bin:/bin".as_ref()),
             ("TERM".as_ref(), "xterm-256color".as_ref()),
+            ("LANG".as_ref(), "en_US.UTF-8".as_ref()),
             ("HOME".as_ref(), home.as_os_str()),
         ];
         for (k, v) in env {
