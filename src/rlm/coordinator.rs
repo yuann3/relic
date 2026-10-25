@@ -3,9 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::domain::StoredObservation;
 use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
-use crate::rlm::evidence::{HandleId, HandleRegistry};
+use crate::rlm::evidence::{EvidenceId, HandleId, HandleRegistry};
 use crate::rlm::executor::{self, ExecError};
+use crate::rlm::finish;
 use crate::rlm::calls::{Calls, Job, Stop, call_all};
 use crate::rlm::model::egress::{PayloadAudit, Role};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary, ModelError, parse_output};
@@ -17,7 +19,10 @@ use crate::store::Store;
 #[derive(Debug)]
 pub struct InvestigationResult {
     pub status: InvestigationStatus,
+    /// Past the finish gate: every citation in it resolves.
     pub finish: Option<FinishV1>,
+    /// The observation behind each evidence id `finish` cites.
+    pub cited: HashMap<EvidenceId, StoredObservation>,
     pub turns: u32,
     pub child_calls: u16,
 }
@@ -133,7 +138,15 @@ pub fn run_investigation(
         progress,
     };
     let (status, finish) = investigate(&mut run, question);
-    InvestigationResult { status, finish, turns: run.turns, child_calls: run.child_calls }
+    let cited = finish
+        .iter()
+        .flat_map(|f| {
+            let claims = f.claims.iter().flat_map(|c| c.supports.iter().chain(&c.contradicts));
+            claims.chain(f.procedure.iter().flat_map(|s| &s.supports))
+        })
+        .filter_map(|id| Some((id.clone(), run.registry.resolve_evidence_id(id)?.1.clone())))
+        .collect();
+    InvestigationResult { status, finish, cited, turns: run.turns, child_calls: run.child_calls }
 }
 
 fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<FinishV1>) {
@@ -216,6 +229,16 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
             RootActionKind::Finish => {
                 let Some(finish) = action.finish else {
                     return (InvestigationStatus::Failed("finish action missing finish body".into()), None);
+                };
+                // An answer resting on a citation that does not resolve has
+                // no evidence behind it: it abstains, saying why (ADR 0009).
+                let finish = match finish::validate_finish(&finish, &run.registry) {
+                    Ok(checked) => checked.finish,
+                    Err(e) => {
+                        let why = format!("the finish gate refused the answer: {e}");
+                        (run.progress)(Progress::Note(why.clone()));
+                        finish::force_abstention(&finish, vec![why])
+                    }
                 };
                 let status = match finish.status {
                     AnswerStatus::Answered => InvestigationStatus::Completed,
@@ -521,31 +544,17 @@ mod tests {
         model.add_child_response(FakeModel::default_supports_handler());
         model.add_child_response(FakeModel::default_supports_handler());
 
-        // Turn 2: finish with cited claims.
-        // The model will see inspection items with evidence IDs. We use a closure
-        // to construct the finish after the root state is available.
-        // For the prototype, we pre-construct with placeholder evidence IDs
-        // since FakeModel root_call ignores state_json.
-        model.add_root_response(RootActionV1 {
-            version: 1,
-            expected_state_version: 1,
-            kind: RootActionKind::Finish,
-            plan: None,
-            finish: Some(FinishV1 {
-                status: AnswerStatus::Answered,
-                answer: "Certificate was renewed using certbot renew.".to_string(),
-                claims: vec![FinalClaimV1 {
-                    text: "certbot renew was executed".to_string(),
-                    supports: vec!["placeholder_ev".to_string()],
-                    contradicts: vec![],
-                }],
-                procedure: vec![ProcedureStepV1 {
-                    text: "Run certbot renew --nginx -d example.com".to_string(),
-                    supports: vec!["placeholder_ev".to_string()],
-                }],
-                contradictions: vec![],
-                missing: vec![],
-            }),
+        // Turn 2: finish citing the inspected renewal, by the id this
+        // investigation gave it.
+        model.add_root_fn(|state| {
+            let items = state["last_inspection"]["items"].as_array().unwrap();
+            let renew = items.iter().find(|i| i["safe_text"].as_str().unwrap().contains("renew")).unwrap();
+            let cite = renew["evidence_id"].clone();
+            serde_json::json!({"version": 1, "expected_state_version": 1, "kind": "finish", "plan": null, "finish": {
+                "status": "answered", "answer": "Certificate was renewed using certbot renew.",
+                "claims": [{"text": "certbot renew was executed", "supports": [cite]}],
+                "procedure": [{"text": "Run certbot renew --nginx -d example.com", "supports": [cite]}]}})
+            .to_string()
         });
 
         let budget = BudgetV1::prototype_default();
@@ -566,8 +575,29 @@ mod tests {
 
         let finish = result.finish.unwrap();
         assert_eq!(finish.status, AnswerStatus::Answered);
-        assert!(!finish.claims.is_empty());
-        assert!(!finish.procedure.is_empty());
+        let cite = &finish.claims[0].supports[0];
+        assert_eq!(result.cited[cite].safe_text, "certbot renew --nginx -d example.com");
+        assert_eq!(&finish.procedure[0].supports[..], std::slice::from_ref(cite));
+    }
+
+    #[test]
+    fn an_answer_citing_evidence_it_was_never_given_abstains() {
+        let mut store = Store::open_memory().unwrap();
+        seed_corpus(&mut store);
+        let model = Arc::new(FakeModel::new());
+        model.add_root_raw(serde_json::json!({"version": 1, "expected_state_version": 0, "kind": "finish", "plan": null, "finish": {
+            "status": "answered", "answer": "certbot renew did it",
+            "claims": [{"text": "certbot renew ran", "supports": ["ev1_00000000deadbeef"]}]}}).to_string());
+        let mut notes = Vec::new();
+        let result = run_investigation("q", &store, model, BudgetV1::prototype_default(), &Arc::default(), &mut |p| {
+            if let Progress::Note(n) = p {
+                notes.push(n)
+            }
+        });
+        assert_eq!(result.status, InvestigationStatus::Abstained);
+        let finish = result.finish.unwrap();
+        assert!(finish.claims.is_empty() && finish.answer.is_empty() && result.cited.is_empty(), "{finish:?}");
+        assert!(finish.missing[0].contains("ev1_00000000deadbeef") && notes == finish.missing, "{finish:?}");
     }
 
     /// Run search `certbot` -> assess -> select `verdicts` -> inspect with
