@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::domain::{ObservationKind, Provenance, StoredObservation};
+use crate::redact::Redactor;
+use crate::rlm::coordinator::{InvestigationStatus, Progress, run_investigation};
+use crate::rlm::model::ModelBoundary;
+use crate::rlm::protocol::{AnswerStatus, BudgetV1, FinishV1};
 use crate::store::{Store, is_interrupt};
 
 pub const SEARCH_SCHEMA: &str = "relic.search/v1";
@@ -405,6 +409,144 @@ pub fn format_utc(ms: i64) -> String {
     let year = yoe + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02} {:02}:{:02}", rem / 3600, rem % 3600 / 60)
 }
+
+pub const RECALL_SCHEMA: &str = "relic.recall/v1";
+
+/// How a recall ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallOutcome {
+    Answered,
+    Partial,
+    /// Nothing it found could be cited for an answer.
+    Abstained,
+    BudgetExhausted,
+    Cancelled,
+    Failed,
+}
+
+/// One recall, as `relic recall --json` prints it and the TUI shows it.
+/// Every string in it is redacted; cites are record ids.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RecallReport {
+    pub schema: &'static str,
+    /// As the model was asked it: redacted.
+    pub question: String,
+    pub outcome: RecallOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub answer: String,
+    pub claims: Vec<CitedText>,
+    pub procedure: Vec<CitedText>,
+    pub contradictions: Vec<String>,
+    pub missing: Vec<String>,
+    /// Every cited record, in the order first cited.
+    pub evidence: Vec<CitedRecord>,
+    pub root_calls: u32,
+    pub child_calls: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CitedText {
+    pub text: String,
+    pub supports: Vec<i64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub contradicts: Vec<i64>,
+}
+
+/// A cited record, with where it sits in its source revision.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CitedRecord {
+    pub id: i64,
+    pub revision: i64,
+    pub ordinal: i64,
+    pub source: &'static str,
+    pub observed_at_ms: Option<i64>,
+    pub text: String,
+}
+
+impl CitedRecord {
+    pub fn when(&self) -> When {
+        When::from_parts(self.observed_at_ms, None)
+    }
+}
+
+/// Answer `question` from the evidence in `store` through a bounded
+/// investigation. Setting `cancel` from any thread or a signal handler ends
+/// it with [`RecallOutcome::Cancelled`].
+pub fn recall(
+    question: &str,
+    store: &Store,
+    model: Arc<dyn ModelBoundary>,
+    cancel: &Arc<AtomicBool>,
+    progress: &mut dyn FnMut(Progress),
+) -> RecallReport {
+    // Once, here: the report shows the question as it was sent.
+    let question = Redactor::new().import(question);
+    let r = run_investigation(&question, store, model, BudgetV1::prototype_default(), cancel, progress);
+    let (outcome, error) = match r.status {
+        InvestigationStatus::Completed => (RecallOutcome::Answered, None),
+        InvestigationStatus::Partial => (RecallOutcome::Partial, None),
+        InvestigationStatus::Abstained => (RecallOutcome::Abstained, None),
+        InvestigationStatus::BudgetExhausted => (RecallOutcome::BudgetExhausted, None),
+        InvestigationStatus::Cancelled => (RecallOutcome::Cancelled, None),
+        // A refusal or a malformed reply quotes what the model wrote.
+        InvestigationStatus::Failed(e) => (RecallOutcome::Failed, Some(Redactor::new().redact(&e))),
+    };
+    let finish = r.finish.unwrap_or(FinishV1 {
+        status: AnswerStatus::Abstained,
+        answer: String::new(),
+        claims: vec![],
+        procedure: vec![],
+        contradictions: vec![],
+        missing: vec![],
+    });
+    let mut evidence: Vec<CitedRecord> = Vec::new();
+    let mut ids = |cites: &[String]| -> Vec<i64> {
+        cites
+            .iter()
+            .filter_map(|c| r.cited.get(c))
+            .map(|o| {
+                if !evidence.iter().any(|e| e.id == o.id) {
+                    evidence.push(CitedRecord {
+                        id: o.id,
+                        revision: o.revision_id,
+                        ordinal: o.ordinal,
+                        source: source_label(o.kind),
+                        observed_at_ms: o.observed_at_ms,
+                        text: o.safe_text.clone(),
+                    });
+                }
+                o.id
+            })
+            .collect()
+    };
+    let claims = finish
+        .claims
+        .iter()
+        .map(|c| CitedText { text: c.text.clone(), supports: ids(&c.supports), contradicts: ids(&c.contradicts) })
+        .collect();
+    let procedure = finish
+        .procedure
+        .iter()
+        .map(|s| CitedText { text: s.text.clone(), supports: ids(&s.supports), contradicts: vec![] })
+        .collect();
+    RecallReport {
+        schema: RECALL_SCHEMA,
+        question,
+        outcome,
+        error,
+        answer: finish.answer,
+        claims,
+        procedure,
+        contradictions: finish.contradictions,
+        missing: finish.missing,
+        evidence,
+        root_calls: r.turns,
+        child_calls: r.child_calls,
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

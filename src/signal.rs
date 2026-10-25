@@ -1,12 +1,13 @@
 //! Fatal signals while Relic owns the terminal or runs fzf (ADR 0011). TERM,
 //! INT, HUP and QUIT stop fzf, put the terminal back, then kill Relic with
-//! the same signal, so the exit status is still 128+n.
+//! the same signal, so the exit status is still 128+n. During `relic
+//! recall`, Ctrl-C instead cancels the investigation.
 //!
 //! Everything the handler does is async-signal-safe: atomics, `kill`,
 //! `waitpid`, `nanosleep`, `tcsetattr`, `write`, `sigaction` and `raise`.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 const FATAL: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT];
 
@@ -48,6 +49,33 @@ pub fn install() {
             }
             libc::sigaction(sig, &act, std::ptr::null_mut());
         }
+    }
+}
+
+/// What SIGINT sets once [`interrupt_cancels`] has run.
+static INTERRUPT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// Makes Ctrl-C set `cancel` instead of killing Relic, so a recall ends as
+/// `Cancelled` at its next admission point and exits 130 (ADR 0010). An
+/// inherited SIG_IGN is honoured, as for [`install`]. Once per process.
+pub fn interrupt_cancels(cancel: Arc<AtomicBool>) {
+    if INTERRUPT.set(cancel).is_err() {
+        return;
+    }
+    // SAFETY: reads the current disposition, then installs a handler that
+    // only loads a set OnceLock and stores to an atomic.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGINT, std::ptr::null(), &mut old);
+        if old.sa_sigaction != libc::SIG_IGN {
+            libc::signal(libc::SIGINT, on_interrupt as *const () as libc::sighandler_t);
+        }
+    }
+}
+
+extern "C" fn on_interrupt(_: libc::c_int) {
+    if let Some(cancel) = INTERRUPT.get() {
+        cancel.store(true, Ordering::SeqCst);
     }
 }
 
