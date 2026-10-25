@@ -1,5 +1,6 @@
 //! `relic recall` as a process against a scripted Chat Completions server on
-//! loopback: its relic.recall/v1 contract and exit codes (ADR 0011).
+//! loopback: its relic.recall/v1 contract and exit codes (ADR 0011), and the
+//! privacy canary gate of ADR 0004.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -59,6 +60,22 @@ fn answer(mut stream: TcpStream, seen: &Bodies, script: &Script) {
     };
     let head = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
     let _ = stream.write_all(format!("{head}{body}").as_bytes());
+}
+
+fn is_child(user: &Value) -> bool {
+    user.get("packet").is_some()
+}
+
+/// A child that says every item of its packet supports the objective.
+fn supports_all(user: &Value, claim: &str) -> Value {
+    let packet = &user["packet"];
+    let items = packet["items"].as_array().unwrap();
+    let assessments: Vec<Value> = items
+        .iter()
+        .map(|i| json!({"item_id": i["item_id"], "verdict": "supports", "confidence": "high",
+            "claims": [{"text": claim, "supports": [i["evidence_id"]]}]}))
+        .collect();
+    json!({"version": 1, "packet_id": packet["packet_id"], "assessments": assessments})
 }
 
 fn plan(ops: Value) -> Value {
@@ -219,4 +236,95 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr.contains("RELIC_MODEL_NAME is required") && out.stdout.is_empty(), "{stderr}");
+}
+
+/// ADR 0004: canaries in every field of a history, then import, search and
+/// recall against a scripted model; no canary in any byte of the state dir
+/// or of anything sent or printed. Every canary starts `Zq9Canary`.
+#[test]
+fn privacy_canary_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (histories, state) = (dir.path().join("in"), dir.path().join("state"));
+    std::fs::create_dir_all(&histories).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let db = state.join("relic.db");
+    // One carrier per line: env assignment, bearer header, URL password, a
+    // flag value, piped sudo password and a continuation line; the timestamp
+    // and duration fields are numbers only.
+    let zsh_commands = [
+        "certbot renew --nginx -d example.com",
+        "PGPASSWORD=Zq9CanaryPg1 certbot certificates",
+        "curl -H 'Authorization: Bearer Zq9CanaryBearer2abcdefghijk' https://acme.test/certbot",
+        "git clone https://bob:Zq9CanaryUrl3@git.test/certbot.git",
+        "certbot register --password Zq9CanaryFlag4",
+        "echo Zq9CanaryPipe5 | sudo -S certbot renew",
+        "certbot renew \\\n--token=Zq9CanaryCont6",
+    ];
+    let zsh: String = zsh_commands.iter().enumerate().map(|(i, c)| format!(": {}:{i};{c}\n", 1_700_000_000 + i)).collect();
+    std::fs::write(histories.join("zsh_history"), zsh).unwrap();
+    let bash_commands = ["certbot renew --api-key=Zq9CanaryBash7"];
+    std::fs::write(histories.join("bash_history"), format!("#1700000100\n{}\n", bash_commands[0])).unwrap();
+    import(&db, &histories.join("zsh_history"), "zsh");
+    import(&db, &histories.join("bash_history"), "bash");
+
+    let redactor = relic::redact::Redactor::new();
+    for raw in zsh_commands.iter().chain(&bash_commands) {
+        let safe = redactor.import(raw);
+        assert_eq!(redactor.redact(&safe), safe, "redact(redact(x)) != redact(x) for {raw:?}");
+    }
+
+    // The model echoes secrets back too, in its answer and its child claims.
+    let (url, bodies) = serve(|user| {
+        if is_child(user) {
+            return Some(supports_all(user, "it ran with token=Zq9CanaryChild8"));
+        }
+        Some(match user["state_version"].as_u64().unwrap() {
+            0 => plan(json!([
+                {"op": "search", "op_id": "s1", "terms": ["certbot"], "match": "any", "limit": 20},
+                {"op": "assess", "op_id": "a1", "input": {"output": "s1"}, "objective": "renewal; password=Zq9CanaryObjective9", "max_items": 20},
+                {"op": "select", "op_id": "k1", "input": {"output": "a1"}, "verdicts": ["supports"], "limit": 20},
+                {"op": "inspect", "op_id": "i1", "input": {"output": "k1"}, "limit": 20, "max_item_bytes": 2048},
+            ])),
+            v => {
+                let all: Vec<Value> = inspected(user).iter().map(|i| i["evidence_id"].clone()).collect();
+                finish(v, json!({"status": "answered", "answer": "certbot renew, then mysql --password=Zq9CanaryAnswer10",
+                    "claims": [{"text": "renewed; api_key=Zq9CanaryClaim11", "supports": all}],
+                    "procedure": [{"text": "certbot renew", "supports": [cite(user, "renew --nginx")]}]}))
+            }
+        })
+    });
+    let recall = relic(&["recall", "how", "did", "I", "renew?", "PGPASSWORD=Zq9CanaryQuestion12", "--json"], &db, &url);
+    let search = relic(&["search", "certbot", "--json"], &db, &url);
+    assert_eq!((recall.status.code(), search.status.code()), (Some(0), Some(0)), "{}", String::from_utf8_lossy(&recall.stderr));
+
+    // Not vacuous: every record went out, redacted, to the root and to
+    // children, and the answer came back with its markers.
+    let bodies = bodies.lock().unwrap().clone();
+    let children = bodies.iter().filter(|b| b.contains("relic_child_result")).count();
+    assert!(bodies.len() >= 3 && children >= 1, "{} requests, {children} child", bodies.len());
+    let sent = bodies.concat();
+    for marker in ["[REDACTED:password]", "[REDACTED:token]", "[REDACTED:key]"] {
+        assert!(sent.contains(marker), "no {marker} in what was sent");
+    }
+    let report: Value = serde_json::from_slice(&recall.stdout).unwrap();
+    assert_eq!(report["evidence"].as_array().unwrap().len(), zsh_commands.len() + bash_commands.len(), "{report}");
+    assert!(report["answer"].as_str().unwrap().ends_with("--password=[REDACTED:password]"), "{report}");
+
+    let mut haystacks: Vec<(String, Vec<u8>)> = vec![
+        ("recall stdout".into(), recall.stdout),
+        ("recall stderr".into(), recall.stderr),
+        ("search stdout".into(), search.stdout),
+        ("search stderr".into(), search.stderr),
+    ];
+    haystacks.extend(bodies.into_iter().enumerate().map(|(i, b)| (format!("request {i}"), b.into_bytes())));
+    let files: Vec<PathBuf> = std::fs::read_dir(&state).unwrap().map(|e| e.unwrap().path()).collect();
+    for wanted in ["relic.db", "relic.db-wal"] {
+        assert!(files.iter().any(|f| f.ends_with(wanted)), "no {wanted} to check in {files:?}");
+    }
+    haystacks.extend(files.into_iter().map(|f| (f.display().to_string(), std::fs::read(&f).unwrap())));
+    for (name, bytes) in &haystacks {
+        // FTS keeps lowercased terms.
+        let folded = bytes.to_ascii_lowercase();
+        assert!(!folded.windows(9).any(|w| w == b"zq9canary"), "a canary in {name}");
+    }
 }
