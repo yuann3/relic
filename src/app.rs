@@ -427,7 +427,7 @@ pub enum RecallOutcome {
 
 /// One recall, as `relic recall --json` prints it and the TUI shows it.
 /// Every string in it is redacted; cites are record ids.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecallReport {
     pub schema: &'static str,
     /// As the model was asked it: redacted.
@@ -446,7 +446,7 @@ pub struct RecallReport {
     pub child_calls: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CitedText {
     pub text: String,
     pub supports: Vec<i64>,
@@ -455,7 +455,7 @@ pub struct CitedText {
 }
 
 /// A cited record, with where it sits in its source revision.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CitedRecord {
     pub id: i64,
     pub revision: i64,
