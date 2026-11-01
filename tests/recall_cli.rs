@@ -13,7 +13,8 @@ use serde_json::{Value, json};
 /// Every request body the server was sent, in arrival order.
 type Bodies = Arc<Mutex<Vec<String>>>;
 
-/// What the model writes for one request, or `None` for an HTTP 500.
+/// What the model writes for one request, or `None` for an HTTP 500 that
+/// says why.
 type Script = dyn Fn(&Value) -> Option<Value> + Send + Sync;
 
 /// A Chat Completions server answering each request with `script`, which
@@ -56,7 +57,7 @@ fn answer(mut stream: TcpStream, seen: &Bodies, script: &Script) {
             let reply = json!({"model": "scripted", "choices": [{"message": {"content": content.to_string()}, "finish_reason": "stop"}]});
             ("200 OK", reply.to_string())
         }
-        None => ("500 Internal Server Error", "{}".to_string()),
+        None => ("500 Internal Server Error", json!({"error": {"message": "the scripted model is down"}}).to_string()),
     };
     let head = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
     let _ = stream.write_all(format!("{head}{body}").as_bytes());
@@ -245,7 +246,8 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     assert_eq!(code, Some(2), "{stderr}");
     let report: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(report["outcome"], "failed");
-    assert!(report["error"].as_str().unwrap().contains("HTTP 500") && stderr.contains("recall failed"), "{report}");
+    let said = "model endpoint answered HTTP 500: the scripted model is down";
+    assert!(report["error"].as_str().unwrap().contains(said) && stderr.contains(said), "{report}\n{stderr}");
 
     // A remote model without prices: its cost cannot be capped, so recall
     // refuses before any call unless told the cost may be unknown.

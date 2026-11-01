@@ -301,8 +301,8 @@ mod tests {
             (vec![Err(ModelError::RateLimited { retry_after: Some(Duration::from_secs(60)) })], false, 0),
             (vec![Err(ModelError::RateLimited { retry_after: None })], false, 0),
             // It may have run: never sent twice.
-            (vec![Err(ModelError::Status(500))], false, 0),
-            (vec![Err(ModelError::Status(529))], false, 0),
+            (vec![Err(ModelError::Status { code: 500, message: None })], false, 0),
+            (vec![Err(ModelError::Status { code: 529, message: None })], false, 0),
             (vec![Err(ModelError::Ambiguous("reset".into()))], false, 0),
             (vec![Err(ModelError::Truncated)], false, 0),
             // A retry that fails too is the end of it.

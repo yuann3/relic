@@ -12,6 +12,10 @@ use super::{ModelBoundary, ModelError, Prices, Reply, Usage};
 
 /// Most bytes of a response body (research, transport).
 const BODY_MAX: u64 = 1024 * 1024;
+/// Most bytes of an error body read, and characters of its message kept:
+/// enough for "unknown model" or "bad parameter", not a page of HTML.
+const ERROR_BODY_MAX: u64 = 8 * 1024;
+const ERROR_MESSAGE_CHARS: usize = 300;
 /// Connecting may take this long at most, so a dead host fails before send.
 const CONNECT_MAX: Duration = Duration::from_secs(10);
 /// A model name rides in every request beside the capped messages.
@@ -238,7 +242,10 @@ impl ModelBoundary for ChatCompletionsClient {
             return Err(ModelError::RateLimited { retry_after });
         }
         if !(200..300).contains(&status) {
-            return Err(ModelError::Status(status));
+            // The status alone does not say a model name or parameter is
+            // wrong; the body usually does. An unreadable body is just none.
+            let body = response.into_body().with_config().limit(ERROR_BODY_MAX).read_to_string();
+            return Err(ModelError::Status { code: status, message: body.ok().and_then(|b| error_message(&b)) });
         }
         let text = response.into_body().with_config().limit(BODY_MAX).read_to_string().map_err(classify)?;
         reply(&text)
@@ -392,6 +399,22 @@ struct WireUsage {
     completion_tokens: u64,
 }
 
+/// What an error body says: OpenAI's `{"error": {"message"}}`, a bare
+/// `error` or `message` string, or else the text itself. Cut to
+/// [`ERROR_MESSAGE_CHARS`] and redacted: it may echo what was sent.
+fn error_message(body: &str) -> Option<String> {
+    let json: Option<Value> = serde_json::from_str(body).ok();
+    let said = json.as_ref().map_or(Some(body), |v| {
+        v["error"]["message"].as_str().or(v["error"].as_str()).or(v["message"].as_str())
+    });
+    let said = said.map(str::trim).filter(|s| !s.is_empty())?;
+    let mut cut: String = said.chars().take(ERROR_MESSAGE_CHARS).collect();
+    if cut.len() < said.len() {
+        cut.push('…');
+    }
+    Some(crate::redact::Redactor::new().redact(&cut))
+}
+
 /// A 2xx body as a [`Reply`]. Provider extras are ignored here; what the
 /// model wrote is checked strictly by the kernel.
 fn reply(text: &str) -> Result<Reply, ModelError> {
@@ -515,8 +538,22 @@ mod tests {
         assert_eq!(rate, Err(ModelError::RateLimited { retry_after: Some(Duration::from_secs(2)) }));
         let rate = call_with(answer(429, "", "{}".into()), long);
         assert_eq!(rate, Err(ModelError::RateLimited { retry_after: None }));
-        assert_eq!(call_with(answer(500, "", "{}".into()), long), Err(ModelError::Status(500)));
-        assert_eq!(call_with(answer(529, "", "{}".into()), long), Err(ModelError::Status(529)));
+        assert_eq!(call_with(answer(500, "", "{}".into()), long), Err(ModelError::Status { code: 500, message: None }));
+        assert_eq!(call_with(answer(529, "", "{}".into()), long), Err(ModelError::Status { code: 529, message: None }));
+        // What the endpoint said comes along, cut short and redacted.
+        let openai = json!({"error": {"message": "unknown provider for model x/y", "code": "model_not_found"}}).to_string();
+        let said = call_with(answer(400, "", openai), long).unwrap_err().to_string();
+        assert_eq!(said, "model endpoint answered HTTP 400: unknown provider for model x/y");
+        let plain = call_with(answer(502, "", "  Bad Gateway\n".into()), long).unwrap_err().to_string();
+        assert_eq!(plain, "model endpoint answered HTTP 502: Bad Gateway");
+        let echoed = json!({"message": "rejected: password=hunter2"}).to_string();
+        let said = call_with(answer(422, "", echoed), long).unwrap_err().to_string();
+        assert_eq!(said, "model endpoint answered HTTP 422: rejected: password=[REDACTED:password]");
+        let long_body = json!({"error": "y".repeat(5000)}).to_string();
+        let Err(ModelError::Status { message: Some(m), .. }) = call_with(answer(400, "", long_body), long) else { panic!() };
+        assert_eq!((m.chars().count(), m.ends_with('…')), (ERROR_MESSAGE_CHARS + 1, true));
+        let huge = "z".repeat(ERROR_BODY_MAX as usize + 1);
+        assert_eq!(call_with(answer(400, "", huge), long), Err(ModelError::Status { code: 400, message: None }));
         // The request went out and then the line dropped, or went quiet.
         assert!(matches!(call_with(Act::Close, long), Err(ModelError::Ambiguous(_))));
         let t = Instant::now();

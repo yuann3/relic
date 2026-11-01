@@ -82,7 +82,8 @@ pub enum ModelError {
     /// 429: the provider refused the request without running it.
     RateLimited { retry_after: Option<Duration> },
     /// Any other non-2xx status, 5xx and 529 included: it may have run.
-    Status(u16),
+    /// `message` is what the endpoint said, cut short and redacted.
+    Status { code: u16, message: Option<String> },
     /// Lost after the request went out (disconnect, timeout): it may have run.
     Ambiguous(String),
     /// The response body was over the transport's cap.
@@ -112,7 +113,8 @@ impl std::fmt::Display for ModelError {
             Self::BeforeSend(e) => write!(f, "could not reach the model: {e}"),
             Self::RateLimited { retry_after: Some(d) } => write!(f, "rate limited; retry after {} s", d.as_secs()),
             Self::RateLimited { retry_after: None } => f.write_str("rate limited"),
-            Self::Status(s) => write!(f, "model endpoint answered HTTP {s}"),
+            Self::Status { code, message: None } => write!(f, "model endpoint answered HTTP {code}"),
+            Self::Status { code, message: Some(m) } => write!(f, "model endpoint answered HTTP {code}: {m}"),
             Self::Ambiguous(e) => write!(f, "lost the model call after sending it: {e}"),
             Self::Oversize => f.write_str("model response over the size cap"),
             Self::InvalidResponse(e) => write!(f, "not a chat completion: {e}"),
