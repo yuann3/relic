@@ -16,7 +16,7 @@ relic — recall what you did in the terminal, with evidence
 
 USAGE:
     relic search <QUERY>... [--db PATH] [--limit N] [--prefix] [--rank] [--json | --fzf]
-    relic recall <QUESTION>... [--db PATH] [--json]
+    relic recall <QUESTION>... [--db PATH] [--json] [--allow-unknown-cost]
 ",
             $ui,
             "    relic import <HISTORY_FILE> [--shell zsh|bash] [--db PATH]
@@ -36,6 +36,10 @@ OPTIONS:
     recall        Answer a question from your history with a model, citing
                   the records it rests on. --json prints one relic.recall/v1
                   document. Ctrl-C cancels it
+    --allow-unknown-cost
+                  Let recall use a remote model with no prices set, whose
+                  cost it then cannot cap. Calls, bytes, tokens and time
+                  stay capped
     forget        Delete records for good, by the id search --json and the TUI
                   show. Remove the line from your history file too, or a later
                   import of a rewritten file can store it again
@@ -58,7 +62,10 @@ MODEL:
                           custom only: json_schema, flat_json_schema or
                           json_object; max_completion_tokens or max_tokens
     RELIC_MODEL_PRICE_IN, RELIC_MODEL_PRICE_OUT
-                          US dollars per million tokens, to fence cost
+                          US dollars per million tokens, to fence cost.
+                          A plain-http loopback model costs nothing; a
+                          remote one without prices needs
+                          --allow-unknown-cost
 
 EXIT STATUS:
     0             Success; search found a match; recall answered, fully or
@@ -85,7 +92,7 @@ pub enum Command {
     Help,
     Version,
     Search(SearchArgs),
-    Recall { question: String, db: Option<PathBuf>, json: bool },
+    Recall { question: String, db: Option<PathBuf>, json: bool, allow_unknown_cost: bool },
     Ui { db: Option<PathBuf> },
     Import { path: PathBuf, shell: Option<SourceKind>, db: Option<PathBuf> },
     Forget { ids: Vec<i64>, db: Option<PathBuf> },
@@ -123,6 +130,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         "search" => parse_search(args),
         "recall" => {
             let (mut words, mut db, mut json, mut options_done) = (Vec::new(), None, false, false);
+            let mut allow_unknown_cost = false;
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
                     _ if options_done => words.push(a),
@@ -130,6 +138,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     "-h" | "--help" => return Ok(Command::Help),
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
                     "--json" => json = true,
+                    "--allow-unknown-cost" => allow_unknown_cost = true,
                     f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
                     _ => words.push(a),
                 }
@@ -137,7 +146,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             if words.is_empty() {
                 return Err("recall needs a question".into());
             }
-            Ok(Command::Recall { question: words.join(" "), db, json })
+            Ok(Command::Recall { question: words.join(" "), db, json, allow_unknown_cost })
         }
         "ui" => {
             let mut db = None;
@@ -372,7 +381,7 @@ mod tests {
         assert!(p(&["forget", "all"]).is_err());
         assert_eq!(
             p(&["recall", "how", "--json", "did", "--", "--db", "x"]).unwrap(),
-            Command::Recall { question: "how did --db x".into(), db: None, json: true }
+            Command::Recall { question: "how did --db x".into(), db: None, json: true, allow_unknown_cost: false }
         );
         assert!(p(&["recall"]).is_err() && p(&["recall", "--json"]).is_err() && p(&["recall", "x", "--fzf"]).is_err());
     }

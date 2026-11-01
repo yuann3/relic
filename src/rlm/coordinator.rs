@@ -23,6 +23,9 @@ pub struct InvestigationResult {
     pub finish: Option<FinishV1>,
     /// The observation behind each evidence id `finish` cites.
     pub cited: HashMap<EvidenceId, StoredObservation>,
+    /// At most this many micro-US-dollars; `None` when the model has no
+    /// prices, so the cost is unknown.
+    pub cost_microusd: Option<u64>,
     pub turns: u32,
     pub child_calls: u16,
 }
@@ -172,7 +175,8 @@ pub fn run_investigation(
         })
         .filter_map(|id| Some((id.clone(), run.registry.resolve_evidence_id(id)?.1.clone())))
         .collect();
-    InvestigationResult { status, finish, cited, turns: run.turns, child_calls: run.child_calls }
+    let cost_microusd = run.model.prices().map(|_| run.ledger.cost_spent());
+    InvestigationResult { status, finish, cited, cost_microusd, turns: run.turns, child_calls: run.child_calls }
 }
 
 fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<FinishV1>) {

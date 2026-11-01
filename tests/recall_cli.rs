@@ -175,6 +175,8 @@ fn an_answer_cites_the_records_it_rests_on_by_id() {
         .collect();
     assert_eq!(evidence, [(renew, CERTBOT[1]), (certs, CERTBOT[2])]);
     assert_eq!((report["root_calls"].as_u64(), bodies.lock().unwrap().len()), (Some(2), 2));
+    // A model on loopback bills nothing; the server named itself.
+    assert_eq!((&report["cost_microusd"], &report["models"]), (&json!(0), &json!(["scripted"])));
     // The payload audit: each request's size and destination, on stderr.
     let origin = url.trim_end_matches("/v1");
     assert_eq!(stderr.matches("send a root request of ").count(), 2, "{stderr}");
@@ -188,6 +190,7 @@ fn an_answer_cites_the_records_it_rests_on_by_id() {
     assert!(text.contains(&format!("  - certbot renew ran [#{renew}, against #{certs}]\n")), "{text}");
     assert!(text.contains(&format!("  1. Run certbot renew --nginx [#{renew}]\n")), "{text}");
     assert!(text.contains(&format!("  #{renew:<6} ")) && text.contains("zsh   certbot renew --nginx -d example.com"), "{text}");
+    assert!(text.ends_with("spent: 2 root + 0 child calls, at most $0.0000, answered by scripted\n"), "{text}");
 }
 
 #[test]
@@ -224,6 +227,29 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let report: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(report["outcome"], "failed");
     assert!(report["error"].as_str().unwrap().contains("HTTP 500") && stderr.contains("recall failed"), "{report}");
+
+    // A remote model without prices: its cost cannot be capped, so recall
+    // refuses before any call unless told the cost may be unknown.
+    let remote = |extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+            .args([&["recall", "renew", "--json", "--db", db.to_str().unwrap()][..], extra].concat())
+            .env("RELIC_MODEL_PROFILE", "vllm")
+            .env("RELIC_MODEL_URL", "https://127.0.0.1:9/v1")
+            .env("RELIC_MODEL_NAME", "remote")
+            .env_remove("RELIC_MODEL_PRICE_IN")
+            .env_remove("RELIC_MODEL_PRICE_OUT")
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+    };
+    let (code, stdout, stderr) = remote(&[]);
+    assert_eq!(code, Some(2));
+    assert!(stdout.is_empty() && stderr.contains("--allow-unknown-cost") && !stderr.contains("send a root"), "{stderr}");
+    let (code, stdout, stderr) = remote(&["--allow-unknown-cost"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!((report["outcome"].as_str(), &report["cost_microusd"]), (Some("failed"), &Value::Null), "{report}");
+    assert!(stderr.contains("send a root request") && stderr.contains("could not reach the model"), "{stderr}");
 
     let out = Command::new(env!("CARGO_BIN_EXE_relic"))
         .args(["recall", "renew", "--db"])

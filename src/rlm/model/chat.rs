@@ -142,6 +142,8 @@ pub struct ChatCompletionsClient {
     config: ChatConfig,
     endpoint: String,
     origin: String,
+    /// Plain http to a loopback address: a model on this machine.
+    local: bool,
     agent: ureq::Agent,
 }
 
@@ -152,14 +154,14 @@ impl ChatCompletionsClient {
     }
 
     pub fn new(config: ChatConfig) -> Result<Self, String> {
-        let (origin, loopback_http) = origin(&config.base_url)?;
+        let (origin, local) = origin(&config.base_url)?;
         let endpoint = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let agent = ureq::Agent::config_builder()
             // Not the environment's proxy, not a redirect: the request goes
             // where the profile says or nowhere (research, transport).
             .proxy(None)
             .max_redirects(0)
-            .https_only(!loopback_http)
+            .https_only(!local)
             .http_status_as_error(false)
             // A fresh connection per call: a connect failure then proves
             // nothing was sent, which the retry rule depends on.
@@ -168,7 +170,7 @@ impl ChatCompletionsClient {
             .user_agent(concat!("relic/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Ok(Self { config, endpoint, origin, agent })
+        Ok(Self { config, endpoint, origin, local, agent })
     }
 
     /// The request body, without the secret.
@@ -203,8 +205,10 @@ impl ModelBoundary for ChatCompletionsClient {
         Target { profile: self.config.profile.name().into(), origin: self.origin.clone() }
     }
 
+    /// A model on this machine bills nothing (research, budget and cost
+    /// lease); a remote one without configured prices has an unknown cost.
     fn prices(&self) -> Option<Prices> {
-        self.config.prices
+        self.config.prices.or(self.local.then_some(Prices { input_per_mtok: 0, output_per_mtok: 0 }))
     }
 
     fn call(&self, req: &EgressRequest, deadline: Instant) -> Result<Reply, ModelError> {

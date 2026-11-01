@@ -99,6 +99,7 @@ pub fn run(db: &Path) -> Result<()> {
         };
         let mut m = UiModel::new(mono);
         m.ascii = ascii;
+        m.recall_priced = model.as_ref().is_ok_and(|model| model.prices().is_some());
         m.recall_model = model.map(|model| {
             let to = model.target();
             format!("{} ({})", to.origin, to.profile)

@@ -62,7 +62,7 @@ fn run(op: u64, question: &str, store: &Store, model: Arc<dyn ModelBoundary>, ca
         Progress::Egress(_) => {}
     };
     let report = app::recall(question, store, model, cancel, &mut progress);
-    send(RecallEvent::Finished(report));
+    send(RecallEvent::Finished(Box::new(report)));
 }
 
 #[cfg(test)]

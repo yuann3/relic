@@ -115,7 +115,7 @@ pub enum RecallEvent {
     /// Ends the newest running step; an empty outcome shows none.
     StepDone(String),
     Calls { root: u32, child: u32 },
-    Finished(RecallReport),
+    Finished(Box<RecallReport>),
 }
 
 /// Everything `update` may ask the runtime to do. There is deliberately no
@@ -283,6 +283,9 @@ pub struct UiModel {
     pub recall: RecallState,
     /// Where a recall's requests go, or why there is no model to ask.
     pub recall_model: Result<String, String>,
+    /// The model has prices, so the cost cap holds. Confirming a recall
+    /// without them is the opt-in to an unknown cost.
+    pub recall_priced: bool,
     pub modal: Option<Modal>,
     /// One transient line for the status bar: picker errors, hints.
     pub notice: Option<String>,
@@ -306,6 +309,7 @@ impl UiModel {
             evidence: EvidenceState::default(),
             recall: RecallState::default(),
             recall_model: Err("no model is configured".into()),
+            recall_priced: false,
             modal: None,
             notice: None,
             mono,
@@ -776,7 +780,7 @@ fn on_recall_event(m: &mut UiModel, op: u64, event: RecallEvent) -> Vec<UiEffect
                     s.state = StepState::Done;
                 }
             }
-            r.report = Some(report);
+            r.report = Some(*report);
         }
     }
     vec![]
@@ -802,6 +806,8 @@ pub(crate) fn answered(cites: &[i64]) -> RecallReport {
             .collect(),
         root_calls: 2,
         child_calls: 3,
+        cost_microusd: Some(1200),
+        models: vec!["m-1".into()],
     }
 }
 
@@ -1299,7 +1305,7 @@ mod tests {
         assert_eq!((m.recall.root_calls, m.recall.child_calls), (2, 3));
         assert_eq!(m.recall.steps[0].state, StepState::Done);
 
-        let finished = RecallEvent::Finished(answered(&[11, 10]));
+        let finished = RecallEvent::Finished(Box::new(answered(&[11, 10])));
         update(
             &mut m,
             UiAction::Recall {
@@ -1341,7 +1347,7 @@ mod tests {
             for late in [
                 RecallEvent::StepDone("late".into()),
                 RecallEvent::Calls { root: 8, child: 16 },
-                RecallEvent::Finished(answered(&[10])),
+                RecallEvent::Finished(Box::new(answered(&[10]))),
             ] {
                 assert!(update(&mut m, UiAction::Recall { op, event: late }).is_empty());
             }

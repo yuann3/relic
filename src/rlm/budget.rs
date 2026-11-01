@@ -133,6 +133,12 @@ impl BudgetLedger {
         self.consumed.rows_returned = self.consumed.rows_returned.saturating_sub(released);
     }
 
+    /// Micro-US-dollars spent so far, at most: a call whose usage went
+    /// unreported keeps its whole reservation.
+    pub fn cost_spent(&self) -> u64 {
+        self.consumed.cost_microusd
+    }
+
     /// Remaining budget for display/root state.
     pub fn remaining(&self) -> BudgetV1 {
         BudgetV1 {

@@ -55,7 +55,9 @@ fn run(cmd: Command) -> Result<ExitCode> {
             writeln!(std::io::stdout().lock(), "relic {} ({build}{debug})", env!("CARGO_PKG_VERSION"))?;
         }
         Command::Search(args) => return search(args),
-        Command::Recall { question, db, json } => return recall(&question, db, json),
+        Command::Recall { question, db, json, allow_unknown_cost } => {
+            return recall(&question, db, json, allow_unknown_cost);
+        }
         Command::Ui { db } => ui(&existing_db(db)?)?,
         Command::ModelCheck => {
             use relic::rlm::model::chat::{self, ChatCompletionsClient};
@@ -259,10 +261,17 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn recall(question: &str, db: Option<PathBuf>, json: bool) -> Result<ExitCode> {
+fn recall(question: &str, db: Option<PathBuf>, json: bool, allow_unknown_cost: bool) -> Result<ExitCode> {
     use relic::app::RecallOutcome;
+    use relic::rlm::model::ModelBoundary;
     let store = Store::open_read_only(&existing_db(db)?)?;
     let model = Arc::new(relic::rlm::model::chat::ChatCompletionsClient::from_env()?);
+    // The $1 cap fences nothing without prices (research, budget and cost lease).
+    if model.prices().is_none() && !allow_unknown_cost {
+        return Err("this model has no prices, so recall cannot cap what it spends: set RELIC_MODEL_PRICE_IN \
+                    and RELIC_MODEL_PRICE_OUT, or pass --allow-unknown-cost"
+            .into());
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     relic::signal::interrupt_cancels(Arc::clone(&cancel));
     // Every request's size and destination is the payload audit (ADR 0004).
@@ -335,6 +344,9 @@ fn print_recall(out: &mut impl Write, r: &app::RecallReport) -> Result<()> {
     for e in &r.evidence {
         writeln!(out, "  #{:<6} {} {:<4}  {}", e.id, e.when().label(), e.source, app::display_line(&e.text))?;
     }
+    let cost = r.cost_microusd.map_or("an unknown cost".into(), |c| format!("at most ${:.4}", c as f64 / 1e6));
+    let by = if r.models.is_empty() { String::new() } else { format!(", answered by {}", r.models.join(", ")) };
+    writeln!(out, "spent: {} root + {} child calls, {cost}{}", r.root_calls, r.child_calls, app::display_line(&by))?;
     Ok(())
 }
 

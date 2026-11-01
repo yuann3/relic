@@ -411,8 +411,11 @@ fn recall_word(r: &RecallState, t: &Theme) -> (&'static str, Style) {
 }
 
 /// The spend a recall may reach, as the confirmation promises it.
-fn recall_cap(b: &BudgetV1) -> String {
-    let cost = b.max_cost_microusd.map_or("no cost cap".into(), |c| format!("${:.2}", c as f64 / 1e6));
+fn recall_cap(b: &BudgetV1, priced: bool) -> String {
+    let cost = match b.max_cost_microusd {
+        Some(c) if priced => format!("${:.2}", c as f64 / 1e6),
+        _ => "cost unknown".into(),
+    };
     format!("{cost} · {}s", b.wall_ms / 1000)
 }
 
@@ -428,7 +431,7 @@ fn recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         lines.push(Line::raw(format!(
             "budget: wall {:.1}s of {}",
             r.elapsed().as_secs_f32(),
-            recall_cap(&budget),
+            recall_cap(&budget, m.recall_priced),
         )));
         lines.push(Line::raw(format!(
             "calls: root {}/{} · child {}/{}",
@@ -587,7 +590,7 @@ fn confirm_recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             "Recall asks a model: up to {} root + {} child calls, {}.",
             b.root_calls,
             b.child_calls,
-            recall_cap(&b)
+            recall_cap(&b, m.recall_priced)
         )),
         Line::styled("It sends the query and the commands it finds, redacted, to", t.dim),
         Line::styled(display_line(to), t.dim),
@@ -1143,11 +1146,14 @@ mod tests {
     fn confirmation_and_help_overlays() {
         let store = store_with(NGINX);
         let mut m = typed(&store, "certb", false);
-        m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
+        m.recall_model = Ok("https://api.example.com (openai)".into());
         drive(&mut m, &store, UiAction::Key(Key::Ctrl('r')));
         let s = text(&render(&m, 120, 40));
+        assert!(s.contains("16 child calls, cost unknown"), "{s}");
+        m.recall_priced = true;
+        let s = text(&render(&m, 120, 40));
         assert!(s.contains("Recall asks a model: up to 8 root + 16 child calls, $1.00 · 180s."), "{s}");
-        assert!(s.contains("Start? y/n") && s.contains("http://127.0.0.1:8000 (vllm)"), "{s}");
+        assert!(s.contains("Start? y/n") && s.contains("https://api.example.com (openai)"), "{s}");
 
         drive(&mut m, &store, UiAction::Key(Key::Esc));
         drive(&mut m, &store, UiAction::Key(Key::Tab));
@@ -1164,6 +1170,7 @@ mod tests {
         let store = store_with(NGINX);
         let mut m = typed(&store, "certb", true);
         m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
+        m.recall_priced = true;
         let cite = m.search.selected_hit().unwrap().id;
         drive(&mut m, &store, UiAction::Key(Key::Ctrl('r')));
         drive(&mut m, &store, UiAction::Key(Key::Char('y')));
@@ -1201,7 +1208,7 @@ mod tests {
         report.claims[0].text = "you renewed the certificate with certbot after the reload; claim-end".into();
         report.procedure = vec![crate::app::CitedText { text: "certbot renew".into(), supports: vec![cite], contradicts: vec![] }];
         report.missing = vec!["when it expires".into()];
-        drive(&mut m, &store, UiAction::Recall { op, event: RecallEvent::Finished(report) });
+        drive(&mut m, &store, UiAction::Recall { op, event: RecallEvent::Finished(Box::new(report)) });
         let s = text(&render(&m, 120, 40));
         for want in [
             "with certbot",

@@ -444,6 +444,12 @@ pub struct RecallReport {
     pub evidence: Vec<CitedRecord>,
     pub root_calls: u32,
     pub child_calls: u16,
+    /// At most this many micro-US-dollars; null when the model has no
+    /// prices, so the cost is unknown.
+    pub cost_microusd: Option<u64>,
+    /// What the provider says answered, in the order first seen: an alias
+    /// may stand for any of them.
+    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -483,7 +489,16 @@ pub fn recall(
 ) -> RecallReport {
     // Once, here: the report shows the question as it was sent.
     let question = Redactor::new().import(question);
-    let r = run_investigation(&question, store, model, BudgetV1::prototype_default(), cancel, progress);
+    let mut models: Vec<String> = Vec::new();
+    let mut progress = |p: Progress| {
+        if let Progress::Replied { returned_model: Some(m), .. } = &p
+            && !models.contains(m)
+        {
+            models.push(m.clone());
+        }
+        progress(p)
+    };
+    let r = run_investigation(&question, store, model, BudgetV1::prototype_default(), cancel, &mut progress);
     let (outcome, error) = match r.status {
         InvestigationStatus::Completed => (RecallOutcome::Answered, None),
         InvestigationStatus::Partial => (RecallOutcome::Partial, None),
@@ -544,6 +559,9 @@ pub fn recall(
         evidence,
         root_calls: r.turns,
         child_calls: r.child_calls,
+        cost_microusd: r.cost_microusd,
+        // Model text: redacted like everything else it writes.
+        models: models.iter().map(|m| Redactor::new().redact(m)).collect(),
     }
 }
 
