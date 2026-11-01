@@ -182,6 +182,22 @@ fn an_answer_cites_the_records_it_rests_on_by_id() {
     assert_eq!(stderr.matches("send a root request of ").count(), 2, "{stderr}");
     assert!(stderr.contains(&format!("to {origin} (vllm)")), "{stderr}");
 
+    // The log: what was sent and how it ended, under one recall id, and no
+    // evidence text, which would outlive `forget`.
+    let log_path = dir.path().join("relic.db.recall.log");
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let lines: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
+    assert_eq!(events, ["start", "send", "reply", "send", "reply", "finish"], "{log}");
+    assert!(lines.iter().all(|l| l["schema"] == "relic.recall-log/v1" && l["recall"] == lines[0]["recall"]), "{log}");
+    assert_eq!((&lines[0]["origin"], &lines[0]["profile"]), (&json!(origin), &json!("vllm")));
+    assert_eq!((&lines[1]["role"], &lines[2]["model"]), (&json!("root"), &json!("scripted")));
+    let finish = &lines[5];
+    assert_eq!((&finish["outcome"], &finish["cited"], &finish["cost_microusd"]), (&json!("answered"), &json!([renew, certs]), &json!(0)));
+    assert!(!log.contains("certbot") && !log.contains("renew"), "{log}");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&log_path).unwrap().permissions().mode() & 0o777, 0o600);
+
     // The same recall as text.
     let out = relic(&["recall", "how", "did", "I", "renew"], &db, &url);
     let text = String::from_utf8(out.stdout).unwrap();
@@ -191,6 +207,9 @@ fn an_answer_cites_the_records_it_rests_on_by_id() {
     assert!(text.contains(&format!("  1. Run certbot renew --nginx [#{renew}]\n")), "{text}");
     assert!(text.contains(&format!("  #{renew:<6} ")) && text.contains("zsh   certbot renew --nginx -d example.com"), "{text}");
     assert!(text.ends_with("spent: 2 root + 0 child calls, at most $0.0000, answered by scripted\n"), "{text}");
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let recalls: std::collections::HashSet<&str> = log.lines().map(|l| l.split("\"recall\":\"").nth(1).unwrap().split('"').next().unwrap()).collect();
+    assert_eq!((log.lines().count(), recalls.len()), (12, 2), "a second recall appends under its own id:\n{log}");
 }
 
 #[test]
@@ -262,6 +281,17 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr.contains("RELIC_MODEL_NAME is required") && out.stdout.is_empty(), "{stderr}");
+
+    // A log that cannot be opened: nothing leaves unaudited.
+    let log = dir.path().join("relic.db.recall.log");
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+    let (url, bodies) = serve(search_then(partial));
+    let out = relic(&["recall", "renew", "--json"], &db, &url);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((out.status.code(), report["outcome"].as_str()), (Some(2), Some("failed")), "{report}");
+    assert!(report["error"].as_str().unwrap().contains("could not write the recall log"), "{report}");
+    assert!(bodies.lock().unwrap().is_empty(), "a request left without its audit");
 }
 
 /// ADR 0004: canaries in every field of a history, then import, search and
@@ -344,7 +374,7 @@ fn privacy_canary_gate() {
     ];
     haystacks.extend(bodies.into_iter().enumerate().map(|(i, b)| (format!("request {i}"), b.into_bytes())));
     let files: Vec<PathBuf> = std::fs::read_dir(&state).unwrap().map(|e| e.unwrap().path()).collect();
-    for wanted in ["relic.db", "relic.db-wal"] {
+    for wanted in ["relic.db", "relic.db-wal", "relic.db.recall.log"] {
         assert!(files.iter().any(|f| f.ends_with(wanted)), "no {wanted} to check in {files:?}");
     }
     haystacks.extend(files.into_iter().map(|f| (f.display().to_string(), std::fs::read(&f).unwrap())));

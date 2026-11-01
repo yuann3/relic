@@ -49,7 +49,9 @@ OPTIONS:
 
 MODEL:
     recall sends the model your question and the commands it searches for,
-    redacted, and prints each request's size and destination on stderr.
+    redacted, and prints each request's size and destination on stderr. It
+    also appends them, with how the recall ended, to <db>.recall.log: one
+    relic.recall-log/v1 JSON line each, metadata and record ids only.
     model check sends a synthetic request, never your history, and prints
     a relic.model-check/v1 receipt. Configure the model with:
     RELIC_MODEL_PROFILE   openai (default), vllm, llama_cpp or custom

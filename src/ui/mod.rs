@@ -317,7 +317,8 @@ where
                 let Some(model) = self.model.clone() else { return Ok(vec![]) };
                 let store = Store::open_read_only(&self.db)?;
                 let cancel = Arc::new(AtomicBool::new(false));
-                recall::spawn(op, question, store, model, Arc::clone(&cancel), self.tx.clone())?;
+                let log = app::recall_log_path(&self.db);
+                recall::spawn(op, question, store, model, log, Arc::clone(&cancel), self.tx.clone())?;
                 self.recall = Some((op, cancel));
                 vec![]
             }

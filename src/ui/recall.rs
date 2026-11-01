@@ -1,6 +1,7 @@
 //! A recall on its own thread: [`app::recall`] over the configured model,
 //! its progress turned into the steps and counters the Recall pane shows.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::SyncSender;
@@ -18,14 +19,23 @@ pub fn spawn(
     question: String,
     store: Store,
     model: Arc<dyn ModelBoundary>,
+    log: PathBuf,
     cancel: Arc<AtomicBool>,
     tx: SyncSender<UiAction>,
 ) -> std::io::Result<JoinHandle<()>> {
     let builder = std::thread::Builder::new().name(format!("relic-recall-{op}"));
-    crate::signal::spawn(builder, move || run(op, &question, &store, model, &cancel, &tx))
+    crate::signal::spawn(builder, move || run(op, &question, &store, model, &log, &cancel, &tx))
 }
 
-fn run(op: u64, question: &str, store: &Store, model: Arc<dyn ModelBoundary>, cancel: &Arc<AtomicBool>, tx: &SyncSender<UiAction>) {
+fn run(
+    op: u64,
+    question: &str,
+    store: &Store,
+    model: Arc<dyn ModelBoundary>,
+    log: &Path,
+    cancel: &Arc<AtomicBool>,
+    tx: &SyncSender<UiAction>,
+) {
     // Fails only once the workspace is gone, which has cancelled the recall.
     let send = |event| drop(tx.send(UiAction::Recall { op, event }));
     send(RecallEvent::Started { at: Instant::now() });
@@ -61,7 +71,7 @@ fn run(op: u64, question: &str, store: &Store, model: Arc<dyn ModelBoundary>, ca
         // requests go.
         Progress::Egress(_) => {}
     };
-    let report = app::recall(question, store, model, cancel, &mut progress);
+    let report = app::recall(question, store, model, log, cancel, &mut progress);
     send(RecallEvent::Finished(Box::new(report)));
 }
 
@@ -104,7 +114,7 @@ mod tests {
         let [UiEffect::StartRecall { op, ref question }] = e[..] else { panic!("{e:?}") };
 
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
-        run(op, question, &store, model, &Arc::default(), &tx);
+        run(op, question, &store, model, &dir.path().join("relic.db.recall.log"), &Arc::default(), &tx);
         drop(tx);
         for a in rx.iter() {
             update(&mut m, a);

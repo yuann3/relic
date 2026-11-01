@@ -2,6 +2,7 @@
 //! they never touch the store directly.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -10,8 +11,9 @@ use serde::Serialize;
 
 use crate::domain::{ObservationKind, Provenance, StoredObservation};
 use crate::redact::Redactor;
-use crate::rlm::coordinator::{InvestigationStatus, Progress, run_investigation};
+use crate::rlm::coordinator::{InvestigationResult, InvestigationStatus, Progress, run_investigation};
 use crate::rlm::model::ModelBoundary;
+use crate::rlm::model::egress::Role;
 use crate::rlm::protocol::{AnswerStatus, BudgetV1, FinishV1};
 use crate::store::{Store, is_interrupt};
 
@@ -477,20 +479,127 @@ impl CitedRecord {
     }
 }
 
+pub const RECALL_LOG_SCHEMA: &str = "relic.recall-log/v1";
+
+/// Where recalls against the store at `db` are logged: beside it, as its
+/// key is.
+pub fn recall_log_path(db: &Path) -> PathBuf {
+    let mut path = db.as_os_str().to_owned();
+    path.push(".recall.log");
+    PathBuf::from(path)
+}
+
+/// The recall log: one JSON line per start, request sent, reply, retry and
+/// finish, all under one random recall id. Metadata and record ids only: a
+/// copy of evidence text here would outlive `relic forget`.
+struct RecallLog {
+    file: std::fs::File,
+    recall: String,
+    /// The first write that failed; later lines are not attempted.
+    failed: Option<std::io::Error>,
+}
+
+impl RecallLog {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(path)?;
+        // One made by another tool, or before Relic set its umask.
+        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        let mut id = [0u8; 8];
+        getrandom::fill(&mut id).map_err(std::io::Error::other)?;
+        let recall = id.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(Self { file, recall, failed: None })
+    }
+
+    fn line(&mut self, event: &str, fields: serde_json::Value) {
+        use std::io::Write;
+        if self.failed.is_some() {
+            return;
+        }
+        let at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let mut line = serde_json::json!({"schema": RECALL_LOG_SCHEMA, "recall": self.recall, "at_ms": at_ms, "event": event});
+        if let (Some(line), serde_json::Value::Object(fields)) = (line.as_object_mut(), fields) {
+            line.extend(fields);
+        }
+        let mut bytes = line.to_string().into_bytes();
+        bytes.push(b'\n');
+        // One write per line: concurrent recalls append whole lines.
+        if let Err(e) = self.file.write_all(&bytes) {
+            self.failed = Some(e);
+        }
+    }
+
+    fn progress(&mut self, p: &Progress) {
+        let role = |r: &Role| if *r == Role::Root { "root" } else { "child" };
+        let redact = |s: &str| Redactor::new().redact(s);
+        match p {
+            Progress::Egress(a) => self.line("send", serde_json::json!({
+                "role": role(&a.role), "bytes": a.bytes, "origin": a.origin, "profile": a.profile,
+                "request_hash": a.request_hash, "redaction_revision": a.redaction_revision,
+            })),
+            Progress::Replied { role: r, returned_model } => {
+                self.line("reply", serde_json::json!({"role": role(r), "model": returned_model.as_deref().map(redact)}))
+            }
+            Progress::Retry { role: r, attempt, reason } => {
+                self.line("retry", serde_json::json!({"role": role(r), "attempt": attempt, "reason": redact(reason)}))
+            }
+            // Notes quote what the model wrote; the rest is in the finish line.
+            Progress::RootCall { .. } | Progress::Op { .. } | Progress::ChildCall { .. } | Progress::Note(_) => {}
+        }
+    }
+
+    /// The last line, synced: a Ctrl-C exits right after it.
+    fn finish(&mut self, r: &RecallReport) -> Option<std::io::Error> {
+        self.line("finish", serde_json::json!({
+            "outcome": r.outcome, "root_calls": r.root_calls, "child_calls": r.child_calls,
+            "cost_microusd": r.cost_microusd, "models": r.models,
+            "cited": r.evidence.iter().map(|e| e.id).collect::<Vec<_>>(), "error": r.error,
+        }));
+        if self.failed.is_none()
+            && let Err(e) = self.file.sync_data()
+        {
+            self.failed = Some(e);
+        }
+        self.failed.take()
+    }
+}
+
 /// Answer `question` from the evidence in `store` through a bounded
-/// investigation. Setting `cancel` from any thread or a signal handler ends
-/// it with [`RecallOutcome::Cancelled`].
+/// investigation, logging it to `log`. Setting `cancel` from any thread or
+/// a signal handler ends it with [`RecallOutcome::Cancelled`]. A log that
+/// cannot be opened or written fails the recall: nothing leaves unaudited.
 pub fn recall(
     question: &str,
     store: &Store,
     model: Arc<dyn ModelBoundary>,
+    log: &Path,
     cancel: &Arc<AtomicBool>,
     progress: &mut dyn FnMut(Progress),
 ) -> RecallReport {
     // Once, here: the report shows the question as it was sent.
     let question = Redactor::new().import(question);
+    let log_error = |e: std::io::Error| format!("could not write the recall log {}: {e}", log.display());
+    let mut log = match RecallLog::open(log) {
+        Ok(log) => log,
+        Err(e) => {
+            let failed = InvestigationResult {
+                status: InvestigationStatus::Failed(log_error(e)),
+                finish: None,
+                cited: HashMap::new(),
+                cost_microusd: None,
+                turns: 0,
+                child_calls: 0,
+            };
+            return report(question, failed, Vec::new());
+        }
+    };
+    let target = model.target();
+    log.line("start", serde_json::json!({"relic_version": env!("CARGO_PKG_VERSION"), "profile": target.profile, "origin": target.origin}));
     let mut models: Vec<String> = Vec::new();
     let mut progress = |p: Progress| {
+        log.progress(&p);
         if let Progress::Replied { returned_model: Some(m), .. } = &p
             && !models.contains(m)
         {
@@ -499,6 +608,15 @@ pub fn recall(
         progress(p)
     };
     let r = run_investigation(&question, store, model, BudgetV1::prototype_default(), cancel, &mut progress);
+    let mut report = report(question, r, models);
+    if let Some(e) = log.finish(&report) {
+        report.outcome = RecallOutcome::Failed;
+        report.error = Some(log_error(e));
+    }
+    report
+}
+
+fn report(question: String, r: InvestigationResult, models: Vec<String>) -> RecallReport {
     let (outcome, error) = match r.status {
         InvestigationStatus::Completed => (RecallOutcome::Answered, None),
         InvestigationStatus::Partial => (RecallOutcome::Partial, None),

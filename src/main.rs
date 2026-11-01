@@ -264,7 +264,8 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
 fn recall(question: &str, db: Option<PathBuf>, json: bool, allow_unknown_cost: bool) -> Result<ExitCode> {
     use relic::app::RecallOutcome;
     use relic::rlm::model::ModelBoundary;
-    let store = Store::open_read_only(&existing_db(db)?)?;
+    let db = existing_db(db)?;
+    let store = Store::open_read_only(&db)?;
     let model = Arc::new(relic::rlm::model::chat::ChatCompletionsClient::from_env()?);
     // The $1 cap fences nothing without prices (research, budget and cost lease).
     if model.prices().is_none() && !allow_unknown_cost {
@@ -275,7 +276,7 @@ fn recall(question: &str, db: Option<PathBuf>, json: bool, allow_unknown_cost: b
     let cancel = Arc::new(AtomicBool::new(false));
     relic::signal::interrupt_cancels(Arc::clone(&cancel));
     // Every request's size and destination is the payload audit (ADR 0004).
-    let report = app::recall(question, &store, model, &cancel, &mut |p| {
+    let report = app::recall(question, &store, model, &app::recall_log_path(&db), &cancel, &mut |p| {
         eprintln!("relic: {}", app::display_line(&p.to_string()))
     });
     let mut out = std::io::stdout().lock();

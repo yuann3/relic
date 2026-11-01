@@ -84,8 +84,8 @@ fn store(dir: &std::path::Path) -> std::path::PathBuf {
 
 /// Runs a recall until `said` holds for what it printed and `ready` holds,
 /// sends SIGINT, and returns the exit code, the time from SIGINT to exit,
-/// and what it said.
-fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> bool) -> (Option<i32>, Duration, String) {
+/// what it said and the last line of its recall log.
+fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> bool) -> (Option<i32>, Duration, String, serde_json::Value) {
     let dir = tempfile::tempdir().unwrap();
     let db = store(dir.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_relic"))
@@ -134,15 +134,18 @@ fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> 
     };
     let took = sent.elapsed();
     said.extend(rx.try_iter().map(|l| l + "\n"));
-    (status.code(), took, said)
+    let log = std::fs::read_to_string(dir.path().join("relic.db.recall.log")).unwrap();
+    let last = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    (status.code(), took, said, last)
 }
 
 #[test]
 fn ctrl_c_during_a_root_call_exits_130_within_250_ms() {
     let (url, _) = server(None, Duration::ZERO);
-    let (code, took, said) = interrupt(&url, |said| said.contains("root call 1"), || true);
+    let (code, took, said, last) = interrupt(&url, |said| said.contains("root call 1"), || true);
     assert_eq!(code, Some(130), "{said}");
     assert!(said.contains("recall cancelled"), "{said}");
+    assert_eq!((&last["event"], &last["outcome"]), (&serde_json::json!("finish"), &serde_json::json!("cancelled")), "{last}");
     assert!(took < GATE, "{took:?} from SIGINT to exit\n{said}");
 }
 
@@ -156,9 +159,10 @@ fn ctrl_c_during_four_child_calls_exits_130_within_250_ms_and_commits_none() {
     // the gate would close if the process were still waiting.
     let (url, children) = server(Some(plan), Duration::from_millis(150));
     let four = |said: &str| said.matches("child call for").count() == 4;
-    let (code, took, said) = interrupt(&url, four, || children.load(Ordering::SeqCst) == 4);
+    let (code, took, said, last) = interrupt(&url, four, || children.load(Ordering::SeqCst) == 4);
     assert_eq!(code, Some(130), "{said}");
     assert!(said.contains("recall cancelled"), "{said}");
+    assert_eq!((&last["event"], &last["outcome"]), (&serde_json::json!("finish"), &serde_json::json!("cancelled")), "{last}");
     assert!(took < GATE, "{took:?} from SIGINT to exit\n{said}");
     assert!(!said.contains("child reply from"), "a child reply was let in after cancel:\n{said}");
 }
