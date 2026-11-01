@@ -144,12 +144,13 @@ pub fn parse_output<T: DeserializeOwned>(raw: &str, max: usize) -> Result<T, Out
 }
 
 type ChildHandler = Box<dyn Fn(&EvidencePacket) -> String + Send>;
+type RootHandler = Box<dyn Fn(&serde_json::Value) -> String + Send>;
 
 /// A fake model that returns scripted responses for testing.
 #[derive(Default)]
 pub struct FakeModel {
     child_responses: std::sync::Mutex<Vec<ChildHandler>>,
-    root_responses: std::sync::Mutex<Vec<String>>,
+    root_responses: std::sync::Mutex<Vec<RootHandler>>,
     requests: std::sync::Mutex<Vec<EgressRequest>>,
 }
 
@@ -192,7 +193,16 @@ impl FakeModel {
 
     /// Add a root reply body exactly as the model would send it.
     pub fn add_root_raw(&self, body: String) {
-        self.root_responses.lock().unwrap().push(body);
+        self.add_root_fn(move |_| body.clone());
+    }
+
+    /// Add a root reply body made from the root state it is shown, so a
+    /// finish can cite the evidence ids of this investigation.
+    pub fn add_root_fn<F>(&self, f: F)
+    where
+        F: Fn(&serde_json::Value) -> String + Send + 'static,
+    {
+        self.root_responses.lock().unwrap().push(Box::new(f));
     }
 
     /// Default child handler: mark all items as "supports" with high confidence.
@@ -233,7 +243,8 @@ impl ModelBoundary for FakeModel {
                 if responses.is_empty() {
                     return Err(ModelError::Refused("no more scripted root responses".into()));
                 }
-                responses.remove(0)
+                let state = serde_json::from_str(req.user()).expect("a root request holds the root state");
+                responses.remove(0)(&state)
             }
             Role::Child => {
                 #[derive(serde::Deserialize)]

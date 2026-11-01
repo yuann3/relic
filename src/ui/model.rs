@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use crate::app::{EvidenceView, SearchError, SearchPage};
+use crate::app::{EvidenceView, RecallReport, SearchError, SearchPage};
 
 /// Rows asked of the index per keystroke. The picker and the list both work
 /// on this page; broad queries say "narrow it" instead of growing it.
@@ -15,13 +15,6 @@ pub const PAGE_LIMIT: usize = 200;
 pub const QUERY_MAX_CHARS: usize = 256;
 pub const DOUBLE_INTERRUPT: Duration = Duration::from_secs(1);
 const INTERRUPT_HINT: &str = "press Ctrl-C again within 1 s to quit";
-
-/// Budget the confirmation promises. The fake recall stays inside it so the
-/// meter reads like the real one will.
-pub const RECALL_ROOT_MAX: u32 = 8;
-pub const RECALL_CHILD_MAX: u32 = 16;
-pub const RECALL_WALL_MAX: Duration = Duration::from_secs(60);
-pub const RECALL_SPEND_CAP: &str = "$1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -119,9 +112,10 @@ pub enum PickOutcome {
 pub enum RecallEvent {
     Started { at: Instant },
     StepStarted(String),
+    /// Ends the newest running step; an empty outcome shows none.
     StepDone(String),
     Calls { root: u32, child: u32 },
-    Finished { claim: String, cites: Vec<i64> },
+    Finished(RecallReport),
 }
 
 /// Everything `update` may ask the runtime to do. There is deliberately no
@@ -140,8 +134,7 @@ pub enum UiEffect {
     OpenPicker(SearchPage),
     StartRecall {
         op: u64,
-        query: String,
-        cite: i64,
+        question: String,
     },
     CancelRecall {
         op: u64,
@@ -230,12 +223,6 @@ pub enum RecallStatus {
     Finished,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Finding {
-    pub claim: String,
-    pub cites: Vec<i64>,
-}
-
 #[derive(Debug)]
 pub struct RecallState {
     next_op: u64,
@@ -248,8 +235,8 @@ pub struct RecallState {
     pub child_calls: u32,
     pub started_at: Option<Instant>,
     pub now: Option<Instant>,
-    pub finding: Option<Finding>,
-    /// `None` follows the newest line, so progress and then the finding stay
+    pub report: Option<RecallReport>,
+    /// `None` follows the newest line, so progress and then the report stay
     /// in view; scrolling up pins a row until it is back at the end.
     pub scroll: Option<u16>,
     /// Like [`EvidenceState::scroll_max`]: only the view knows the wrap.
@@ -280,7 +267,7 @@ impl Default for RecallState {
             child_calls: 0,
             started_at: None,
             now: None,
-            finding: None,
+            report: None,
             scroll: None,
             scroll_max: Cell::new(0),
         }
@@ -294,6 +281,8 @@ pub struct UiModel {
     pub search: SearchState,
     pub evidence: EvidenceState,
     pub recall: RecallState,
+    /// Where a recall's requests go, or why there is no model to ask.
+    pub recall_model: Result<String, String>,
     pub modal: Option<Modal>,
     /// One transient line for the status bar: picker errors, hints.
     pub notice: Option<String>,
@@ -316,6 +305,7 @@ impl UiModel {
             search: SearchState::default(),
             evidence: EvidenceState::default(),
             recall: RecallState::default(),
+            recall_model: Err("no model is configured".into()),
             modal: None,
             notice: None,
             mono,
@@ -668,11 +658,7 @@ fn enter(m: &mut UiModel) -> Vec<UiEffect> {
     let id = match m.focus {
         Focus::Query | Focus::Results => m.search.selected_hit().map(|h| h.id),
         Focus::Timeline => m.evidence.shown().map(|o| o.id),
-        Focus::Recall => m
-            .recall
-            .finding
-            .as_ref()
-            .and_then(|f| f.cites.first().copied()),
+        Focus::Recall => m.recall.report.as_ref().and_then(|r| r.evidence.first()).map(|e| e.id),
         Focus::Evidence => return vec![],
     };
     let Some(id) = id else {
@@ -711,8 +697,12 @@ fn toggle_recall(m: &mut UiModel) -> Vec<UiEffect> {
     if let Some(op) = m.recall.active {
         return cancel_recall(m, op);
     }
-    if m.search.selected_hit().is_none() {
-        m.notice = Some("recall cites the selected result; search for something first".into());
+    if let Err(why) = &m.recall_model {
+        m.notice = Some(format!("recall needs a model: {why}; see relic --help"));
+        return vec![];
+    }
+    if m.query.trim().is_empty() {
+        m.notice = Some("recall answers the query; type a question first".into());
         return vec![];
     }
     m.modal = Some(Modal::ConfirmRecall);
@@ -721,10 +711,6 @@ fn toggle_recall(m: &mut UiModel) -> Vec<UiEffect> {
 
 fn start_recall(m: &mut UiModel) -> Vec<UiEffect> {
     m.modal = None;
-    let Some(cite) = m.search.selected_hit().map(|h| h.id) else {
-        m.notice = Some("the selected result went away; recall not started".into());
-        return vec![];
-    };
     let op = m.recall.next_op;
     m.recall = RecallState {
         next_op: op + 1,
@@ -734,11 +720,7 @@ fn start_recall(m: &mut UiModel) -> Vec<UiEffect> {
     };
     m.focus = Focus::Recall;
     m.notice = None;
-    vec![UiEffect::StartRecall {
-        op,
-        query: m.query.clone(),
-        cite,
-    }]
+    vec![UiEffect::StartRecall { op, question: m.query.clone() }]
 }
 
 fn cancel_recall(m: &mut UiModel, op: u64) -> Vec<UiEffect> {
@@ -778,20 +760,49 @@ fn on_recall_event(m: &mut UiModel, op: u64, event: RecallEvent) -> Vec<UiEffect
                 .find(|s| s.state == StepState::Running)
             {
                 s.state = StepState::Done;
-                s.outcome = Some(outcome);
+                s.outcome = (!outcome.is_empty()).then_some(outcome);
             }
         }
         RecallEvent::Calls { root, child } => {
             r.root_calls = root;
             r.child_calls = child;
         }
-        RecallEvent::Finished { claim, cites } => {
+        RecallEvent::Finished(report) => {
             r.active = None;
             r.status = RecallStatus::Finished;
-            r.finding = Some(Finding { claim, cites });
+            // The last operation has no event of its own that ends it.
+            for s in &mut r.steps {
+                if s.state == StepState::Running {
+                    s.state = StepState::Done;
+                }
+            }
+            r.report = Some(report);
         }
     }
     vec![]
+}
+
+/// An answered report citing `cites`, for the UI's tests.
+#[cfg(test)]
+pub(crate) fn answered(cites: &[i64]) -> RecallReport {
+    use crate::app::{CitedRecord, CitedText, RECALL_SCHEMA, RecallOutcome};
+    RecallReport {
+        schema: RECALL_SCHEMA,
+        question: "how did I renew".into(),
+        outcome: RecallOutcome::Answered,
+        error: None,
+        answer: "with certbot".into(),
+        claims: vec![CitedText { text: "certbot renew ran".into(), supports: cites.to_vec(), contradicts: vec![] }],
+        procedure: vec![],
+        contradictions: vec![],
+        missing: vec![],
+        evidence: cites
+            .iter()
+            .map(|&id| CitedRecord { id, revision: 1, ordinal: id, source: "zsh", observed_at_ms: None, text: format!("cmd {id}") })
+            .collect(),
+        root_calls: 2,
+        child_calls: 3,
+    }
 }
 
 #[cfg(test)]
@@ -868,6 +879,7 @@ mod tests {
     /// A model with "git" typed and its page of ids 10, 11, 12 accepted.
     fn with_results() -> UiModel {
         let mut m = UiModel::new(false);
+        m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
         keys(&mut m, "git");
         let g = m.search.generation;
         update(&mut m, done(g, page("git", &[10, 11, 12])));
@@ -1246,26 +1258,27 @@ mod tests {
 
         update(&mut m, UiAction::Key(Key::Ctrl('r')));
         let e = update(&mut m, UiAction::Key(Key::Char('y')));
-        let [
-            UiEffect::StartRecall {
-                op,
-                ref query,
-                cite,
-            },
-        ] = e[..]
-        else {
+        let [UiEffect::StartRecall { op, ref question }] = e[..] else {
             panic!("{e:?}")
         };
         // The keys after the "r" were query text: "git" became "gitby".
-        assert_eq!((op, query.as_str(), cite), (1, "gitby", 10));
+        assert_eq!((op, question.as_str()), (1, "gitby"));
         assert_eq!(m.recall.status, RecallStatus::Running);
     }
 
     #[test]
-    fn recall_without_a_selected_hit_does_not_offer_to_spend() {
-        let mut m = UiModel::new(false);
+    fn recall_without_a_question_or_a_model_does_not_offer_to_spend() {
+        let mut m = with_results();
+        update(&mut m, UiAction::Key(Key::Ctrl('u')));
         update(&mut m, UiAction::Key(Key::Ctrl('r')));
         assert_eq!(m.modal, None);
+        assert_eq!(m.notice.as_deref(), Some("recall answers the query; type a question first"));
+
+        let mut m = with_results();
+        m.recall_model = Err("RELIC_MODEL_NAME is required".into());
+        update(&mut m, UiAction::Key(Key::Ctrl('r')));
+        assert_eq!(m.modal, None);
+        assert_eq!(m.notice.as_deref(), Some("recall needs a model: RELIC_MODEL_NAME is required; see relic --help"));
     }
 
     #[test]
@@ -1277,6 +1290,7 @@ mod tests {
             RecallEvent::StepStarted("plan".into()),
             RecallEvent::StepDone("2 searches".into()),
             RecallEvent::Calls { root: 2, child: 3 },
+            RecallEvent::StepStarted("run i1".into()),
         ] {
             update(&mut m, UiAction::Recall { op, event: ev });
         }
@@ -1285,10 +1299,7 @@ mod tests {
         assert_eq!((m.recall.root_calls, m.recall.child_calls), (2, 3));
         assert_eq!(m.recall.steps[0].state, StepState::Done);
 
-        let finished = RecallEvent::Finished {
-            claim: "x".into(),
-            cites: vec![10],
-        };
+        let finished = RecallEvent::Finished(answered(&[11, 10]));
         update(
             &mut m,
             UiAction::Recall {
@@ -1297,11 +1308,12 @@ mod tests {
             },
         );
         assert_eq!(m.recall.status, RecallStatus::Finished);
+        assert_eq!(m.recall.steps[1].state, StepState::Done, "the last operation ends with the recall");
         m.focus = Focus::Recall;
         let e = update(&mut m, UiAction::Key(Key::Enter));
         assert!(
-            matches!(e[..], [UiEffect::OpenEvidence { id: 10 }]),
-            "the citation opens"
+            matches!(e[..], [UiEffect::OpenEvidence { id: 11 }]),
+            "the first cited record opens"
         );
     }
 
@@ -1329,15 +1341,12 @@ mod tests {
             for late in [
                 RecallEvent::StepDone("late".into()),
                 RecallEvent::Calls { root: 8, child: 16 },
-                RecallEvent::Finished {
-                    claim: "late".into(),
-                    cites: vec![10],
-                },
+                RecallEvent::Finished(answered(&[10])),
             ] {
                 assert!(update(&mut m, UiAction::Recall { op, event: late }).is_empty());
             }
             assert_eq!(m.recall.status, RecallStatus::Cancelled);
-            assert_eq!((m.recall.root_calls, m.recall.finding.is_none()), (0, true));
+            assert_eq!((m.recall.root_calls, m.recall.report.is_none()), (0, true));
             assert!(!m.dirty);
         }
     }
@@ -1485,6 +1494,7 @@ mod tests {
         let mut starts = 0;
         for run in 0..300 {
             let mut m = UiModel::new(false);
+            m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
             let mut ops = Vec::new();
             for step in 0..60u64 {
                 let action = match rng.next() % 10 {

@@ -125,8 +125,8 @@ fn admit(c: &mut Calls, job: Job) -> Result<Result<Flight, String>, Stop> {
     };
     c.ledger.reserve(&logical).map_err(Stop::Budget)?;
     let target = c.model.target();
-    let progress = &mut c.progress;
-    let req = match EgressRequest::new(job.role, job.payload, &target, c.ledger, &mut |a| progress(Progress::Egress(a))) {
+    let mut audit = None;
+    let req = match EgressRequest::new(job.role, job.payload, &target, c.ledger, &mut |a| audit = Some(a)) {
         Ok(req) => req,
         Err(EgressError::Budget(b)) => return Err(Stop::Budget(b)),
         Err(e) => return Ok(Err(e.to_string())),
@@ -141,6 +141,11 @@ fn admit(c: &mut Calls, job: Job) -> Result<Result<Flight, String>, Stop> {
         *c.child_calls += 1;
     }
     (c.progress)(job.admitted);
+    // After the admission it belongs to, and only for a request every fence
+    // let through: the audit says what is about to leave.
+    if let Some(audit) = audit {
+        (c.progress)(Progress::Egress(audit));
+    }
     Ok(Ok(Flight { req, attempt: 1, tokens, cost }))
 }
 
@@ -259,6 +264,30 @@ mod tests {
 
     fn retries(events: &[Progress]) -> usize {
         events.iter().filter(|e| matches!(e, Progress::Retry { .. })).count()
+    }
+
+    #[test]
+    fn each_admission_comes_before_its_audit_and_a_fenced_request_has_none() {
+        let ok = || Ok(Reply { body: "ok".into(), ..Reply::default() });
+        let label = |e: &Progress| match e {
+            Progress::Note(n) => Some(n.clone()),
+            Progress::Egress(a) => Some(format!("send {}", a.bytes)),
+            _ => None,
+        };
+        let budget = BudgetV1 { max_concurrency: 1, ..BudgetV1::prototype_default() };
+        let (out, events, _, _) = run(script(vec![ok(), ok()]), budget.clone(), jobs(2), &AtomicBool::new(false));
+        assert!(out.is_ok());
+        let seen: Vec<String> = events.iter().filter_map(label).collect();
+        let send = seen[1].clone();
+        assert!(send.starts_with("send "), "{seen:?}");
+        assert_eq!(seen, ["job 0".to_string(), send.clone(), "job 1".into(), send]);
+
+        // Out of output tokens after the bytes were counted: nothing leaves,
+        // so nothing is audited as leaving.
+        let budget = BudgetV1 { reserved_output_tokens: 0, ..budget };
+        let (out, events, _, _) = run(script(vec![ok()]), budget, jobs(1), &AtomicBool::new(false));
+        assert!(out.is_err());
+        assert!(events.iter().all(|e| label(e).is_none()), "{events:?}");
     }
 
     #[test]

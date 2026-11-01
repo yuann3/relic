@@ -42,14 +42,9 @@ impl std::fmt::Display for IntegrityError {
 
 impl std::error::Error for IntegrityError {}
 
-/// Create an evidence handle from a stored observation.
-pub fn create_evidence_handle(
-    obs: &StoredObservation,
-    investigation_id: InvestigationId,
-    installation_key: &[u8],
-) -> EvidenceHandleV1 {
+/// Create the evidence handle `id` for a stored observation.
+pub fn create_evidence_handle(obs: &StoredObservation, investigation_id: InvestigationId, id: EvidenceId) -> EvidenceHandleV1 {
     let content_hash = content_hash(obs.safe_text.as_bytes());
-    let id = keyed_evidence_id(obs.id, investigation_id, installation_key);
 
     EvidenceHandleV1 {
         id,
@@ -93,14 +88,18 @@ fn content_hash(data: &[u8]) -> Vec<u8> {
     hash.to_le_bytes().to_vec()
 }
 
-/// Generate a keyed evidence ID that doesn't expose internal identifiers.
-fn keyed_evidence_id(obs_id: i64, investigation_id: InvestigationId, key: &[u8]) -> EvidenceId {
-    let mut input = Vec::new();
-    input.extend_from_slice(&obs_id.to_le_bytes());
-    input.extend_from_slice(&investigation_id.to_le_bytes());
-    input.extend_from_slice(key);
-    let hash = content_hash(&input);
-    format!("ev1_{}", hex_encode(&hash))
+/// Random bytes. Entropy failing on macOS or Linux is not an outcome a
+/// recall can do anything about.
+fn random<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    getrandom::fill(&mut bytes).expect("the OS gives out random bytes");
+    bytes
+}
+
+/// A fresh evidence id: random, so it says nothing about the observation and
+/// no other investigation can name it (ADR 0002). No key is involved.
+fn random_evidence_id() -> EvidenceId {
+    format!("ev1_{}", hex_encode(&random::<8>()))
 }
 
 /// A short hex digest of `data`, for audit records.
@@ -136,17 +135,19 @@ struct RegistryEntry {
 /// Manages result handles for one investigation.
 pub struct HandleRegistry {
     investigation_id: InvestigationId,
-    installation_key: Vec<u8>,
+    /// One evidence id per observation, so every set holding it cites it alike.
+    evidence_ids: HashMap<i64, EvidenceId>,
     entries: HashMap<HandleId, RegistryEntry>,
     next_handle: u64,
     max_handles: usize,
 }
 
 impl HandleRegistry {
-    pub fn new(investigation_id: InvestigationId, installation_key: Vec<u8>, max_handles: usize) -> Self {
+    /// A registry for a new investigation, with a random id of its own.
+    pub fn new(max_handles: usize) -> Self {
         Self {
-            investigation_id,
-            installation_key,
+            investigation_id: u64::from_le_bytes(random()),
+            evidence_ids: HashMap::new(),
             entries: HashMap::new(),
             next_handle: 0,
             max_handles,
@@ -183,7 +184,10 @@ impl HandleRegistry {
 
         let evidence_handles: Vec<EvidenceHandleV1> = observations
             .iter()
-            .map(|obs| create_evidence_handle(obs, self.investigation_id, &self.installation_key))
+            .map(|obs| {
+                let id = self.evidence_ids.entry(obs.id).or_insert_with(random_evidence_id).clone();
+                create_evidence_handle(obs, self.investigation_id, id)
+            })
             .collect();
 
         let count = observations.len() as u32;
@@ -290,12 +294,11 @@ mod tests {
         }
     }
 
-    const KEY: &[u8] = b"test-installation-key";
 
     #[test]
     fn create_and_verify_handle() {
         let obs = make_stored(1, 10, 0, "cargo build --release");
-        let handle = create_evidence_handle(&obs, 100, KEY);
+        let handle = create_evidence_handle(&obs, 100, random_evidence_id());
 
         assert!(handle.id.starts_with("ev1_"));
         assert_eq!(handle.observation_id, 1);
@@ -308,7 +311,7 @@ mod tests {
     #[test]
     fn forged_content_hash_detected() {
         let obs = make_stored(1, 10, 0, "cargo build --release");
-        let mut handle = create_evidence_handle(&obs, 100, KEY);
+        let mut handle = create_evidence_handle(&obs, 100, random_evidence_id());
         handle.sanitized_content_hash = vec![0xFF; 8]; // forge
 
         assert_eq!(
@@ -320,7 +323,7 @@ mod tests {
     #[test]
     fn forged_revision_detected() {
         let obs = make_stored(1, 10, 0, "cargo build --release");
-        let mut handle = create_evidence_handle(&obs, 100, KEY);
+        let mut handle = create_evidence_handle(&obs, 100, random_evidence_id());
         handle.revision_id = 999; // forge
 
         assert_eq!(
@@ -332,7 +335,7 @@ mod tests {
     #[test]
     fn forged_ordinal_detected() {
         let obs = make_stored(1, 10, 0, "cargo build --release");
-        let mut handle = create_evidence_handle(&obs, 100, KEY);
+        let mut handle = create_evidence_handle(&obs, 100, random_evidence_id());
         handle.ordinal = 42; // forge
 
         assert_eq!(
@@ -344,7 +347,7 @@ mod tests {
     #[test]
     fn cross_investigation_reuse_detected() {
         let obs = make_stored(1, 10, 0, "cargo build --release");
-        let handle = create_evidence_handle(&obs, 100, KEY);
+        let handle = create_evidence_handle(&obs, 100, random_evidence_id());
 
         // Try to use in investigation 200
         assert_eq!(
@@ -356,7 +359,7 @@ mod tests {
     #[test]
     fn altered_observation_text_detected() {
         let obs = make_stored(1, 10, 0, "cargo build --release");
-        let handle = create_evidence_handle(&obs, 100, KEY);
+        let handle = create_evidence_handle(&obs, 100, random_evidence_id());
 
         // Observation text changed after handle was created
         let altered = make_stored(1, 10, 0, "rm -rf /");
@@ -370,7 +373,7 @@ mod tests {
 
     #[test]
     fn registry_insert_and_lookup() {
-        let mut reg = HandleRegistry::new(100, KEY.to_vec(), 64);
+        let mut reg = HandleRegistry::new(64);
         let obs = vec![
             make_stored(1, 10, 0, "cargo build"),
             make_stored(2, 10, 1, "cargo test"),
@@ -385,13 +388,13 @@ mod tests {
 
     #[test]
     fn registry_nonexistent_handle_returns_none() {
-        let reg = HandleRegistry::new(100, KEY.to_vec(), 64);
+        let reg = HandleRegistry::new(64);
         assert!(reg.get("nonexistent").is_none());
     }
 
     #[test]
     fn registry_evidence_id_resolution() {
-        let mut reg = HandleRegistry::new(100, KEY.to_vec(), 64);
+        let mut reg = HandleRegistry::new(64);
         let obs = vec![make_stored(1, 10, 0, "cargo build")];
         let hid = reg.insert_evidence_set(obs);
 
@@ -405,13 +408,30 @@ mod tests {
 
     #[test]
     fn registry_unknown_evidence_id_returns_none() {
-        let reg = HandleRegistry::new(100, KEY.to_vec(), 64);
+        let reg = HandleRegistry::new(64);
         assert!(reg.resolve_evidence_id("ev1_fake").is_none());
     }
 
     #[test]
+    fn evidence_ids_are_shared_within_an_investigation_and_differ_across_them() {
+        let obs = || vec![make_stored(1, 10, 0, "cargo build"), make_stored(2, 10, 1, "cargo test")];
+        let ids = |reg: &mut HandleRegistry| {
+            let hid = reg.insert_evidence_set(obs());
+            reg.get_evidence_handles(&hid).unwrap().iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        };
+        let (mut first, mut second) = (HandleRegistry::new(64), HandleRegistry::new(64));
+        let a = ids(&mut first);
+        assert_ne!(a[0], a[1]);
+        assert_eq!(ids(&mut first), a, "a second set over the same records cites them alike");
+        let b = ids(&mut second);
+        assert!(a.iter().all(|id| !b.contains(id)), "{a:?} {b:?}");
+        assert!(second.resolve_evidence_id(&a[0]).is_none());
+        assert_ne!(first.investigation_id(), second.investigation_id());
+    }
+
+    #[test]
     fn registry_summaries() {
-        let mut reg = HandleRegistry::new(100, KEY.to_vec(), 64);
+        let mut reg = HandleRegistry::new(64);
         reg.insert_evidence_set(vec![make_stored(1, 10, 0, "cmd1")]);
         reg.insert_evidence_set(vec![make_stored(2, 10, 1, "cmd2"), make_stored(3, 10, 2, "cmd3")]);
 

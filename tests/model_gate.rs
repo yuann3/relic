@@ -4,77 +4,17 @@
 //! that arrives late. If it fails, the transport decision reopens (reqwest),
 //! not a workaround.
 //!
-//! The process under test is this test binary run again with `GATE_CHILD`
-//! set: it drives `run_investigation` over the real `ChatCompletionsClient`
-//! and turns SIGINT into the cancel flag, as the recall command will.
+//! The process under test is `relic recall` itself, over the real
+//! `ChatCompletionsClient`, with SIGINT as the cancel flag.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use relic::rlm::coordinator::{InvestigationStatus, run_investigation};
-use relic::rlm::model::chat::{ChatCompletionsClient, ChatConfig, OutputMode, Profile, TokenField};
-use relic::rlm::protocol::BudgetV1;
-use relic::store::Store;
-
 const GATE: Duration = Duration::from_millis(250);
-
-static CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-
-extern "C" fn on_sigint(_: libc::c_int) {
-    // An atomic load and an atomic store: async-signal-safe.
-    if let Some(cancel) = CANCEL.get() {
-        cancel.store(true, Ordering::SeqCst);
-    }
-}
-
-/// The process under test. Not a test unless `GATE_CHILD` names a case.
-#[test]
-fn gate_child() {
-    let (Ok(case), Ok(url), Ok(db)) = (std::env::var("GATE_CHILD"), std::env::var("GATE_URL"), std::env::var("GATE_DB")) else {
-        return;
-    };
-    let cancel = CANCEL.get_or_init(Arc::default).clone();
-    // SAFETY: installs a handler that only stores to an atomic.
-    unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t) };
-    let config = ChatConfig {
-        profile: Profile::Vllm,
-        base_url: url,
-        model: "gate".into(),
-        output: OutputMode::JsonSchema,
-        token_field: TokenField::MaxTokens,
-        api_key: None,
-        prices: None,
-    };
-    let client = Arc::new(ChatCompletionsClient::new(config).unwrap());
-    let store = Store::open_read_only(std::path::Path::new(&db)).unwrap();
-    let (mut roots, mut children) = (0, 0);
-    let mut progress = |p: relic::rlm::coordinator::Progress| {
-        use relic::rlm::coordinator::Progress::*;
-        eprintln!("event {p:?}");
-        match p {
-            RootCall { .. } => roots += 1,
-            ChildCall { .. } => children += 1,
-            _ => {}
-        }
-        let ready = match case.as_str() {
-            "root" => roots == 1 && children == 0,
-            _ => children == 4,
-        };
-        if ready {
-            eprintln!("READY");
-        }
-    };
-    let result = run_investigation("which command renewed the certificate?", &store, client, BudgetV1::prototype_default(), &cancel, &mut progress);
-    eprintln!("status {:?}", result.status);
-    let code = if result.status == InvestigationStatus::Cancelled { 130 } else { 1 };
-    // Not a return: the calls still blocked on their sockets must not hold
-    // the process open; exiting closes them (research, cancellation 6).
-    std::process::exit(code);
-}
 
 /// Reads one HTTP request off `stream`; true if it was a child call.
 fn read_request(stream: &TcpStream) -> bool {
@@ -142,16 +82,19 @@ fn store(dir: &std::path::Path) -> std::path::PathBuf {
     db
 }
 
-/// Runs the case until it says READY and `ready` holds, sends SIGINT, and
-/// returns the exit code, the time from SIGINT to exit, and what it said.
-fn interrupt(case: &str, url: &str, ready: impl Fn() -> bool) -> (Option<i32>, Duration, String) {
+/// Runs a recall until `said` holds for what it printed and `ready` holds,
+/// sends SIGINT, and returns the exit code, the time from SIGINT to exit,
+/// and what it said.
+fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> bool) -> (Option<i32>, Duration, String) {
     let dir = tempfile::tempdir().unwrap();
     let db = store(dir.path());
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["gate_child", "--exact", "--nocapture"])
-        .env("GATE_CHILD", case)
-        .env("GATE_URL", url)
-        .env("GATE_DB", &db)
+    let mut child = Command::new(env!("CARGO_BIN_EXE_relic"))
+        .args(["recall", "which command renewed the certificate?", "--db"])
+        .arg(&db)
+        .env("RELIC_MODEL_PROFILE", "vllm")
+        .env("RELIC_MODEL_URL", url)
+        .env("RELIC_MODEL_NAME", "gate")
+        .env_remove("RELIC_MODEL_API_KEY")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -166,10 +109,10 @@ fn interrupt(case: &str, url: &str, ready: impl Fn() -> bool) -> (Option<i32>, D
     let mut said = String::new();
     let start = Instant::now();
     loop {
-        let line = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| panic!("no READY from {case}:\n{said}"));
+        let line = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| panic!("not ready:\n{said}"));
         said.push_str(&line);
         said.push('\n');
-        if line == "READY" {
+        if said_enough(&said) {
             break;
         }
         assert!(start.elapsed() < Duration::from_secs(10), "{said}");
@@ -197,9 +140,9 @@ fn interrupt(case: &str, url: &str, ready: impl Fn() -> bool) -> (Option<i32>, D
 #[test]
 fn ctrl_c_during_a_root_call_exits_130_within_250_ms() {
     let (url, _) = server(None, Duration::ZERO);
-    let (code, took, said) = interrupt("root", &url, || true);
+    let (code, took, said) = interrupt(&url, |said| said.contains("root call 1"), || true);
     assert_eq!(code, Some(130), "{said}");
-    assert!(said.contains("status Cancelled"), "{said}");
+    assert!(said.contains("recall cancelled"), "{said}");
     assert!(took < GATE, "{took:?} from SIGINT to exit\n{said}");
 }
 
@@ -212,9 +155,10 @@ fn ctrl_c_during_four_child_calls_exits_130_within_250_ms_and_commits_none() {
     // Replies land 150 ms after each call arrives: after SIGINT, and before
     // the gate would close if the process were still waiting.
     let (url, children) = server(Some(plan), Duration::from_millis(150));
-    let (code, took, said) = interrupt("children", &url, || children.load(Ordering::SeqCst) == 4);
+    let four = |said: &str| said.matches("child call for").count() == 4;
+    let (code, took, said) = interrupt(&url, four, || children.load(Ordering::SeqCst) == 4);
     assert_eq!(code, Some(130), "{said}");
-    assert!(said.contains("status Cancelled"), "{said}");
+    assert!(said.contains("recall cancelled"), "{said}");
     assert!(took < GATE, "{took:?} from SIGINT to exit\n{said}");
-    assert!(!said.contains("Replied { role: Child"), "a child reply was let in after cancel:\n{said}");
+    assert!(!said.contains("child reply from"), "a child reply was let in after cancel:\n{said}");
 }

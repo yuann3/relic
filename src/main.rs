@@ -1,6 +1,8 @@
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use relic::app::{self, Budget, MatchMode, Order, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
@@ -53,10 +55,11 @@ fn run(cmd: Command) -> Result<ExitCode> {
             writeln!(std::io::stdout().lock(), "relic {} ({build}{debug})", env!("CARGO_PKG_VERSION"))?;
         }
         Command::Search(args) => return search(args),
+        Command::Recall { question, db, json } => return recall(&question, db, json),
         Command::Ui { db } => ui(&existing_db(db)?)?,
         Command::ModelCheck => {
-            use relic::rlm::model::chat::{self, ChatCompletionsClient, ChatConfig};
-            let client = ChatCompletionsClient::new(ChatConfig::from_env(|k| std::env::var(k).ok())?)?;
+            use relic::rlm::model::chat::{self, ChatCompletionsClient};
+            let client = ChatCompletionsClient::from_env()?;
             let (receipt, verdict) = chat::check(&client);
             // Terminal-safe: the receipt quotes the endpoint's error text.
             let mut out = std::io::stdout().lock();
@@ -254,6 +257,85 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn recall(question: &str, db: Option<PathBuf>, json: bool) -> Result<ExitCode> {
+    use relic::app::RecallOutcome;
+    let store = Store::open_read_only(&existing_db(db)?)?;
+    let model = Arc::new(relic::rlm::model::chat::ChatCompletionsClient::from_env()?);
+    let cancel = Arc::new(AtomicBool::new(false));
+    relic::signal::interrupt_cancels(Arc::clone(&cancel));
+    // Every request's size and destination is the payload audit (ADR 0004).
+    let report = app::recall(question, &store, model, &cancel, &mut |p| {
+        eprintln!("relic: {}", app::display_line(&p.to_string()))
+    });
+    let mut out = std::io::stdout().lock();
+    if json {
+        report.serialize(&mut serde_json::Serializer::with_formatter(&mut out, TerminalSafe))?;
+        writeln!(out)?;
+    } else {
+        print_recall(&mut out, &report)?;
+    }
+    Ok(match report.outcome {
+        RecallOutcome::Answered | RecallOutcome::Partial => ExitCode::SUCCESS,
+        RecallOutcome::Abstained => ExitCode::FAILURE,
+        RecallOutcome::Cancelled => {
+            eprintln!("relic: recall cancelled");
+            ExitCode::from(130)
+        }
+        RecallOutcome::BudgetExhausted => {
+            eprintln!("relic: recall ran out of budget before it could answer");
+            ExitCode::from(2)
+        }
+        RecallOutcome::Failed => {
+            let why = report.error.as_deref().unwrap_or("unknown");
+            eprintln!("relic: recall failed: {}", app::display_line(why));
+            ExitCode::from(2)
+        }
+    })
+}
+
+/// Model text is as hostile as history text: every line through
+/// `display_line`.
+fn print_recall(out: &mut impl Write, r: &app::RecallReport) -> Result<()> {
+    let cites = |ids: &[i64]| ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
+    let outcome = match r.outcome {
+        app::RecallOutcome::Answered => "answered",
+        app::RecallOutcome::Partial => "partly answered",
+        app::RecallOutcome::Abstained => "no answer",
+        app::RecallOutcome::BudgetExhausted => "out of budget",
+        app::RecallOutcome::Cancelled => "cancelled",
+        app::RecallOutcome::Failed => "failed",
+    };
+    writeln!(out, "{outcome}: {}", app::display_line(&r.answer))?;
+    if !r.claims.is_empty() {
+        writeln!(out, "claims:")?;
+    }
+    for c in &r.claims {
+        let against = if c.contradicts.is_empty() { String::new() } else { format!(", against {}", cites(&c.contradicts)) };
+        writeln!(out, "  - {} [{}{against}]", app::display_line(&c.text), cites(&c.supports))?;
+    }
+    if !r.procedure.is_empty() {
+        writeln!(out, "procedure:")?;
+    }
+    for (i, s) in r.procedure.iter().enumerate() {
+        writeln!(out, "  {}. {} [{}]", i + 1, app::display_line(&s.text), cites(&s.supports))?;
+    }
+    for (label, items) in [("contradictions", &r.contradictions), ("missing", &r.missing)] {
+        if !items.is_empty() {
+            writeln!(out, "{label}:")?;
+        }
+        for m in items {
+            writeln!(out, "  - {}", app::display_line(m))?;
+        }
+    }
+    if !r.evidence.is_empty() {
+        writeln!(out, "evidence:")?;
+    }
+    for e in &r.evidence {
+        writeln!(out, "  #{:<6} {} {:<4}  {}", e.id, e.when().label(), e.source, app::display_line(&e.text))?;
+    }
+    Ok(())
 }
 
 /// "Could not look" is not "nothing found": exit 2, not 1 (ADR 0011).

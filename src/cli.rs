@@ -16,6 +16,7 @@ relic — recall what you did in the terminal, with evidence
 
 USAGE:
     relic search <QUERY>... [--db PATH] [--limit N] [--prefix] [--rank] [--json | --fzf]
+    relic recall <QUESTION>... [--db PATH] [--json]
 ",
             $ui,
             "    relic import <HISTORY_FILE> [--shell zsh|bash] [--db PATH]
@@ -32,6 +33,9 @@ OPTIONS:
                   which is import order, not the time a command ran
     --json        Print one relic.search/v1 document on stdout
     --fzf         Pick one result with fzf and show its evidence
+    recall        Answer a question from your history with a model, citing
+                  the records it rests on. --json prints one relic.recall/v1
+                  document. Ctrl-C cancels it
     forget        Delete records for good, by the id search --json and the TUI
                   show. Remove the line from your history file too, or a later
                   import of a rewritten file can store it again
@@ -40,6 +44,8 @@ OPTIONS:
                   that differs from the stored one replaces that file's records
 
 MODEL:
+    recall sends the model your question and the commands it searches for,
+    redacted, and prints each request's size and destination on stderr.
     model check sends a synthetic request, never your history, and prints
     a relic.model-check/v1 receipt. Configure the model with:
     RELIC_MODEL_PROFILE   openai (default), vllm, llama_cpp or custom
@@ -55,11 +61,14 @@ MODEL:
                           US dollars per million tokens, to fence cost
 
 EXIT STATUS:
-    0             Success; search found a match
-    1             Search found no match, or nothing matched in fzf
-    2             Error, including bad arguments, a busy store and a query
-                  with nothing to search for
-    130           The fzf picker was cancelled
+    0             Success; search found a match; recall answered, fully or
+                  in part
+    1             Search found no match, nothing matched in fzf, or recall
+                  found nothing it could cite
+    2             Error, including bad arguments, a busy store, a query
+                  with nothing to search for, and a recall that failed or
+                  ran out of budget
+    130           The fzf picker or a recall was cancelled
     128+n         Killed by signal n
 "
         )
@@ -76,6 +85,7 @@ pub enum Command {
     Help,
     Version,
     Search(SearchArgs),
+    Recall { question: String, db: Option<PathBuf>, json: bool },
     Ui { db: Option<PathBuf> },
     Import { path: PathBuf, shell: Option<SourceKind>, db: Option<PathBuf> },
     Forget { ids: Vec<i64>, db: Option<PathBuf> },
@@ -111,6 +121,24 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         "-h" | "--help" | "help" => Ok(Command::Help),
         "-V" | "--version" => Ok(Command::Version),
         "search" => parse_search(args),
+        "recall" => {
+            let (mut words, mut db, mut json, mut options_done) = (Vec::new(), None, false, false);
+            while let Some(a) = args.next().transpose()? {
+                match a.as_str() {
+                    _ if options_done => words.push(a),
+                    "--" => options_done = true,
+                    "-h" | "--help" => return Ok(Command::Help),
+                    "--db" => db = Some(value(&mut args, "--db")?.into()),
+                    "--json" => json = true,
+                    f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
+                    _ => words.push(a),
+                }
+            }
+            if words.is_empty() {
+                return Err("recall needs a question".into());
+            }
+            Ok(Command::Recall { question: words.join(" "), db, json })
+        }
         "ui" => {
             let mut db = None;
             while let Some(a) = args.next().transpose()? {
@@ -291,6 +319,7 @@ mod tests {
             &["forget", "7", "-h"],
             &["search", "--help"],
             &["search", "git", "-h", "--db", "x.db"],
+            &["recall", "why", "--help"],
         ] {
             assert_eq!(p(args), Ok(Command::Help), "{args:?}");
         }
@@ -341,6 +370,11 @@ mod tests {
         assert_eq!(p(&["model", "check", "--help"]).unwrap(), Command::Help);
         assert!(p(&["model"]).is_err() && p(&["model", "chek"]).is_err() && p(&["model", "check", "x"]).is_err());
         assert!(p(&["forget", "all"]).is_err());
+        assert_eq!(
+            p(&["recall", "how", "--json", "did", "--", "--db", "x"]).unwrap(),
+            Command::Recall { question: "how did --db x".into(), db: None, json: true }
+        );
+        assert!(p(&["recall"]).is_err() && p(&["recall", "--json"]).is_err() && p(&["recall", "x", "--fzf"]).is_err());
     }
 
     #[test]

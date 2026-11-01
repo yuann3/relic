@@ -146,6 +146,11 @@ pub struct ChatCompletionsClient {
 }
 
 impl ChatCompletionsClient {
+    /// Configured by the `RELIC_MODEL_*` variables ([`ChatConfig::from_env`]).
+    pub fn from_env() -> Result<Self, String> {
+        Self::new(ChatConfig::from_env(|k| std::env::var(k).ok())?)
+    }
+
     pub fn new(config: ChatConfig) -> Result<Self, String> {
         let (origin, loopback_http) = origin(&config.base_url)?;
         let endpoint = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));

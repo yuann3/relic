@@ -7,11 +7,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::model::{
-    Focus, Modal, RECALL_CHILD_MAX, RECALL_ROOT_MAX, RECALL_SPEND_CAP, RECALL_WALL_MAX,
-    RecallStatus, StepState, UiModel,
-};
-use crate::app::{MIN_PREFIX_CHARS, When, display_line, source_label};
+use super::model::{Focus, Modal, RecallState, RecallStatus, StepState, UiModel};
+use crate::app::{MIN_PREFIX_CHARS, RecallOutcome, When, display_line, source_label};
+use crate::rlm::protocol::BudgetV1;
 use crate::domain::Provenance;
 
 /// Below this the panes cannot show a usable row, so say so instead.
@@ -163,7 +161,7 @@ fn workspace(frame: &mut Frame, m: &UiModel) {
 
     match m.modal {
         Some(Modal::Help) => help(frame, &t, area),
-        Some(Modal::ConfirmRecall) => confirm_recall(frame, &t, area),
+        Some(Modal::ConfirmRecall) => confirm_recall(frame, m, &t, area),
         None => {}
     }
 }
@@ -397,31 +395,44 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     frame.render_widget(p, area);
 }
 
+/// What a recall is doing or how it ended, as a word and its style.
+fn recall_word(r: &RecallState, t: &Theme) -> (&'static str, Style) {
+    match (&r.status, r.report.as_ref().map(|r| r.outcome)) {
+        (RecallStatus::Idle, _) => ("idle", t.dim),
+        (RecallStatus::Running, _) => ("running", t.busy),
+        (RecallStatus::Cancelled, _) | (_, Some(RecallOutcome::Cancelled)) => ("cancelled", t.bad),
+        (_, Some(RecallOutcome::Answered)) => ("answered", t.ok),
+        (_, Some(RecallOutcome::Partial)) => ("partly answered", t.ok),
+        (_, Some(RecallOutcome::Abstained)) => ("no answer", t.busy),
+        (_, Some(RecallOutcome::BudgetExhausted)) => ("out of budget", t.bad),
+        (_, Some(RecallOutcome::Failed)) => ("failed", t.bad),
+        (RecallStatus::Finished, None) => ("finished", t.ok),
+    }
+}
+
+/// The spend a recall may reach, as the confirmation promises it.
+fn recall_cap(b: &BudgetV1) -> String {
+    let cost = b.max_cost_microusd.map_or("no cost cap".into(), |c| format!("${:.2}", c as f64 / 1e6));
+    format!("{cost} · {}s", b.wall_ms / 1000)
+}
+
 fn recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let r = &m.recall;
-    let (word, style) = match &r.status {
-        RecallStatus::Idle => ("idle", t.dim),
-        RecallStatus::Running => ("running", t.busy),
-        RecallStatus::Cancelled => ("cancelled", t.bad),
-        RecallStatus::Finished => ("finished", t.ok),
-    };
+    let (word, style) = recall_word(r, t);
+    let budget = BudgetV1::prototype_default();
     let block = pane(t, "Recall".into(), m.focus == Focus::Recall);
-    let mut lines = vec![Line::from(vec![
-        Span::raw("status: "),
-        Span::styled(word, style),
-        Span::styled(" (fake, no model)", t.dim),
-    ])];
+    let mut lines = vec![Line::from(vec![Span::raw("status: "), Span::styled(word, style)])];
     if r.status == RecallStatus::Idle {
         lines.push(Line::styled("r asks before starting a recall", t.dim));
     } else {
         lines.push(Line::raw(format!(
-            "budget: wall {:.1}s/{}s · cap {RECALL_SPEND_CAP}",
+            "budget: wall {:.1}s of {}",
             r.elapsed().as_secs_f32(),
-            RECALL_WALL_MAX.as_secs(),
+            recall_cap(&budget),
         )));
         lines.push(Line::raw(format!(
-            "calls: root {}/{RECALL_ROOT_MAX} · child {}/{RECALL_CHILD_MAX}",
-            r.root_calls, r.child_calls,
+            "calls: root {}/{} · child {}/{}",
+            r.root_calls, budget.root_calls, r.child_calls, budget.child_calls,
         )));
         // A long recall keeps its newest steps on screen.
         let hidden = r.steps.len().saturating_sub(MAX_STEPS_SHOWN);
@@ -444,14 +455,8 @@ fn recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             }
             lines.push(Line::from(spans));
         }
-        if let Some(f) = &r.finding {
-            let cites: Vec<String> = f.cites.iter().map(|c| format!("#{c}")).collect();
-            lines.push(Line::styled(
-                format!("finding (cites {}):", cites.join(", ")),
-                t.title,
-            ));
-            lines.push(Line::from(safe_spans(&display_line(&f.claim), t)));
-            lines.push(Line::styled("Enter here opens the cited evidence", t.dim));
+        if let Some(report) = &r.report {
+            report_lines(&mut lines, report, t);
         }
     }
     let inner = block.inner(area);
@@ -461,6 +466,47 @@ fn recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     r.scroll_max.set(max);
     let p = p.block(block).scroll((r.scroll.unwrap_or(max).min(max), 0));
     frame.render_widget(p, area);
+}
+
+/// A finished recall: its answer, then each claim and step with its cites.
+fn report_lines(lines: &mut Vec<Line<'static>>, r: &crate::app::RecallReport, t: &Theme) {
+    let cites = |ids: &[i64]| ids.iter().map(|c| format!("#{c}")).collect::<Vec<_>>().join(", ");
+    if let Some(e) = &r.error {
+        lines.push(Line::styled(format!("error: {}", display_line(e)), t.bad));
+    }
+    if !r.answer.is_empty() {
+        lines.push(Line::styled("answer:", t.title));
+        lines.push(Line::from(safe_spans(&display_line(&r.answer), t)));
+    }
+    for c in &r.claims {
+        let mut spans = vec![Span::raw("- ")];
+        spans.extend(safe_spans(&display_line(&c.text), t));
+        spans.push(Span::styled(format!(" [{}]", cites(&c.supports)), t.dim));
+        if !c.contradicts.is_empty() {
+            spans.push(Span::styled(format!(" against [{}]", cites(&c.contradicts)), t.bad));
+        }
+        lines.push(Line::from(spans));
+    }
+    if !r.procedure.is_empty() {
+        lines.push(Line::styled("procedure:", t.title));
+    }
+    for (i, s) in r.procedure.iter().enumerate() {
+        let mut spans = vec![Span::raw(format!("{}. ", i + 1))];
+        spans.extend(safe_spans(&display_line(&s.text), t));
+        spans.push(Span::styled(format!(" [{}]", cites(&s.supports)), t.dim));
+        lines.push(Line::from(spans));
+    }
+    for (label, items) in [("contradictions:", &r.contradictions), ("missing:", &r.missing)] {
+        if !items.is_empty() {
+            lines.push(Line::styled(label, t.title));
+        }
+        for m in items {
+            lines.push(Line::from([vec![Span::raw("- ")], safe_spans(&display_line(m), t)].concat()));
+        }
+    }
+    if !r.evidence.is_empty() {
+        lines.push(Line::styled("Enter here opens the first cited record", t.dim));
+    }
 }
 
 fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
@@ -480,11 +526,10 @@ fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         )),
         _ => Span::styled("search: idle", t.dim),
     };
+    let (word, style) = recall_word(&m.recall, t);
     let recall = match m.recall.status {
-        RecallStatus::Running => Span::styled("recall: running", t.busy),
-        RecallStatus::Idle => Span::styled("recall: idle", t.dim),
-        RecallStatus::Cancelled => Span::raw("recall: cancelled"),
-        RecallStatus::Finished => Span::raw("recall: finished"),
+        RecallStatus::Running | RecallStatus::Idle => Span::styled(format!("recall: {word}"), style),
+        RecallStatus::Cancelled | RecallStatus::Finished => Span::raw(format!("recall: {word}")),
     };
     let mut first = vec![search, Span::raw(" · "), recall];
     if let Some(n) = &m.notice {
@@ -534,18 +579,22 @@ fn help(frame: &mut Frame, t: &Theme, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), box_);
 }
 
-fn confirm_recall(frame: &mut Frame, t: &Theme, area: Rect) {
+fn confirm_recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
+    let b = BudgetV1::prototype_default();
+    let to = m.recall_model.as_deref().unwrap_or("the model");
     let lines = vec![
         Line::raw(format!(
-            "Recall uses a model and may spend up to {RECALL_SPEND_CAP} / {RECALL_ROOT_MAX} root + {RECALL_CHILD_MAX} child calls. Start? y/n"
+            "Recall asks a model: up to {} root + {} child calls, {}.",
+            b.root_calls,
+            b.child_calls,
+            recall_cap(&b)
         )),
+        Line::styled("It sends the query and the commands it finds, redacted, to", t.dim),
+        Line::styled(display_line(to), t.dim),
         Line::raw(""),
-        Line::styled(
-            "Prototype: this recall is scripted. No model is called and nothing leaves this machine.",
-            t.dim,
-        ),
+        Line::raw("Start? y/n"),
     ];
-    let box_ = centered(area, 64, 7);
+    let box_ = centered(area, 72, 7);
     frame.render_widget(Clear, box_);
     let block = Block::bordered()
         .border_type(BorderType::Double)
@@ -1094,13 +1143,11 @@ mod tests {
     fn confirmation_and_help_overlays() {
         let store = store_with(NGINX);
         let mut m = typed(&store, "certb", false);
+        m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
         drive(&mut m, &store, UiAction::Key(Key::Ctrl('r')));
         let s = text(&render(&m, 120, 40));
-        assert!(
-            s.contains("Recall uses a model and may spend up to $1 / 8 root + 16"),
-            "{s}"
-        );
-        assert!(s.contains("Start? y/n"), "{s}");
+        assert!(s.contains("Recall asks a model: up to 8 root + 16 child calls, $1.00 · 180s."), "{s}");
+        assert!(s.contains("Start? y/n") && s.contains("http://127.0.0.1:8000 (vllm)"), "{s}");
 
         drive(&mut m, &store, UiAction::Key(Key::Esc));
         drive(&mut m, &store, UiAction::Key(Key::Tab));
@@ -1116,6 +1163,7 @@ mod tests {
     fn recall_progress_and_finding_render_as_words() {
         let store = store_with(NGINX);
         let mut m = typed(&store, "certb", true);
+        m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
         let cite = m.search.selected_hit().unwrap().id;
         drive(&mut m, &store, UiAction::Key(Key::Ctrl('r')));
         drive(&mut m, &store, UiAction::Key(Key::Char('y')));
@@ -1138,7 +1186,7 @@ mod tests {
         let s = text(&render(&m, 120, 40));
         for want in [
             "status: running",
-            "wall 2.3s/60s",
+            "wall 2.3s of $1.00 · 180s",
             "root 2/8",
             "child 3/16",
             "done plan → 2 searches",
@@ -1149,18 +1197,18 @@ mod tests {
         }
 
         // Longer than the pane is wide: the claim must wrap, not be cut.
-        let claim =
-            "you renewed the certificate with certbot after the reload; claim-end".to_string();
-        let event = RecallEvent::Finished {
-            claim,
-            cites: vec![cite],
-        };
-        drive(&mut m, &store, UiAction::Recall { op, event });
+        let mut report = crate::ui::model::answered(&[cite]);
+        report.claims[0].text = "you renewed the certificate with certbot after the reload; claim-end".into();
+        report.procedure = vec![crate::app::CitedText { text: "certbot renew".into(), supports: vec![cite], contradicts: vec![] }];
+        report.missing = vec!["when it expires".into()];
+        drive(&mut m, &store, UiAction::Recall { op, event: RecallEvent::Finished(report) });
         let s = text(&render(&m, 120, 40));
         for want in [
-            &format!("finding (cites #{cite})"),
-            "status: finished",
-            "claim-end",
+            "with certbot",
+            &format!("claim-end [#{cite}]"),
+            &format!("1. certbot renew [#{cite}]"),
+            "- when it expires",
+            "recall: answered",
         ] {
             assert!(s.contains(want), "missing {want:?} in\n{s}");
         }
@@ -1168,18 +1216,19 @@ mod tests {
         // At 120x26 the pane is shorter than its text: it follows the end,
         // so the finding is in view, and k scrolls back to the start.
         let s = text(&render(&m, 120, 26));
-        assert!(s.contains("claim-end") && !s.contains("status: finished"), "{s}");
+        assert!(s.contains("claim-end") && !s.contains("status: answered"), "{s}");
         for _ in 0..20 {
             drive(&mut m, &store, UiAction::Key(Key::Char('k')));
         }
         let s = text(&render(&m, 120, 26));
-        assert!(s.contains("status: finished") && !s.contains("claim-end"), "{s}");
+        assert!(s.contains("status: answered") && !s.contains("claim-end"), "{s}");
     }
 
     #[test]
     fn a_long_recall_keeps_its_newest_steps_on_screen() {
         let store = store_with(NGINX);
         let mut m = typed(&store, "certb", false);
+        m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
         drive(&mut m, &store, UiAction::Key(Key::Ctrl('r')));
         drive(&mut m, &store, UiAction::Key(Key::Char('y')));
         let op = m.recall.active.unwrap();

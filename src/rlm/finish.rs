@@ -93,7 +93,6 @@ mod tests {
     use crate::domain::{ObservationKind, StoredObservation};
     use crate::rlm::evidence::HandleRegistry;
 
-    const KEY: &[u8] = b"test-key";
 
     fn make_obs(id: i64, text: &str) -> StoredObservation {
         StoredObservation {
@@ -109,7 +108,7 @@ mod tests {
     }
 
     fn registry_with_evidence() -> (HandleRegistry, Vec<String>) {
-        let mut reg = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let mut reg = HandleRegistry::new(64);
         let obs = vec![
             make_obs(1, "certbot renew --nginx"),
             make_obs(2, "certbot status"),
@@ -240,7 +239,7 @@ mod tests {
         let (_, ev_ids) = registry_with_evidence();
 
         // New registry for investigation 2 — different evidence IDs.
-        let reg2 = HandleRegistry::new(2, KEY.to_vec(), 64);
+        let reg2 = HandleRegistry::new(64);
 
         let finish = FinishV1 {
             status: AnswerStatus::Answered,
@@ -289,7 +288,7 @@ mod tests {
 
     #[test]
     fn abstained_finish_with_missing_passes_validation() {
-        let reg = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let reg = HandleRegistry::new(64);
         let finish = FinishV1 {
             status: AnswerStatus::Abstained,
             answer: String::new(),

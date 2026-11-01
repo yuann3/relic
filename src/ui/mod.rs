@@ -6,15 +6,15 @@
 //! thread reads the terminal; one search worker owns its own `Store`; a
 //! recall runs on its own worker. Everything talks over bounded channels.
 
-mod fake_recall;
 mod model;
+mod recall;
 mod term;
 mod view;
 
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -26,6 +26,8 @@ use ratatui::backend::{Backend, CrosstermBackend};
 
 use crate::app::{self, Budget, MatchMode, Order, SearchRequest};
 use crate::picker::{self, Pick, PickError, PickMode};
+use crate::rlm::model::ModelBoundary;
+use crate::rlm::model::chat::ChatCompletionsClient;
 use crate::store::Store;
 use model::{PAGE_LIMIT, PickOutcome, UiAction, UiEffect, UiModel, update};
 use term::{InputReader, TerminalGuard};
@@ -61,6 +63,8 @@ pub fn run(db: &Path) -> Result<()> {
     // stderr and not a pane that fails on every keystroke.
     let store = Store::open_read_only(db)?;
     let worker_store = Store::open_read_only(db)?;
+    // Read once: a recall's confirmation names where its requests will go.
+    let model = ChatCompletionsClient::from_env().map(|c| Arc::new(c) as Arc<dyn ModelBoundary>);
     let mono = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     let ascii = !utf8_locale(|k| std::env::var_os(k));
     let (tx, rx) = mpsc::sync_channel(ACTION_QUEUE);
@@ -85,15 +89,21 @@ pub fn run(db: &Path) -> Result<()> {
             tx,
             input,
             terminal,
+            db: db.to_path_buf(),
+            model: model.as_ref().ok().cloned(),
             recall: None,
             trace: Trace::from_env(),
             issued: None,
             awaiting_frame: None,
             started,
         };
-        let mut model = UiModel::new(mono);
-        model.ascii = ascii;
-        let r = rt.event_loop(&mut guard, &rx, model);
+        let mut m = UiModel::new(mono);
+        m.ascii = ascii;
+        m.recall_model = model.map(|model| {
+            let to = model.target();
+            format!("{} ({})", to.origin, to.profile)
+        });
+        let r = rt.event_loop(&mut guard, &rx, m);
         if let Some((_, cancel)) = rt.recall.take() {
             cancel.store(true, Ordering::SeqCst);
         }
@@ -142,6 +152,9 @@ struct Runtime<B: Backend> {
     tx: SyncSender<UiAction>,
     input: InputReader,
     terminal: Terminal<B>,
+    /// A recall opens its own connection to it.
+    db: PathBuf,
+    model: Option<Arc<dyn ModelBoundary>>,
     recall: Option<(u64, Arc<AtomicBool>)>,
     trace: Trace,
     /// Newest search sent to the worker and when, for key-to-frame timing.
@@ -295,12 +308,15 @@ where
                 self.input.resume();
                 vec![UiAction::PickerReturned(pick_outcome(picked))]
             }
-            UiEffect::StartRecall { op, query, cite } => {
+            UiEffect::StartRecall { op, question } => {
                 if let Some((_, old)) = self.recall.take() {
                     old.store(true, Ordering::SeqCst);
                 }
+                // `update` asks only when a model is configured.
+                let Some(model) = self.model.clone() else { return Ok(vec![]) };
+                let store = Store::open_read_only(&self.db)?;
                 let cancel = Arc::new(AtomicBool::new(false));
-                fake_recall::spawn(op, query, cite, Arc::clone(&cancel), self.tx.clone())?;
+                recall::spawn(op, question, store, model, Arc::clone(&cancel), self.tx.clone())?;
                 self.recall = Some((op, cancel));
                 vec![]
             }
@@ -650,6 +666,8 @@ mod tests {
                 Ok(None)
             }),
             terminal: Terminal::new(TestBackend::new(100, 30)).unwrap(),
+            db: PathBuf::new(),
+            model: None,
             recall: None,
             trace: Trace(None),
             issued: None,
