@@ -59,6 +59,7 @@ One canonical term per concept. Use the term, not the words in the Avoid column.
 | Recently imported | Rowid order, the default order on every search surface. Label it as import order. | newest (unlabelled), chronological |
 | Observed at | When the command ran, according to the source: either an exact time or an inferred bound (`When`). | timestamp (unqualified), date |
 | Investigation | One bounded RLM recall run. Evidence handles are scoped to it. | session, query |
+| Recall log | `<db>.recall.log`, an owner-only JSONL file beside the store: each recall's start, every request sent (the payload audit without its preview), replies, retries and its finish, durably synced. Metadata and record ids only, so `forget` leaves no evidence text behind in it ([S12](https://github.com/yuann3/relic/issues/37)). | audit trail, trace |
 | Plan admission | `src/rlm/validate.rs`: the check that a `PlanV1` is well-formed and within its fences before anything executes. Relate and Combine are rejected here. | plan validation, validate |
 | Finish gate | `src/rlm/finish.rs`: every final claim and procedure step must cite evidence that resolves. | finish validation, verify |
 | Handle integrity check | `verify_handle`: the check that an evidence handle is genuine, current and belongs to this investigation. | verify, verification, validation |

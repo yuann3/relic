@@ -33,6 +33,7 @@ Status: Accepted · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture]
 
 - Every model adapter, including a conditional Jev child adapter ([0010](0010-model-boundary.md)), takes `EgressRequest`. A new adapter cannot bypass redaction, caps, ledger reservation or audit.
 - The 24 KiB child cap matches the host's Assess batch sizing (≤4 items, shrunk to stay ≤24 KiB; [0009](0009-rlm-kernel.md)). The ledger reservations are the ones [0009](0009-rlm-kernel.md) and [0010](0010-model-boundary.md) require for every outbound call.
+- The audit persists in the recall log beside the store ([[S12] Persist recall audits and outcomes in a JSONL log beside the store](https://github.com/yuann3/relic/issues/37)) without its preview or evidence ids: the preview is evidence text, which `forget` could not reach there, and evidence ids mean nothing outside their investigation.
 - S2 (recall core) builds the seam with the Chat Completions adapter and ends with the canary gate, whose state-dir grep also covers the fields S1a and S1b store. From then on, any slice that adds an egress path or stored field must pass it before it closes.
 - The gate runs real data through both sides of the seam (CODING_STANDARD "test the seam").
 
