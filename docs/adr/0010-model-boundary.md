@@ -19,7 +19,7 @@ Status: Accepted · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture]
 
 ## Decision
 
-- **One adapter.** One `ChatCompletionsClient` serves root and child calls. It ships with built-in profiles `openai`, `vllm`, `llama_cpp`, `custom` (configuration presets, not separate clients), `relic model check`, and mock-server tests. It lands after executor hardening ([0009](0009-rlm-kernel.md)), which needs no network. Adapters accept only an `EgressRequest` ([0004](0004-egress-seam-and-privacy-canary.md)).
+- **One adapter.** One `ChatCompletionsClient` serves root and child calls. It ships with built-in profiles `openai`, `llama_cpp`, `custom` (configuration presets, not separate clients; `vllm` was removed after S7: a vLLM server is reached through `custom` with `json_schema` and `max_tokens`), `relic model check`, and mock-server tests. It lands after executor hardening ([0009](0009-rlm-kernel.md)), which needs no network. Adapters accept only an `EgressRequest` ([0004](0004-egress-seam-and-privacy-canary.md)).
 - **Fences.** Every outbound model call, whatever the provider, reserves:
   - one logical call (root or child);
   - `provider_attempts`;
@@ -73,10 +73,10 @@ Status: Accepted · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture]
 
   Only the first two cases retry. No logical call commits twice (`rlm-model-boundary.md:543`).
 - The Ctrl-C gate is a hanging-server process test. Its four-child case needs a concurrent child pool, which does not exist yet. If the gate fails, the reqwest/Tokio switch overrides [0001](0001-one-synchronous-process.md) and [0015](0015-dependency-envelope.md) for that dependency.
-- `relic model check` must pass against one real remote and one real local (vLLM or llama.cpp) endpoint as release evidence, with exact versions recorded.
+- `relic model check` must pass against one real remote and one real local llama.cpp endpoint as release evidence, with exact versions recorded.
 - S2 measures and reports, per [0014](0014-performance-contract.md): the stripped ureq/rustls delta and RSS with the four-child pool. RSS is reported, not gated.
 - The Jev slice (S2b) is subject to the same fences, retry rule and egress seam. S0 creates the Jev evidence ticket; S2b runs only if it passes. [[T1] Implement JevModelBoundary adapter](https://github.com/yuann3/relic/issues/19) stays blocked on the recall core and that ticket.
-- Users without API billing get recall through the `vllm` / `llama_cpp` profiles once the adapter ships.
+- Users without API billing get recall through the `llama_cpp` profile, or `custom` for another local server such as vLLM.
 
 ## Rejected alternatives
 

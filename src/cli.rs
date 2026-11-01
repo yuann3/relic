@@ -54,7 +54,7 @@ MODEL:
     relic.recall-log/v1 JSON line each, metadata and record ids only.
     model check sends a synthetic request, never your history, and prints
     a relic.model-check/v1 receipt. Configure the model with:
-    RELIC_MODEL_PROFILE   openai (default), vllm, llama_cpp or custom
+    RELIC_MODEL_PROFILE   openai (default), llama_cpp or custom
     RELIC_MODEL_URL       Base URL up to the API version. Default for openai:
                           https://api.openai.com/v1. Plain http only to a
                           loopback address such as 127.0.0.1

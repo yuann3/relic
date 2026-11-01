@@ -1169,7 +1169,7 @@ mod tests {
     fn recall_progress_and_finding_render_as_words() {
         let store = store_with(NGINX);
         let mut m = typed(&store, "certb", true);
-        m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
+        m.recall_model = Ok("http://127.0.0.1:8080 (llama_cpp)".into());
         m.recall_priced = true;
         let cite = m.search.selected_hit().unwrap().id;
         drive(&mut m, &store, UiAction::Key(Key::Ctrl('r')));
@@ -1235,7 +1235,7 @@ mod tests {
     fn a_long_recall_keeps_its_newest_steps_on_screen() {
         let store = store_with(NGINX);
         let mut m = typed(&store, "certb", false);
-        m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
+        m.recall_model = Ok("http://127.0.0.1:8080 (llama_cpp)".into());
         drive(&mut m, &store, UiAction::Key(Key::Ctrl('r')));
         drive(&mut m, &store, UiAction::Key(Key::Char('y')));
         let op = m.recall.active.unwrap();

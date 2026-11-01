@@ -31,7 +31,10 @@ fn read_request(stream: &TcpStream) -> bool {
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
-    String::from_utf8_lossy(&body).contains("relic_child_result")
+    // Only a child call's user message holds a packet.
+    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let user: serde_json::Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    user.get("packet").is_some()
 }
 
 fn completion(content: &serde_json::Value) -> String {
@@ -91,7 +94,7 @@ fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> 
     let mut child = Command::new(env!("CARGO_BIN_EXE_relic"))
         .args(["recall", "which command renewed the certificate?", "--db"])
         .arg(&db)
-        .env("RELIC_MODEL_PROFILE", "vllm")
+        .env("RELIC_MODEL_PROFILE", "llama_cpp")
         .env("RELIC_MODEL_URL", url)
         .env("RELIC_MODEL_NAME", "gate")
         .env_remove("RELIC_MODEL_API_KEY")

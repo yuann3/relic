@@ -885,7 +885,7 @@ mod tests {
     /// A model with "git" typed and its page of ids 10, 11, 12 accepted.
     fn with_results() -> UiModel {
         let mut m = UiModel::new(false);
-        m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
+        m.recall_model = Ok("http://127.0.0.1:8080 (llama_cpp)".into());
         keys(&mut m, "git");
         let g = m.search.generation;
         update(&mut m, done(g, page("git", &[10, 11, 12])));
@@ -1500,7 +1500,7 @@ mod tests {
         let mut starts = 0;
         for run in 0..300 {
             let mut m = UiModel::new(false);
-            m.recall_model = Ok("http://127.0.0.1:8000 (vllm)".into());
+            m.recall_model = Ok("http://127.0.0.1:8080 (llama_cpp)".into());
             let mut ops = Vec::new();
             for step in 0..60u64 {
                 let action = match rng.next() % 10 {

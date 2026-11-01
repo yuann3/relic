@@ -24,7 +24,6 @@ const MODEL_NAME_MAX: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
     OpenAi,
-    Vllm,
     LlamaCpp,
     Custom,
 }
@@ -33,7 +32,6 @@ impl Profile {
     fn name(self) -> &'static str {
         match self {
             Profile::OpenAi => "openai",
-            Profile::Vllm => "vllm",
             Profile::LlamaCpp => "llama_cpp",
             Profile::Custom => "custom",
         }
@@ -81,17 +79,16 @@ pub struct ChatConfig {
 
 impl ChatConfig {
     /// From `RELIC_MODEL_*` variables, read through `get`:
-    /// `PROFILE` (openai, vllm, llama_cpp, custom; default openai), `URL`,
+    /// `PROFILE` (openai, llama_cpp, custom; default openai), `URL`,
     /// `NAME`, `API_KEY`, `OUTPUT` and `TOKEN_FIELD` (custom only), and
     /// `PRICE_IN` / `PRICE_OUT` in US dollars per million tokens.
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let var = |k: &str| get(&format!("RELIC_MODEL_{k}")).filter(|v| !v.is_empty());
         let profile = match var("PROFILE").as_deref() {
             None | Some("openai") => Profile::OpenAi,
-            Some("vllm") => Profile::Vllm,
             Some("llama_cpp") => Profile::LlamaCpp,
             Some("custom") => Profile::Custom,
-            Some(p) => return Err(format!("RELIC_MODEL_PROFILE {p:?} is not openai, vllm, llama_cpp or custom")),
+            Some(p) => return Err(format!("RELIC_MODEL_PROFILE {p:?} is not openai, llama_cpp or custom")),
         };
         let base_url = match (var("URL"), profile) {
             (Some(url), _) => url,
@@ -104,7 +101,6 @@ impl ChatConfig {
         }
         let (output, token_field) = match profile {
             Profile::OpenAi => (OutputMode::JsonSchema, TokenField::MaxCompletionTokens),
-            Profile::Vllm => (OutputMode::JsonSchema, TokenField::MaxTokens),
             Profile::LlamaCpp => (OutputMode::FlatJsonSchema, TokenField::MaxTokens),
             Profile::Custom => {
                 let output = match var("OUTPUT").as_deref() {
@@ -518,7 +514,7 @@ mod tests {
 
     fn call_with(act: Act, wait: Duration) -> Result<Reply, ModelError> {
         let (url, _rx) = serve(vec![act]);
-        let client = ChatCompletionsClient::new(config(Profile::Vllm, url)).unwrap();
+        let client = ChatCompletionsClient::new(config(Profile::LlamaCpp, url)).unwrap();
         client.call(&request(&client), Instant::now() + wait)
     }
 
@@ -531,7 +527,7 @@ mod tests {
         let long = Duration::from_secs(5);
         // Nothing listens: refused before a byte was sent.
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let client = ChatCompletionsClient::new(config(Profile::Vllm, format!("http://127.0.0.1:{port}/v1"))).unwrap();
+        let client = ChatCompletionsClient::new(config(Profile::LlamaCpp, format!("http://127.0.0.1:{port}/v1"))).unwrap();
         assert!(matches!(client.call(&request(&client), Instant::now() + long), Err(ModelError::BeforeSend(_))));
 
         let rate = call_with(answer(429, "retry-after: 2\r\n", "{}".into()), long);
@@ -677,7 +673,8 @@ mod tests {
         let c = env(&[("PROFILE", "llama_cpp"), ("URL", "http://127.0.0.1:8080/v1"), ("NAME", "q")]).unwrap();
         assert_eq!((c.output, c.api_key.is_none()), (OutputMode::FlatJsonSchema, true));
         assert!(env(&[("NAME", "gpt-x")]).unwrap_err().contains("API_KEY"));
-        assert!(env(&[("PROFILE", "vllm"), ("NAME", "q")]).unwrap_err().contains("URL"));
+        assert!(env(&[("PROFILE", "llama_cpp"), ("NAME", "q")]).unwrap_err().contains("URL"));
+        assert!(env(&[("PROFILE", "vllm"), ("URL", "http://127.0.0.1/v1"), ("NAME", "q")]).unwrap_err().contains("not openai, llama_cpp or custom"));
         assert!(env(&[("PROFILE", "custom"), ("URL", "http://127.0.0.1/v1"), ("NAME", "q")]).unwrap_err().contains("OUTPUT"));
         assert!(env(&[("NAME", "q"), ("API_KEY", "k"), ("PRICE_IN", "1")]).unwrap_err().contains("neither"));
     }

@@ -50,8 +50,7 @@ fn answer(mut stream: TcpStream, seen: &Bodies, script: &Script) {
     reader.read_exact(&mut body).unwrap();
     let body = String::from_utf8(body).unwrap();
     seen.lock().unwrap().push(body.clone());
-    let request: Value = serde_json::from_str(&body).unwrap();
-    let user: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let user = user_message(&body);
     let (status, body) = match script(&user) {
         Some(content) => {
             let reply = json!({"model": "scripted", "choices": [{"message": {"content": content.to_string()}, "finish_reason": "stop"}]});
@@ -61,6 +60,12 @@ fn answer(mut stream: TcpStream, seen: &Bodies, script: &Script) {
     };
     let head = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
     let _ = stream.write_all(format!("{head}{body}").as_bytes());
+}
+
+/// The user message of a request body: the root state or the child packet.
+fn user_message(body: &str) -> Value {
+    let request: Value = serde_json::from_str(body).unwrap();
+    serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap()
 }
 
 fn is_child(user: &Value) -> bool {
@@ -117,7 +122,7 @@ fn relic(args: &[&str], db: &Path, url: &str) -> Output {
         .arg("--db")
         .arg(db)
         .env_remove("RELIC_MODEL_API_KEY")
-        .env("RELIC_MODEL_PROFILE", "vllm")
+        .env("RELIC_MODEL_PROFILE", "llama_cpp")
         .env("RELIC_MODEL_URL", url)
         .env("RELIC_MODEL_NAME", "scripted")
         .output()
@@ -181,7 +186,7 @@ fn an_answer_cites_the_records_it_rests_on_by_id() {
     // The payload audit: each request's size and destination, on stderr.
     let origin = url.trim_end_matches("/v1");
     assert_eq!(stderr.matches("send a root request of ").count(), 2, "{stderr}");
-    assert!(stderr.contains(&format!("to {origin} (vllm)")), "{stderr}");
+    assert!(stderr.contains(&format!("to {origin} (llama_cpp)")), "{stderr}");
 
     // The log: what was sent and how it ended, under one recall id, and no
     // evidence text, which would outlive `forget`.
@@ -191,7 +196,7 @@ fn an_answer_cites_the_records_it_rests_on_by_id() {
     let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
     assert_eq!(events, ["start", "send", "reply", "send", "reply", "finish"], "{log}");
     assert!(lines.iter().all(|l| l["schema"] == "relic.recall-log/v1" && l["recall"] == lines[0]["recall"]), "{log}");
-    assert_eq!((&lines[0]["origin"], &lines[0]["profile"]), (&json!(origin), &json!("vllm")));
+    assert_eq!((&lines[0]["origin"], &lines[0]["profile"]), (&json!(origin), &json!("llama_cpp")));
     assert_eq!((&lines[1]["role"], &lines[2]["model"]), (&json!("root"), &json!("scripted")));
     let finish = &lines[5];
     assert_eq!((&finish["outcome"], &finish["cited"], &finish["cost_microusd"]), (&json!("answered"), &json!([renew, certs]), &json!(0)));
@@ -254,7 +259,7 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let remote = |extra: &[&str]| {
         let out = Command::new(env!("CARGO_BIN_EXE_relic"))
             .args([&["recall", "renew", "--json", "--db", db.to_str().unwrap()][..], extra].concat())
-            .env("RELIC_MODEL_PROFILE", "vllm")
+            .env("RELIC_MODEL_PROFILE", "llama_cpp")
             .env("RELIC_MODEL_URL", "https://127.0.0.1:9/v1")
             .env("RELIC_MODEL_NAME", "remote")
             .env_remove("RELIC_MODEL_PRICE_IN")
@@ -275,7 +280,7 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let out = Command::new(env!("CARGO_BIN_EXE_relic"))
         .args(["recall", "renew", "--db"])
         .arg(&db)
-        .env("RELIC_MODEL_PROFILE", "vllm")
+        .env("RELIC_MODEL_PROFILE", "llama_cpp")
         .env("RELIC_MODEL_URL", "http://127.0.0.1:9/v1")
         .env_remove("RELIC_MODEL_NAME")
         .output()
@@ -358,7 +363,7 @@ fn privacy_canary_gate() {
     // Not vacuous: every record went out, redacted, to the root and to
     // children, and the answer came back with its markers.
     let bodies = bodies.lock().unwrap().clone();
-    let children = bodies.iter().filter(|b| b.contains("relic_child_result")).count();
+    let children = bodies.iter().filter(|b| is_child(&user_message(b))).count();
     assert!(bodies.len() >= 3 && children >= 1, "{} requests, {children} child", bodies.len());
     let sent = bodies.concat();
     for marker in ["[REDACTED:password]", "[REDACTED:token]", "[REDACTED:key]"] {
