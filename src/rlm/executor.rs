@@ -372,7 +372,6 @@ mod tests {
     use crate::store::{Cursor, Store};
     use std::collections::HashMap;
 
-    const KEY: &[u8] = b"test-key";
 
     fn seed_store(store: &mut Store) -> i64 {
         let rev = store.lock_source(b"/h").unwrap().new_revision(SourceKind::Zsh).unwrap();
@@ -408,7 +407,7 @@ mod tests {
             "docker compose up",
         ]);
 
-        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let mut registry = HandleRegistry::new(64);
         let search = SearchV1 {
             op_id: "s1".to_string(),
             terms: vec!["cargo".to_string()],
@@ -430,7 +429,7 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
         insert_commands(&mut store, rev_id, &["cargo build", "git push", "cargo git-hook", "docker ps", "git or cargo"]);
-        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let mut registry = HandleRegistry::new(64);
         let mut run = |match_mode, limit| {
             let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into(), "git".into()], match_mode, limit };
             let hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
@@ -450,7 +449,7 @@ mod tests {
         let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
         insert_commands(&mut store, rev_id, &cmd_refs);
 
-        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let mut registry = HandleRegistry::new(64);
         let search = SearchV1 {
             op_id: "s1".to_string(),
             terms: vec!["cargo".to_string()],
@@ -473,7 +472,7 @@ mod tests {
         let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
         insert_commands(&mut store, rev_id, &cmd_refs);
 
-        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let mut registry = HandleRegistry::new(64);
 
         // Search for certbot first.
         let search = SearchV1 {
@@ -518,7 +517,7 @@ mod tests {
         let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
         insert_commands(&mut store, rev_id, &cmd_refs);
 
-        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let mut registry = HandleRegistry::new(64);
         let search = SearchV1 {
             op_id: "s1".to_string(),
             terms: vec!["certbot".to_string()],
@@ -554,7 +553,7 @@ mod tests {
         let rev_id = seed_store(&mut store);
         let cmds: Vec<String> = (0..2_000).map(|i| format!("cargo cmd_{i}")).collect();
         insert_commands(&mut store, rev_id, &cmds.iter().map(String::as_str).collect::<Vec<_>>());
-        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let mut registry = HandleRegistry::new(64);
         let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into()], match_mode: MatchMode::Any, limit: 50 };
 
         let spent = Budget { deadline: std::time::Instant::now(), cancel: None };
@@ -633,7 +632,7 @@ mod tests {
         let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
         insert_commands(&mut store, rev_id, &cmd_refs);
 
-        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let mut registry = HandleRegistry::new(64);
 
         // Search to get 8 items.
         let search = SearchV1 {
@@ -736,7 +735,7 @@ mod tests {
         let rev_id = seed_store(&mut store);
         let cmds: Vec<String> = (0..12).map(|i| format!("cargo task_{i}")).collect();
         insert_commands(&mut store, rev_id, &cmds.iter().map(String::as_str).collect::<Vec<_>>());
-        let mut registry = HandleRegistry::new(1, KEY.to_vec(), 64);
+        let mut registry = HandleRegistry::new(64);
         let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into()], match_mode: MatchMode::Any, limit: 50 };
         let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
         // Packet 1's evidence, which packet 0's child was never sent.

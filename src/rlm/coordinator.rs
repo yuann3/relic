@@ -148,16 +148,13 @@ pub fn run_investigation(
     cancel: &Arc<AtomicBool>,
     progress: &mut dyn FnMut(Progress),
 ) -> InvestigationResult {
-    let investigation_id = 1u64; // Single investigation for prototype.
-    let installation_key = b"prototype-key".to_vec();
-
     let deadline = Instant::now() + Duration::from_millis(budget.wall_ms);
     let mut run = Run {
         store,
         model,
         deadline,
         concurrency: usize::from(budget.max_concurrency),
-        registry: HandleRegistry::new(investigation_id, installation_key, budget.evidence_handles as usize),
+        registry: HandleRegistry::new(budget.evidence_handles as usize),
         ledger: BudgetLedger::new(budget),
         turns: 0,
         child_calls: 0,
@@ -826,9 +823,7 @@ mod tests {
         seed_corpus(&mut store);
 
         // Run turn 1 manually to measure state size.
-        let investigation_id = 1u64;
-        let mut registry =
-            HandleRegistry::new(investigation_id, b"key".to_vec(), 512);
+        let mut registry = HandleRegistry::new(512);
         let budget = BudgetV1::prototype_default();
         let ledger = BudgetLedger::new(budget);
 
