@@ -1,14 +1,15 @@
 //! The Ctrl-C gate of ADR 0010, as a process against a server that never
 //! answers: Ctrl-C during a root call, and during a batch of four child
-//! calls, exits 130 within 250 ms, says `Cancelled`, and commits nothing
-//! that arrives late. If it fails, the transport decision reopens (reqwest),
-//! not a workaround.
+//! calls, dies by SIGINT (130 to a shell) within 250 ms, says `Cancelled`,
+//! and commits nothing that arrives late. If it fails, the transport
+//! decision reopens (reqwest), not a workaround.
 //!
 //! The process under test is `relic recall` itself, over the real
 //! `ChatCompletionsClient`, with SIGINT as the cancel flag.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,7 +87,7 @@ fn store(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Runs a recall until `said` holds for what it printed and `ready` holds,
-/// sends SIGINT, and returns the exit code, the time from SIGINT to exit,
+/// sends SIGINT, and returns the signal it died by, the time from SIGINT to exit,
 /// what it said and the last line of its recall log.
 fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> bool) -> (Option<i32>, Duration, String, serde_json::Value) {
     let dir = tempfile::tempdir().unwrap();
@@ -139,21 +140,23 @@ fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> 
     said.extend(rx.try_iter().map(|l| l + "\n"));
     let log = std::fs::read_to_string(dir.path().join("relic.db.recall.log")).unwrap();
     let last = serde_json::from_str(log.lines().last().unwrap()).unwrap();
-    (status.code(), took, said, last)
+    (status.signal(), took, said, last)
 }
 
 #[test]
-fn ctrl_c_during_a_root_call_exits_130_within_250_ms() {
+fn ctrl_c_during_a_root_call_dies_by_sigint_within_250_ms() {
     let (url, _) = server(None, Duration::ZERO);
-    let (code, took, said, last) = interrupt(&url, |said| said.contains("root call 1"), || true);
-    assert_eq!(code, Some(130), "{said}");
+    let (signal, took, said, last) = interrupt(&url, |said| said.contains("root call 1"), || true);
+    // Not exit(130): a shell stops a script around Relic only for a child
+    // that died by the signal.
+    assert_eq!(signal, Some(libc::SIGINT), "{said}");
     assert!(said.contains("recall cancelled"), "{said}");
     assert_eq!((&last["event"], &last["outcome"]), (&serde_json::json!("finish"), &serde_json::json!("cancelled")), "{last}");
     assert!(took < GATE, "{took:?} from SIGINT to exit\n{said}");
 }
 
 #[test]
-fn ctrl_c_during_four_child_calls_exits_130_within_250_ms_and_commits_none() {
+fn ctrl_c_during_four_child_calls_dies_by_sigint_within_250_ms_and_commits_none() {
     let plan = serde_json::json!({"version": 1, "expected_state_version": 0, "kind": "plan", "finish": null, "plan": {"ops": [
         {"op": "search", "op_id": "s1", "terms": ["generic"], "match": "any", "limit": 16},
         {"op": "assess", "op_id": "a1", "input": {"output": "s1"}, "objective": "renewal", "max_items": 16},
@@ -162,8 +165,10 @@ fn ctrl_c_during_four_child_calls_exits_130_within_250_ms_and_commits_none() {
     // the gate would close if the process were still waiting.
     let (url, children) = server(Some(plan), Duration::from_millis(150));
     let four = |said: &str| said.matches("child call for").count() == 4;
-    let (code, took, said, last) = interrupt(&url, four, || children.load(Ordering::SeqCst) == 4);
-    assert_eq!(code, Some(130), "{said}");
+    let (signal, took, said, last) = interrupt(&url, four, || children.load(Ordering::SeqCst) == 4);
+    // Not exit(130): a shell stops a script around Relic only for a child
+    // that died by the signal.
+    assert_eq!(signal, Some(libc::SIGINT), "{said}");
     assert!(said.contains("recall cancelled"), "{said}");
     assert_eq!((&last["event"], &last["outcome"]), (&serde_json::json!("finish"), &serde_json::json!("cancelled")), "{last}");
     assert!(took < GATE, "{took:?} from SIGINT to exit\n{said}");

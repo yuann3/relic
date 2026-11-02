@@ -62,7 +62,7 @@ Status: Accepted · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture]
   - **`clear()` hang:** a PTY test with a non-answering terminal shows no 2 s stall and no error exit.
   - **Ctrl-Z:** a PTY test covers suspend + `fg` with a full redraw.
   - **Exit codes:** a CLI test pins each code, including empty `--json`, fzf 1 vs 130, a busy store, and a query with nothing searchable.
-- The busy store's exit 2 relies on the typed Busy of [0005](0005-evidence-store-transactions-and-read-only-open.md). Recall's Ctrl-C exit 130 ([0010](0010-model-boundary.md)) equals 128+SIGINT.
+- The busy store's exit 2 relies on the typed Busy of [0005](0005-evidence-store-transactions-and-read-only-open.md). Recall's Ctrl-C exit 130 ([0010](0010-model-boundary.md)) equals 128+SIGINT: once the report and the log's finish line are written, Relic re-raises SIGINT with its default action, so a shell running a script or loop around it stops too.
 - Under `set -e`, an empty JSON result fails, so JSON callers must handle exit 1.
 - A genuine Alt+letter now acts as Esc (which may quit) followed by the letter.
 - Release (S6) checks upstream movement on the two reader bugs before deciding on any fork.

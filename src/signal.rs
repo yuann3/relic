@@ -56,7 +56,8 @@ pub fn install() {
 static INTERRUPT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 /// Makes Ctrl-C set `cancel` instead of killing Relic, so a recall ends as
-/// `Cancelled` at its next admission point and exits 130 (ADR 0010). An
+/// `Cancelled` at its next admission point and then dies by SIGINT through
+/// [`die_by_interrupt`] (ADR 0010). An
 /// inherited SIG_IGN is honoured, as for [`install`]. Once per process.
 pub fn interrupt_cancels(cancel: Arc<AtomicBool>) {
     if INTERRUPT.set(cancel).is_err() {
@@ -71,6 +72,24 @@ pub fn interrupt_cancels(cancel: Arc<AtomicBool>) {
             libc::signal(libc::SIGINT, on_interrupt as *const () as libc::sighandler_t);
         }
     }
+}
+
+/// Ends Relic by SIGINT, for a recall that Ctrl-C cancelled once it has
+/// printed and logged how it ended. Exiting 130 instead would look the
+/// same in `$?`, but a shell running a script or loop around Relic only
+/// stops it when the child died by the signal.
+pub fn die_by_interrupt() -> ! {
+    // SAFETY: the default action for SIGINT terminates; unblocking it after
+    // the raise delivers it at once.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::raise(libc::SIGINT);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+    std::process::exit(130)
 }
 
 extern "C" fn on_interrupt(_: libc::c_int) {

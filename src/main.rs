@@ -335,7 +335,8 @@ fn recall(question: &str, db: Option<PathBuf>, json: bool, allow_unknown_cost: b
         RecallOutcome::Abstained => ExitCode::FAILURE,
         RecallOutcome::Cancelled => {
             eprintln!("relic: recall cancelled");
-            ExitCode::from(130)
+            out.flush()?;
+            relic::signal::die_by_interrupt()
         }
         RecallOutcome::BudgetExhausted => {
             eprintln!("relic: recall ran out of budget before it could answer");
