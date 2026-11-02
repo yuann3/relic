@@ -41,3 +41,5 @@
 ## Clippy
 
 `cargo clippy --all-targets -- -D warnings` must pass with zero diagnostics. No `#[allow(clippy::*)]` without a comment explaining why.
+
+Lints beyond clippy's defaults live in `[lints.clippy]` in `Cargo.toml`, each with the pattern it stops. When a review finds a bad pattern that a lint can catch, add the lint there and fix every site. An exception uses `#[expect(lint, reason = "...")]`, so it fails once the code no longer needs it.
