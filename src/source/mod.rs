@@ -1,4 +1,5 @@
 pub mod bash;
+pub mod git;
 pub mod zsh;
 
 use std::io::{self, BufRead};
