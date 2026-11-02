@@ -86,6 +86,50 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 return Err(format!("no such record: {}", unknown.join(" ")).into());
             }
         }
+        Command::Import { path, shell, db } if path.is_dir() => {
+            if shell.is_some() {
+                return Err(format!("{} is a directory: a Git repository takes no --shell", shown(&path)).into());
+            }
+            let owns_dir = cli::owns_data_dir(&db);
+            let db = cli::resolve_db(db)?;
+            // Git first, so a directory that is no repository leaves no store.
+            relic::source::git::git_dir(&path).map_err(|e| format!("{}: {e}", shown(&path)))?;
+            if let Some(dir) = db.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            tighten(&db, owns_dir);
+            let r = match Store::open(&db).map_err(ImportError::from).and_then(|mut store| {
+                relic::import::import_git(&mut store, &path, &relic::redact::Redactor::new())
+            }) {
+                Err(ImportError::Busy) => {
+                    eprintln!("relic: busy: another import is writing {}; try again", shown(&db));
+                    return Ok(ExitCode::from(2));
+                }
+                r => r?,
+            };
+            if r.rescrubbed > 0 {
+                eprintln!(
+                    "relic: redaction rules changed since they were stored: re-redacted {} stored commands",
+                    r.rescrubbed
+                );
+            }
+            if r.scrub_blocked {
+                eprintln!("{SCRUB_BLOCKED}");
+            }
+            if r.checkpoint_blocked {
+                eprintln!("relic: note: WAL not checkpointed: a reader is active; the next large import retries");
+            }
+            let name = shown(&path);
+            if r.lossy_records > 0 {
+                eprintln!("relic: warning: {name}: {} Git records stored lossy (cut, or not UTF-8)", r.lossy_records);
+            }
+            let (moves, refs) = (r.reflog_stored, r.refs_stored);
+            match r.outcome {
+                Outcome::Unchanged => eprintln!("{name}: no new reflog entries or refs since last import"),
+                Outcome::First => eprintln!("{name}: stored {moves} reflog entries and {refs} refs in {}", shown(&db)),
+                _ => eprintln!("{name}: added {moves} reflog entries and {refs} refs"),
+            }
+        }
         Command::Import { path, shell, db } => {
             let owns_dir = cli::owns_data_dir(&db);
             let db = cli::resolve_db(db)?;

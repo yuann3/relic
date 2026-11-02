@@ -19,7 +19,7 @@ USAGE:
     relic recall <QUESTION>... [--db PATH] [--json] [--allow-unknown-cost]
 ",
             $ui,
-            "    relic import <HISTORY_FILE> [--shell zsh|bash] [--db PATH]
+            "    relic import <HISTORY_FILE | GIT_REPO> [--shell zsh|bash] [--db PATH]
     relic forget <ID>... [--db PATH]
     relic model check
     relic --help | --version
@@ -43,6 +43,10 @@ OPTIONS:
     forget        Delete records for good, by the id search --json and the TUI
                   show. Remove the line from your history file too, or a later
                   import of a rewritten file can store it again
+    import        A directory is a Git repository: relic runs git to store
+                  its reflogs (HEAD, branches, stash) and refs, never its
+                  files or diffs. Re-import to add what moved since; what
+                  Git deletes or expires stays in relic
     --shell       History format for import. Default: what the file was imported
                   as before, else what its content or name shows. A --shell
                   that differs from the stored one replaces that file's records

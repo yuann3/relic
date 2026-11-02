@@ -329,6 +329,29 @@ fn privacy_canary_gate() {
     std::fs::write(histories.join("bash_history"), format!("#1700000100\n{}\n", bash_commands[0])).unwrap();
     import(&db, &histories.join("zsh_history"), "zsh");
     import(&db, &histories.join("bash_history"), "bash");
+    // A repository whose commit subject, branch name and stash message
+    // carry secrets: the Git fields relic stores.
+    let repo = dir.path().join("repo");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    std::fs::create_dir(&repo).unwrap();
+    git(&["init", "-q", "-b", "main"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "certbot renew; password=Zq9CanaryGit13"]);
+    git(&["branch", "certbot/api_key=Zq9CanaryRef14"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&["add", "f"]);
+    git(&["stash", "-q", "-m", "certbot wip token=Zq9CanaryStash15"]);
+    let out = relic(&["import", repo.to_str().unwrap()], &db, "");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
     let redactor = relic::redact::Redactor::new();
     for raw in zsh_commands.iter().chain(&bash_commands) {
@@ -370,7 +393,10 @@ fn privacy_canary_gate() {
         assert!(sent.contains(marker), "no {marker} in what was sent");
     }
     let report: Value = serde_json::from_slice(&recall.stdout).unwrap();
-    assert_eq!(report["evidence"].as_array().unwrap().len(), zsh_commands.len() + bash_commands.len(), "{report}");
+    let hits = serde_json::from_slice::<Value>(&search.stdout).unwrap()["hits"].as_array().unwrap().len();
+    let git_rows = report["evidence"].as_array().unwrap().iter().filter(|e| e["source"] == "git").count();
+    assert!(git_rows >= 6, "the commit, branch and stash went out: {report}");
+    assert_eq!(report["evidence"].as_array().unwrap().len(), hits, "{report}");
     assert!(report["answer"].as_str().unwrap().ends_with("--password=[REDACTED:password]"), "{report}");
 
     let mut haystacks: Vec<(String, Vec<u8>)> = vec![
