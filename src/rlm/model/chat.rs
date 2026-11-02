@@ -396,19 +396,20 @@ struct WireUsage {
 }
 
 /// What an error body says: OpenAI's `{"error": {"message"}}`, a bare
-/// `error` or `message` string, or else the text itself. Cut to
-/// [`ERROR_MESSAGE_CHARS`] and redacted: it may echo what was sent.
+/// `error` or `message` string, or else the text itself. Redacted, as it
+/// may echo what was sent, then cut to [`ERROR_MESSAGE_CHARS`]: cut first,
+/// a secret across the cut is too short to be judged one and keeps its head.
 fn error_message(body: &str) -> Option<String> {
     let json: Option<Value> = serde_json::from_str(body).ok();
     let said = json.as_ref().map_or(Some(body), |v| {
         v["error"]["message"].as_str().or(v["error"].as_str()).or(v["message"].as_str())
     });
-    let said = said.map(str::trim).filter(|s| !s.is_empty())?;
+    let said = crate::redact::Redactor::new().redact(said.map(str::trim).filter(|s| !s.is_empty())?);
     let mut cut: String = said.chars().take(ERROR_MESSAGE_CHARS).collect();
     if cut.len() < said.len() {
         cut.push('…');
     }
-    Some(crate::redact::Redactor::new().redact(&cut))
+    Some(cut)
 }
 
 /// A 2xx body as a [`Reply`]. Provider extras are ignored here; what the
@@ -548,6 +549,9 @@ mod tests {
         let long_body = json!({"error": "y".repeat(5000)}).to_string();
         let Err(ModelError::Status { message: Some(m), .. }) = call_with(answer(400, "", long_body), long) else { panic!() };
         assert_eq!((m.chars().count(), m.ends_with('…')), (ERROR_MESSAGE_CHARS + 1, true));
+        let across_the_cut = json!({"error": format!("{} ghp_{}", "y".repeat(290), "a1B2".repeat(8))}).to_string();
+        let Err(ModelError::Status { message: Some(m), .. }) = call_with(answer(400, "", across_the_cut), long) else { panic!() };
+        assert!(!m.contains("ghp_"), "{m}");
         let huge = "z".repeat(ERROR_BODY_MAX as usize + 1);
         assert_eq!(call_with(answer(400, "", huge), long), Err(ModelError::Status { code: 400, message: None }));
         // The request went out and then the line dropped, or went quiet.
