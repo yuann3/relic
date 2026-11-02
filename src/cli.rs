@@ -42,7 +42,8 @@ OPTIONS:
                   stay capped
     forget        Delete records for good, by the id search --json and the TUI
                   show. Remove the line from your history file too, or a later
-                  import of a rewritten file can store it again
+                  import of a rewritten file can store it again. A Git record
+                  comes back on the next import while Git still holds it
     import        A directory is a Git repository: relic runs git to store
                   its reflogs (HEAD, branches, stash) and refs, never its
                   files or diffs. Re-import to add what moved since; what
