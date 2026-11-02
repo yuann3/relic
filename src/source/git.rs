@@ -49,6 +49,9 @@ pub enum GitError {
     NotInstalled,
     TimedOut { args: String },
     TooLarge { args: String },
+    /// Lines of `git`'s output that are no record: not the git Relic
+    /// asked, or a format it does not know.
+    Unreadable { args: String, lines: usize },
     /// `git` ran and failed; `stderr` is its first line.
     Failed { args: String, stderr: String },
     Io(std::io::Error),
@@ -60,6 +63,7 @@ impl std::fmt::Display for GitError {
             Self::NotInstalled => f.write_str("git is not installed, or not on PATH"),
             Self::TimedOut { args } => write!(f, "git {args} took over {} s; stopped it", TIMEOUT.as_secs()),
             Self::TooLarge { args } => write!(f, "git {args} printed over {} MiB; stopped it", OUTPUT_MAX >> 20),
+            Self::Unreadable { args, lines } => write!(f, "git {args} printed {lines} lines that are no record; stored nothing"),
             Self::Failed { args, stderr } => write!(f, "git {args} failed: {stderr}"),
             Self::Io(e) => write!(f, "running git: {e}"),
         }
@@ -86,11 +90,23 @@ pub fn read(repo: &Path) -> Result<Vec<RawRecord>, GitError> {
     let reflog = git(repo, &["log", "--walk-reflogs", "--all", "--date=unix", "--format=%gD%x00%H%x00%gs"])?;
     // `git log -g` is newest first within each ref: reversed, each ref runs
     // oldest first, and a stable sort by time interleaves them.
-    let mut records: Vec<RawRecord> = reflog.split(|&b| b == b'\n').filter(|l| !l.is_empty()).rev().filter_map(reflog_entry).collect();
+    let mut records = parse(&reflog, "log", reflog_entry)?;
+    records.reverse();
     records.sort_by_key(|r| r.timestamp);
     let refs = git(repo, &["for-each-ref", "--format=%(refname)%00%(objectname)%00%(contents:subject)"])?;
-    records.extend(refs.split(|&b| b == b'\n').filter(|l| !l.is_empty()).filter_map(ref_entry));
+    records.extend(parse(&refs, "for-each-ref", ref_entry)?);
     Ok(records)
+}
+
+/// One record per line of `out`, or an error naming how many lines are
+/// none: an import that skipped them would look complete.
+fn parse(out: &[u8], args: &str, entry: fn(&[u8]) -> Option<RawRecord>) -> Result<Vec<RawRecord>, GitError> {
+    let lines: Vec<&[u8]> = out.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    let records: Vec<RawRecord> = lines.iter().filter_map(|l| entry(l)).collect();
+    match lines.len() - records.len() {
+        0 => Ok(records),
+        lines => Err(GitError::Unreadable { args: args.into(), lines }),
+    }
 }
 
 fn fields(line: &[u8]) -> Option<[&[u8]; 3]> {
@@ -273,6 +289,9 @@ mod tests {
         let r = reflog_entry(b"refs/heads/main@{1700000000}\0abc\0commit: fix").unwrap();
         assert_eq!((r.kind, r.timestamp, r.text.as_str(), r.lossy), (RecordKind::Reflog, Some(1_700_000_000), "git reflog refs/heads/main abc commit: fix", false));
         assert_eq!(reflog_entry(b"HEAD\0abc\0no time").map(|r| r.text), None);
+        let out = b"HEAD@{1}\0abc\0one\n/some/path\nHEAD@{2}\0abc\0two\n";
+        assert!(matches!(parse(out, "log", reflog_entry), Err(GitError::Unreadable { lines: 1, .. })));
+        assert_eq!(parse(b"HEAD@{1}\0abc\0one\n", "log", reflog_entry).unwrap().len(), 1);
         let long = [b"refs/heads/x\0abc\0".as_slice(), &[b'y'; RECORD_MAX], b"\xff"].concat();
         let r = ref_entry(&long).unwrap();
         assert!(r.lossy && r.text.len() <= RECORD_MAX && r.text.starts_with("git ref refs/heads/x abc yyy"));
