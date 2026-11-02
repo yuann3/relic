@@ -19,6 +19,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
+# Patterns a review found shipped; `cargo clippy -- -D warnings` fails on
+# any new one. An exception says why with `#[expect(..., reason = ...)]`.
+[lints.clippy]
+# A `Display` that writes `{self:?}` showed users a Rust dump such as
+# `UncitedClaim { claim_text: .. }`. Write the sentence.
+use_debug = "warn"
+# A panic for a state a guard elsewhere rules out: return the error the
+# guard would, so moving the guard cannot crash Relic.
+unreachable = "warn"
+
 [[bin]]
 name = "relic"
 path = "src/main.rs"

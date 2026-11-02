@@ -35,6 +35,7 @@ pub enum ChildRejection {
 }
 
 impl std::fmt::Display for ChildRejection {
+    #[expect(clippy::use_debug, reason = "quotes the ids the model wrote, with their control characters escaped")]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Oversize { bytes } => write!(f, "{bytes} bytes, over the {CHILD_RESULT_MAX}-byte cap"),
