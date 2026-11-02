@@ -263,6 +263,19 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let finish: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
     assert!(finish["outcome"] == "failed" && !log.contains("scripted model is down"), "{log}");
 
+    // A root that never finishes runs out of root calls: exit 2, like a
+    // failure, and the report says which.
+    let forever = |state: &Value| {
+        let v = state["state_version"].as_u64().unwrap();
+        Some(json!({"version": 1, "expected_state_version": v, "kind": "plan", "finish": null, "plan": {"ops": [
+            {"op": "search", "op_id": "s1", "terms": ["certbot"], "match": "any", "limit": 1}]}}))
+    };
+    let (code, stdout, stderr) = run(Box::new(forever), &["--json"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!((report["outcome"].as_str(), report["root_calls"].as_u64()), (Some("budget_exhausted"), Some(8)), "{report}");
+    assert!(stderr.contains("ran out of budget"), "{stderr}");
+
     // A remote model without prices: its cost cannot be capped, so recall
     // refuses before any call unless told the cost may be unknown.
     let remote = |extra: &[&str]| {
