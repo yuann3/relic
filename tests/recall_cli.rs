@@ -258,6 +258,10 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     assert_eq!(report["outcome"], "failed");
     let said = "model endpoint answered HTTP 500: the scripted model is down";
     assert!(report["error"].as_str().unwrap().contains(said) && stderr.contains(said), "{report}\n{stderr}");
+    // An error can echo evidence back, which the log must not keep.
+    let log = std::fs::read_to_string(dir.path().join("relic.db.recall.log")).unwrap();
+    let finish: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert!(finish["outcome"] == "failed" && !log.contains("scripted model is down"), "{log}");
 
     // A remote model without prices: its cost cannot be capped, so recall
     // refuses before any call unless told the cost may be unknown.

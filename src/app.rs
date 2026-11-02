@@ -551,12 +551,14 @@ impl RecallLog {
         }
     }
 
-    /// The last line, synced: a Ctrl-C exits right after it.
+    /// The last line, synced: a Ctrl-C exits right after it. Without the
+    /// report's error, which can quote evidence the endpoint or the model
+    /// echoed.
     fn finish(&mut self, r: &RecallReport) -> Option<std::io::Error> {
         self.line("finish", serde_json::json!({
             "outcome": r.outcome, "root_calls": r.root_calls, "child_calls": r.child_calls,
             "cost_microusd": r.cost_microusd, "models": r.models,
-            "cited": r.evidence.iter().map(|e| e.id).collect::<Vec<_>>(), "error": r.error,
+            "cited": r.evidence.iter().map(|e| e.id).collect::<Vec<_>>(),
         }));
         if self.failed.is_none()
             && let Err(e) = self.file.sync_data()
