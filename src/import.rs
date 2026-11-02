@@ -11,7 +11,7 @@ use crate::redact::{REDACTION_REVISION, Redactor};
 use crate::source::{self, RawRecord};
 use crate::store::{Cursor, RevisionTx, StatHint, Store, StoreError};
 
-/// Which shell format to parse.
+/// What a source is: a shell history, by its format, or a Git repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     Zsh,
@@ -220,7 +220,7 @@ pub fn import(
     let mut source = store.lock_source(history.resolved.as_os_str().as_bytes())?;
     // Only through `import_git`; a path once a repository is not a history.
     if shell == Some(SourceKind::Git) || source.stored_kind() == Some(SourceKind::Git) {
-        return Err(ImportError::NotRegularFile(history.path.clone()));
+        return Err(ImportError::GitAsHistory);
     }
     // Asked beats stored beats detected: a stored kind was either asked for
     // once or detected once, and detection must not flip it later.
@@ -423,7 +423,7 @@ fn scan<T>(
             let out = run(&mut parser.by_ref().map(absolute))?;
             (out, parser.stable_len(), 0, parser.incomplete_tail().is_some())
         }
-        SourceKind::Git => unreachable!("import refuses a Git source before parsing"),
+        SourceKind::Git => return Err(ImportError::GitAsHistory),
     };
     Ok((out, Scan { stable_len: from + stable_len, dangling_meta, incomplete_tail }))
 }
@@ -488,7 +488,7 @@ fn align(
         return Ok((Some(0), 0));
     }
     let width = anchor.len().min(ALIGN_WINDOW);
-    let obs_kind = observation_kind(kind);
+    let obs_kind = observation_kind(kind)?;
     let mut window = VecDeque::with_capacity(width);
     let (mut records, mut runs, mut in_run, mut boundary) = (0, 0usize, false, 0);
     scan(file, 0, kind, |parsed| {
@@ -514,11 +514,11 @@ fn align(
     Ok(((runs == 1).then_some(boundary), records))
 }
 
-fn observation_kind(kind: SourceKind) -> ObservationKind {
+fn observation_kind(kind: SourceKind) -> Result<ObservationKind, ImportError> {
     match kind {
-        SourceKind::Zsh => ObservationKind::ZshCommand,
-        SourceKind::Bash => ObservationKind::BashCommand,
-        SourceKind::Git => unreachable!("import refuses a Git source before parsing"),
+        SourceKind::Zsh => Ok(ObservationKind::ZshCommand),
+        SourceKind::Bash => Ok(ObservationKind::BashCommand),
+        SourceKind::Git => Err(ImportError::GitAsHistory),
     }
 }
 
@@ -574,7 +574,7 @@ fn store_records(
     records: impl Iterator<Item = io::Result<RawRecord>>,
     redactor: &Redactor,
 ) -> Result<Stored, ImportError> {
-    let obs_kind = observation_kind(kind);
+    let obs_kind = observation_kind(kind)?;
     let mut stored = Stored { count: 0, lossy: 0, provenance: Provenance::COMMAND };
     for raw in records {
         let observation = raw_to_observation(&raw.map_err(ImportError::Io)?, obs_kind, redactor);
@@ -622,6 +622,8 @@ pub enum ImportError {
     ChangedDuringImport(PathBuf),
     /// Another import holds the store's write lock.
     Busy,
+    /// A Git source asked to be read as a history file.
+    GitAsHistory,
     Store(StoreError),
 }
 
@@ -639,6 +641,7 @@ impl std::fmt::Display for ImportError {
         match self {
             Self::Io(e) => write!(f, "{e}"),
             Self::NotRegularFile(path) => write!(f, "{}: not a regular file", path.display()),
+            Self::GitAsHistory => f.write_str("a Git repository is imported by its directory, not read as a history file"),
             Self::FinalSymlink { path, target } => write!(
                 f,
                 "{}: is a symlink to {}; relic does not follow it, import the target instead",
@@ -1696,6 +1699,17 @@ mod tests {
         let after = git_texts(&store);
         assert_eq!(&after[..rows.len()], &rows[..]);
         assert!(after[rows.len()..].iter().all(|(_, _, s)| s.contains("three")), "{after:#?}");
+    }
+
+    #[test]
+    fn a_history_file_is_never_read_as_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zsh_history");
+        fs::write(&path, ": 1700000000:0;ls\n").unwrap();
+        let mut store = Store::open_memory().unwrap();
+        let r = import_file(&mut store, &path, SourceKind::Git, &Redactor::new());
+        assert!(matches!(r, Err(ImportError::GitAsHistory)), "{r:?}");
+        assert_eq!(store.observation_count().unwrap(), 0);
     }
 
     #[test]
