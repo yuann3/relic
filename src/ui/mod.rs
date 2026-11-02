@@ -271,9 +271,9 @@ where
                     self.awaiting_frame = Some((g, issued, *elapsed));
                 }
                 for effect in update(&mut m, action) {
-                    match effect {
-                        UiEffect::Exit => return Ok(()),
-                        e => queue.extend(self.run_effect(e, guard)?),
+                    match self.run_effect(effect, guard)? {
+                        Some(actions) => queue.extend(actions),
+                        None => return Ok(()),
                     }
                 }
                 // Draw the new size before the keys queued behind it: the
@@ -287,9 +287,9 @@ where
     }
 
     /// Performs one effect. Synchronous results come back as actions; the
-    /// rest arrive later on the channel.
-    fn run_effect(&mut self, effect: UiEffect, guard: &mut TerminalGuard) -> Result<Vec<UiAction>> {
-        Ok(match effect {
+    /// rest arrive later on the channel. `None` is the effect that quits.
+    fn run_effect(&mut self, effect: UiEffect, guard: &mut TerminalGuard) -> Result<Option<Vec<UiAction>>> {
+        Ok(Some(match effect {
             UiEffect::Search { generation, query } => {
                 let issued = Instant::now();
                 self.issued = Some((generation, issued));
@@ -324,7 +324,7 @@ where
                     old.store(true, Ordering::SeqCst);
                 }
                 // `update` asks only when a model is configured.
-                let Some(model) = self.model.clone() else { return Ok(vec![]) };
+                let Some(model) = self.model.clone() else { return Ok(Some(vec![])) };
                 let store = Store::open_read_only(&self.db)?;
                 let cancel = Arc::new(AtomicBool::new(false));
                 let log = app::recall_log_path(&self.db);
@@ -352,7 +352,7 @@ where
                     old.sa_sigaction == libc::SIG_IGN
                 };
                 if ignored {
-                    return Ok(vec![UiAction::SuspendRefused]);
+                    return Ok(Some(vec![UiAction::SuspendRefused]));
                 }
                 // The fzf hand-off, with the shell as the program that
                 // takes the terminal (ADR 0011).
@@ -367,8 +367,8 @@ where
                 self.input.resume();
                 vec![UiAction::Resize]
             }
-            UiEffect::Exit => unreachable!("handled by the loop"),
-        })
+            UiEffect::Exit => return Ok(None),
+        }))
     }
 }
 
