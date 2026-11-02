@@ -108,18 +108,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 }
                 r => r?,
             };
-            if r.rescrubbed > 0 {
-                eprintln!(
-                    "relic: redaction rules changed since they were stored: re-redacted {} stored commands",
-                    r.rescrubbed
-                );
-            }
-            if r.scrub_blocked {
-                eprintln!("{SCRUB_BLOCKED}");
-            }
-            if r.checkpoint_blocked {
-                eprintln!("relic: note: WAL not checkpointed: a reader is active; the next large import retries");
-            }
+            store_notes(r.rescrubbed, r.scrub_blocked, r.checkpoint_blocked);
             let name = shown(&path);
             if r.lossy_records > 0 {
                 eprintln!("relic: warning: {name}: {} Git records stored lossy (cut, or not UTF-8)", r.lossy_records);
@@ -152,23 +141,12 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 r => r?,
             };
             let (name, n) = (shown(&path), r.records_stored);
-            if r.rescrubbed > 0 {
-                eprintln!(
-                    "relic: redaction rules changed since they were stored: re-redacted {} stored commands",
-                    r.rescrubbed
-                );
-            }
+            store_notes(r.rescrubbed, r.scrub_blocked, r.checkpoint_blocked);
             if let Some((was, removed)) = r.replaced {
                 eprintln!(
                     "relic: {name}: was imported as {was}; replaced its {removed} stored commands with a {} import",
                     r.kind
                 );
-            }
-            if r.scrub_blocked {
-                eprintln!("{SCRUB_BLOCKED}");
-            }
-            if r.checkpoint_blocked {
-                eprintln!("relic: note: WAL not checkpointed: a reader is active; the next large import retries");
             }
             if r.lossy_records > 0 {
                 eprintln!("relic: warning: {name}: {} commands stored lossy (cut, or not decodable)", r.lossy_records);
@@ -196,6 +174,19 @@ fn run(cmd: Command) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// What an import of either kind of source did to the store as a whole.
+fn store_notes(rescrubbed: usize, scrub_blocked: bool, checkpoint_blocked: bool) {
+    if rescrubbed > 0 {
+        eprintln!("relic: redaction rules changed since they were stored: re-redacted {rescrubbed} stored commands");
+    }
+    if scrub_blocked {
+        eprintln!("{SCRUB_BLOCKED}");
+    }
+    if checkpoint_blocked {
+        eprintln!("relic: note: WAL not checkpointed: a reader is active; the next large import retries");
+    }
 }
 
 const SCRUB_BLOCKED: &str = "relic: warning: another relic is reading the store, so the removed text is still \
