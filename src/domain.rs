@@ -33,7 +33,9 @@ impl ObservationKind {
 /// Which observation fields a revision's source file itself encodes. A field
 /// outside the set is absent for that revision, never inferred. One value per
 /// revision instead of a blob per row (ADR 0008); a single row still says
-/// "no time" with a NULL `observed_at_ms`.
+/// "no time" with a NULL `observed_at_ms`. One exception: a Git revision's
+/// `GitRef` rows carry the time they were imported, as Git keeps none for
+/// where a ref points, while its reflog rows beside them carry Git's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Provenance(u8);
 

@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use super::model::{Focus, Modal, RecallState, RecallStatus, StepState, UiModel};
 use crate::app::{MIN_PREFIX_CHARS, RecallOutcome, When, display_line, source_label};
 use crate::rlm::protocol::BudgetV1;
-use crate::domain::Provenance;
+use crate::domain::{ObservationKind, Provenance};
 
 /// Below this the panes cannot show a usable row, so say so instead.
 pub const MIN_WIDTH: u16 = 40;
@@ -356,10 +356,14 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             Span::raw(value),
         ])
     };
-    let provenance = match m.evidence.view.as_ref().map(|v| v.provenance) {
-        Some(p) if p.has(Provenance::OBSERVED_AT) => "text, time from file",
-        Some(_) => "text only from file",
-        None => "unknown",
+    let from = if matches!(o.kind, ObservationKind::GitReflog | ObservationKind::GitRef) { "git" } else { "file" };
+    let provenance = match (o.kind, m.evidence.view.as_ref().map(|v| v.provenance)) {
+        // Git keeps no time for where a ref points; Relic's clock is no
+        // source's.
+        (ObservationKind::GitRef, Some(_)) => "text from git, time of import".to_string(),
+        (_, Some(p)) if p.has(Provenance::OBSERVED_AT) => format!("text, time from {from}"),
+        (_, Some(_)) => format!("text only from {from}"),
+        (_, None) => "unknown".to_string(),
     };
     let mut lines = vec![
         field("id", format!("#{}", o.id)),
@@ -369,7 +373,7 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             "revision",
             format!("{} · ordinal {}", o.revision_id, o.ordinal),
         ),
-        field("provenance", provenance.to_string()),
+        field("provenance", provenance),
         Line::raw(""),
         Line::styled("exact text, redacted at import:", t.title),
     ];
@@ -779,6 +783,31 @@ mod tests {
         assert!(s.contains("hit  unknown     certbot renew"), "{s}");
         assert!(!s.contains("hit wn time"), "{s}");
         assert!(s.contains("provenance: text only from file"), "{s}");
+    }
+
+    #[test]
+    fn git_evidence_says_its_text_is_from_git_and_a_refs_time_is_of_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "wired"]);
+        let mut store = Store::open_memory().unwrap();
+        crate::import::import_git(&mut store, crate::source::git::read(dir.path()).unwrap(), &Redactor::new()).unwrap();
+        // Refs are stored after the reflog, so the newest hit is the ref.
+        let s = text(&render(&typed(&store, "wired", false), 160, 40));
+        assert!(s.contains("provenance: text from git, time of import"), "{s}");
+        let s = text(&render(&typed(&store, "reflog wired", false), 160, 40));
+        assert!(s.contains("provenance: text, time from git"), "{s}");
     }
 
     #[test]
