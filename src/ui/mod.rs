@@ -79,6 +79,9 @@ pub fn run(db: &Path) -> Result<()> {
         let builder = std::thread::Builder::new().name("relic-search".into());
         crate::signal::spawn(builder, move || search_worker(&worker_store, &mb, &tx, debounce()))?
     };
+    // Joined once the action channel is closed: a recall blocked on a full
+    // queue then gets its error at once, and its log its finish line.
+    let mut recalls = Vec::new();
     let outcome = (|| {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         redraw_all(&mut terminal)?;
@@ -92,6 +95,7 @@ pub fn run(db: &Path) -> Result<()> {
             db: db.to_path_buf(),
             model: model.as_ref().ok().cloned(),
             recall: None,
+            recalls: Vec::new(),
             trace: Trace::from_env(),
             issued: None,
             awaiting_frame: None,
@@ -108,6 +112,7 @@ pub fn run(db: &Path) -> Result<()> {
         if let Some((_, cancel)) = rt.recall.take() {
             cancel.store(true, Ordering::SeqCst);
         }
+        recalls = std::mem::take(&mut rt.recalls);
         // Dropping the runtime joins the input reader before the terminal
         // goes back to canonical mode.
         drop(rt);
@@ -115,6 +120,9 @@ pub fn run(db: &Path) -> Result<()> {
     })();
     let restored = guard.restore();
     stop_worker(&mailbox, rx, worker);
+    for recall in recalls {
+        let _ = recall.join();
+    }
     outcome?;
     restored?;
     Ok(())
@@ -157,6 +165,8 @@ struct Runtime<B: Backend> {
     db: PathBuf,
     model: Option<Arc<dyn ModelBoundary>>,
     recall: Option<(u64, Arc<AtomicBool>)>,
+    /// Every recall thread that may still be running, the cancelled ones too.
+    recalls: Vec<JoinHandle<()>>,
     trace: Trace,
     /// Newest search sent to the worker and when, for key-to-frame timing.
     issued: Option<(u64, Instant)>,
@@ -318,7 +328,8 @@ where
                 let store = Store::open_read_only(&self.db)?;
                 let cancel = Arc::new(AtomicBool::new(false));
                 let log = app::recall_log_path(&self.db);
-                recall::spawn(op, question, store, model, log, Arc::clone(&cancel), self.tx.clone())?;
+                self.recalls.retain(|r| !r.is_finished());
+                self.recalls.push(recall::spawn(op, question, store, model, log, Arc::clone(&cancel), self.tx.clone())?);
                 self.recall = Some((op, cancel));
                 vec![]
             }
@@ -671,6 +682,7 @@ mod tests {
             db: PathBuf::new(),
             model: None,
             recall: None,
+            recalls: Vec::new(),
             trace: Trace(None),
             issued: None,
             awaiting_frame: None,
