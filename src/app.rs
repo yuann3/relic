@@ -316,6 +316,7 @@ pub fn source_label(kind: ObservationKind) -> &'static str {
         ObservationKind::BashCommand => "bash",
         ObservationKind::HookFrame => "hook",
         ObservationKind::AgentMessage => "agent",
+        ObservationKind::GitReflog | ObservationKind::GitRef => "git",
     }
 }
 

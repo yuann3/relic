@@ -1,11 +1,15 @@
 /// Kind of observation source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ObservationKind {
     ZshCommand = 1,
     BashCommand = 2,
     HookFrame = 3,
     AgentMessage = 4,
+    /// A Git ref moved, at the time Git recorded.
+    GitReflog = 5,
+    /// Where a Git ref pointed when Relic imported the repository.
+    GitRef = 6,
 }
 
 impl ObservationKind {
@@ -19,6 +23,8 @@ impl ObservationKind {
             2 => Some(Self::BashCommand),
             3 => Some(Self::HookFrame),
             4 => Some(Self::AgentMessage),
+            5 => Some(Self::GitReflog),
+            6 => Some(Self::GitRef),
             _ => None,
         }
     }

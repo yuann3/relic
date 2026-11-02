@@ -216,6 +216,24 @@ impl<'a> SourceLock<'a> {
         Ok(records)
     }
 
+    /// Every record stored for this source, in any revision, as
+    /// `(kind, observed_at_ms, safe_text)`.
+    pub fn records(&self) -> Result<Vec<(ObservationKind, Option<i64>, String)>, StoreError> {
+        let mut stmt = self.tx.prepare(
+            "SELECT o.kind, o.observed_at_ms, o.safe_text FROM observation o
+             JOIN source_revision sr ON sr.id = o.revision_id JOIN source s ON s.id = sr.source_id
+             WHERE s.private_locator = ?1",
+        )?;
+        let rows = stmt.query_map([self.locator], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (kind, at, text) = row?;
+            let kind = ObservationKind::from_i64(kind).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, kind))?;
+            out.push((kind, at, text));
+        }
+        Ok(out)
+    }
+
     /// Reopen the newest revision to append records after its last one. A
     /// source with no revision yet gets its first.
     pub fn append(self, kind: SourceKind) -> Result<RevisionTx<'a>, StoreError> {
@@ -395,7 +413,7 @@ impl Store {
             })
             .optional()?
             .map(|kind| {
-                [SourceKind::Zsh, SourceKind::Bash]
+                [SourceKind::Zsh, SourceKind::Bash, SourceKind::Git]
                     .into_iter()
                     .find(|k| kind_int(*k) == kind)
                     // Guessing a shell here could delete the source's records
@@ -772,6 +790,7 @@ fn kind_int(kind: SourceKind) -> i64 {
     match kind {
         SourceKind::Zsh => 1,
         SourceKind::Bash => 2,
+        SourceKind::Git => 3,
     }
 }
 
@@ -779,6 +798,7 @@ fn parser_contract(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::Zsh => crate::source::zsh::PARSER_CONTRACT,
         SourceKind::Bash => crate::source::bash::PARSER_CONTRACT,
+        SourceKind::Git => crate::source::git::PARSER_CONTRACT,
     }
 }
 

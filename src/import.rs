@@ -16,6 +16,8 @@ use crate::store::{Cursor, RevisionTx, StatHint, Store, StoreError};
 pub enum SourceKind {
     Zsh,
     Bash,
+    /// A repository, imported through `git` rather than read as a file.
+    Git,
 }
 
 impl std::fmt::Display for SourceKind {
@@ -23,6 +25,7 @@ impl std::fmt::Display for SourceKind {
         f.write_str(match self {
             Self::Zsh => "zsh",
             Self::Bash => "bash",
+            Self::Git => "git",
         })
     }
 }
@@ -215,6 +218,10 @@ pub fn import(
     // Lock before looking: an importer that decided first and then waited for
     // another import of this file would store the file a second time.
     let mut source = store.lock_source(history.resolved.as_os_str().as_bytes())?;
+    // Only through `import_git`; a path once a repository is not a history.
+    if shell == Some(SourceKind::Git) || source.stored_kind() == Some(SourceKind::Git) {
+        return Err(ImportError::NotRegularFile(history.path.clone()));
+    }
     // Asked beats stored beats detected: a stored kind was either asked for
     // once or detected once, and detection must not flip it later.
     let (kind, replaced) = match (shell, source.stored_kind()) {
@@ -301,6 +308,85 @@ pub fn import(
     })
 }
 
+/// What a Git import stored.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GitImportResult {
+    /// `First`, `Appended`, or `Unchanged` when Git held nothing new.
+    pub outcome: Outcome,
+    pub reflog_stored: usize,
+    pub refs_stored: usize,
+    pub lossy_records: usize,
+    pub rescrubbed: usize,
+    pub scrub_blocked: bool,
+    pub checkpoint_blocked: bool,
+}
+
+/// Import a repository's reflog entries and refs, storing only what the
+/// store does not hold yet. Nothing is ever removed: a branch deleted or a
+/// reflog expired in Git stays evidence here, which is what recovering it
+/// needs. `repo` may be the top level, a subdirectory or the Git directory.
+pub fn import_git(store: &mut Store, repo: &Path, redactor: &Redactor) -> Result<GitImportResult, ImportError> {
+    // Before the store: a path that is no repository locks nothing.
+    let git_dir = source::git::git_dir(repo).map_err(ImportError::Git)?;
+    let raw = source::git::read(&git_dir).map_err(ImportError::Git)?;
+    let (rescrubbed, scrubbed) = store.rescrub(REDACTION_REVISION, |safe| redactor.redact(safe))?;
+    let source = store.lock_source(git_dir.as_os_str().as_bytes())?;
+    if let Some(kind) = source.stored_kind().filter(|k| *k != SourceKind::Git) {
+        return Err(ImportError::Io(io::Error::other(format!(
+            "{} was imported as a {kind} history, not a Git repository",
+            git_dir.display()
+        ))));
+    }
+    // A ref's time is when it was seen, so it matches by text alone. Counted,
+    // not a set: one second can hold the same reflog entry twice.
+    let key = |kind: ObservationKind, at: Option<i64>, text: String| (kind, at.filter(|_| kind == ObservationKind::GitReflog), text);
+    let mut known: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
+    for (kind, at, text) in source.records()? {
+        *known.entry(key(kind, at, text)).or_default() += 1;
+    }
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+    let mut fresh = Vec::new();
+    for r in raw {
+        let kind = match r.kind {
+            source::git::RecordKind::Reflog => ObservationKind::GitReflog,
+            source::git::RecordKind::Ref => ObservationKind::GitRef,
+        };
+        let observed_at_ms = match r.kind {
+            source::git::RecordKind::Reflog => r.timestamp.and_then(|t| t.checked_mul(1000)),
+            source::git::RecordKind::Ref => Some(now_ms),
+        };
+        let safe_text = redactor.import(&r.text);
+        if let Some(n) = known.get_mut(&key(kind, observed_at_ms, safe_text.clone())).filter(|n| **n > 0) {
+            *n -= 1;
+            continue;
+        }
+        let flags = if r.lossy { FLAG_LOSSY } else { 0 };
+        fresh.push(Observation { kind, observed_at_ms, safe_text, flags, locator: Vec::new() });
+    }
+    let count = |kind| fresh.iter().filter(|o| o.kind == kind).count();
+    let mut result = GitImportResult {
+        outcome: Outcome::Unchanged,
+        reflog_stored: count(ObservationKind::GitReflog),
+        refs_stored: count(ObservationKind::GitRef),
+        lossy_records: fresh.iter().filter(|o| o.flags & FLAG_LOSSY != 0).count(),
+        rescrubbed,
+        scrub_blocked: !scrubbed,
+        checkpoint_blocked: false,
+    };
+    if fresh.is_empty() {
+        return Ok(result);
+    }
+    result.outcome = if source.newest().is_some() { Outcome::Appended } else { Outcome::First };
+    let mut revision = source.append(SourceKind::Git)?;
+    for o in &fresh {
+        revision.insert(o)?;
+    }
+    // No cursor: Git is asked again on every import, never stat-skipped.
+    revision.commit(&Cursor::default(), Provenance::COMMAND.with(Provenance::OBSERVED_AT))?;
+    result.checkpoint_blocked = checkpoint_blocked(store, fresh.len())?;
+    Ok(result)
+}
+
 /// What a pass over a file's records learned besides the records.
 struct Scan {
     /// Byte end of the last complete record, from the start of the file.
@@ -339,6 +425,7 @@ fn scan<T>(
             let out = run(&mut parser.by_ref().map(absolute))?;
             (out, parser.stable_len(), 0, parser.incomplete_tail().is_some())
         }
+        SourceKind::Git => unreachable!("import refuses a Git source before parsing"),
     };
     Ok((out, Scan { stable_len: from + stable_len, dangling_meta, incomplete_tail }))
 }
@@ -433,6 +520,7 @@ fn observation_kind(kind: SourceKind) -> ObservationKind {
     match kind {
         SourceKind::Zsh => ObservationKind::ZshCommand,
         SourceKind::Bash => ObservationKind::BashCommand,
+        SourceKind::Git => unreachable!("import refuses a Git source before parsing"),
     }
 }
 
@@ -536,6 +624,8 @@ pub enum ImportError {
     ChangedDuringImport(PathBuf),
     /// Another import holds the store's write lock.
     Busy,
+    /// Reading a repository through `git` failed; nothing was stored.
+    Git(source::git::GitError),
     Store(StoreError),
 }
 
@@ -568,6 +658,7 @@ impl std::fmt::Display for ImportError {
                 write!(f, "{}: changed while it was being imported; nothing was stored, try again", path.display())
             }
             Self::Busy => write!(f, "{}", StoreError::Busy),
+            Self::Git(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "store error: {e}"),
         }
     }
@@ -1528,6 +1619,88 @@ mod tests {
         // The corrected kind is the stored one: no --shell, no second replace.
         let r = import_file(&mut store, &path, None, &redactor).unwrap();
         assert_eq!((r.kind, r.replaced, r.outcome), (SourceKind::Bash, None, Outcome::Unchanged));
+    }
+
+
+    /// `git` in `dir` with a fixed identity and clock, so reflog times are
+    /// known and repeated entries fall in one second.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn git_texts(store: &Store) -> Vec<(ObservationKind, Option<i64>, String)> {
+        let mut rows = store.recent(1000).unwrap();
+        rows.reverse();
+        rows.into_iter().map(|h| (h.kind, h.observed_at_ms, h.safe_text)).collect()
+    }
+
+    #[test]
+    fn a_git_import_keeps_what_git_later_deletes_and_adds_only_what_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(repo, &["commit", "-q", "--allow-empty", "-m", "two password=hunter2"]);
+        let lost = git(repo, &["rev-parse", "HEAD"]);
+        git(repo, &["branch", "feat"]);
+        fs::write(repo.join("f"), "x").unwrap();
+        git(repo, &["add", "f"]);
+        git(repo, &["stash", "-q", "-m", "wip"]);
+        // Twice in one second: two entries alike, both evidence.
+        git(repo, &["reset", "-q", "--hard", "HEAD"]);
+        git(repo, &["reset", "-q", "--hard", "HEAD"]);
+        git(repo, &["reset", "-q", "--hard", "HEAD~1"]);
+        let entries = git(repo, &["log", "-g", "--all", "--format=%H"]).lines().count();
+
+        let mut store = Store::open_memory().unwrap();
+        let redactor = Redactor::new();
+        let r = import_git(&mut store, &repo.join(".git"), &redactor).unwrap();
+        assert_eq!((r.outcome, r.reflog_stored, r.refs_stored), (Outcome::First, entries, 3));
+        let rows = git_texts(&store);
+        let at = Some(1_700_000_000_000);
+        let resets = rows.iter().filter(|(k, t, s)| *k == ObservationKind::GitReflog && *t == at && s.ends_with("reset: moving to HEAD")).count();
+        assert_eq!(resets, 3, "one from the stash, two typed: {rows:#?}");
+        let commit = format!("git reflog HEAD {lost} commit: two password=[REDACTED:password]");
+        assert!(rows.iter().any(|(_, t, s)| *s == commit && *t == at), "{rows:#?}");
+        assert!(rows.iter().any(|(k, _, s)| *k == ObservationKind::GitRef && s.starts_with("git ref refs/heads/feat ")), "{rows:#?}");
+        // The lost commit the evidence names is one Git can still give back.
+        assert_eq!(git(repo, &["rev-parse", "--verify", &format!("{lost}^{{commit}}")]), lost);
+
+        // Git forgets the branch, the stash and every reflog entry; relic does not.
+        git(repo, &["branch", "-q", "-D", "feat"]);
+        git(repo, &["stash", "drop", "-q"]);
+        git(repo, &["reflog", "expire", "--expire=now", "--all"]);
+        let again = import_git(&mut store, repo, &redactor).unwrap();
+        assert_eq!((again.outcome, again.reflog_stored, again.refs_stored), (Outcome::Unchanged, 0, 0));
+        assert_eq!(git_texts(&store), rows);
+
+        // A new commit moves HEAD and main: two entries, and main's new place.
+        git(repo, &["commit", "-q", "--allow-empty", "-m", "three"]);
+        let next = import_git(&mut store, repo, &redactor).unwrap();
+        assert_eq!((next.outcome, next.reflog_stored, next.refs_stored), (Outcome::Appended, 2, 1));
+        let after = git_texts(&store);
+        assert_eq!(&after[..rows.len()], &rows[..]);
+        assert!(after[rows.len()..].iter().all(|(_, _, s)| s.contains("three")), "{after:#?}");
+    }
+
+    #[test]
+    fn a_directory_that_is_no_repository_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_memory().unwrap();
+        let err = import_git(&mut store, dir.path(), &Redactor::new()).unwrap_err();
+        assert!(err.to_string().contains("not a git repository"), "{err}");
+        assert_eq!(store.observation_count().unwrap(), 0);
     }
 
 }
