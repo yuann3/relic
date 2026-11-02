@@ -321,15 +321,12 @@ pub struct GitImportResult {
     pub checkpoint_blocked: bool,
 }
 
-/// Import a repository's reflog entries and refs, storing only what the
-/// store does not hold yet. Nothing is ever removed: a branch deleted or a
-/// reflog expired in Git stays evidence here, which is what recovering it
-/// needs. `repo` may be the top level, a subdirectory, the Git directory or
-/// a linked worktree.
-pub fn import_git(store: &mut Store, repo: &Path, redactor: &Redactor) -> Result<GitImportResult, ImportError> {
-    // Before the store: a path that is no repository locks nothing.
-    let git_dir = source::git::git_dir(repo).map_err(ImportError::Git)?;
-    let raw = source::git::read(&git_dir).map_err(ImportError::Git)?;
+/// Import a repository's reflog entries and refs, read before the store is
+/// opened, storing only what the store does not hold yet. Nothing is ever
+/// removed: a branch deleted or a reflog expired in Git stays evidence
+/// here, which is what recovering it needs.
+pub fn import_git(store: &mut Store, repo: source::git::Repository, redactor: &Redactor) -> Result<GitImportResult, ImportError> {
+    let source::git::Repository { git_dir, records: raw } = repo;
     let (rescrubbed, scrubbed) = store.rescrub(REDACTION_REVISION, |safe| redactor.redact(safe))?;
     let source = store.lock_source(git_dir.as_os_str().as_bytes())?;
     if let Some(kind) = source.stored_kind().filter(|k| *k != SourceKind::Git) {
@@ -625,8 +622,6 @@ pub enum ImportError {
     ChangedDuringImport(PathBuf),
     /// Another import holds the store's write lock.
     Busy,
-    /// Reading a repository through `git` failed; nothing was stored.
-    Git(source::git::GitError),
     Store(StoreError),
 }
 
@@ -659,7 +654,6 @@ impl std::fmt::Display for ImportError {
                 write!(f, "{}: changed while it was being imported; nothing was stored, try again", path.display())
             }
             Self::Busy => write!(f, "{}", StoreError::Busy),
-            Self::Git(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "store error: {e}"),
         }
     }
@@ -1640,6 +1634,10 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
+    fn read_git(repo: &Path) -> source::git::Repository {
+        source::git::read(repo).unwrap()
+    }
+
     fn git_texts(store: &Store) -> Vec<(ObservationKind, Option<i64>, String)> {
         let mut rows = store.recent(1000).unwrap();
         rows.reverse();
@@ -1666,7 +1664,7 @@ mod tests {
 
         let mut store = Store::open_memory().unwrap();
         let redactor = Redactor::new();
-        let r = import_git(&mut store, &repo.join(".git"), &redactor).unwrap();
+        let r = import_git(&mut store, read_git(&repo.join(".git")), &redactor).unwrap();
         assert_eq!((r.outcome, r.reflog_stored, r.refs_stored), (Outcome::First, entries, 3));
         let rows = git_texts(&store);
         let at = Some(1_700_000_000_000);
@@ -1682,13 +1680,13 @@ mod tests {
         git(repo, &["branch", "-q", "-D", "feat"]);
         git(repo, &["stash", "drop", "-q"]);
         git(repo, &["reflog", "expire", "--expire=now", "--all"]);
-        let again = import_git(&mut store, repo, &redactor).unwrap();
+        let again = import_git(&mut store, read_git(repo), &redactor).unwrap();
         assert_eq!((again.outcome, again.reflog_stored, again.refs_stored), (Outcome::Unchanged, 0, 0));
         assert_eq!(git_texts(&store), rows);
 
         // A new commit moves HEAD and main: two entries, and main's new place.
         git(repo, &["commit", "-q", "--allow-empty", "-m", "three"]);
-        let next = import_git(&mut store, repo, &redactor).unwrap();
+        let next = import_git(&mut store, read_git(repo), &redactor).unwrap();
         assert_eq!((next.outcome, next.reflog_stored, next.refs_stored), (Outcome::Appended, 2, 1));
         let after = git_texts(&store);
         assert_eq!(&after[..rows.len()], &rows[..]);
@@ -1705,20 +1703,12 @@ mod tests {
         git(&repo, &["worktree", "add", "-q", "-b", "side", "../wt"]);
         git(&dir.path().join("wt"), &["commit", "-q", "--allow-empty", "-m", "two"]);
         let mut store = Store::open_memory().unwrap();
-        let first = import_git(&mut store, &repo, &Redactor::new()).unwrap();
+        let first = import_git(&mut store, read_git(&repo), &Redactor::new()).unwrap();
         let rows = git_texts(&store);
         assert!(rows.iter().any(|(_, _, s)| s.ends_with(" commit: two")), "the worktree's moves: {rows:#?}");
-        let again = import_git(&mut store, &dir.path().join("wt"), &Redactor::new()).unwrap();
+        let again = import_git(&mut store, read_git(&dir.path().join("wt")), &Redactor::new()).unwrap();
         assert_eq!((first.outcome, again.outcome), (Outcome::First, Outcome::Unchanged), "{:#?}", git_texts(&store));
     }
 
-    #[test]
-    fn a_directory_that_is_no_repository_stores_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::open_memory().unwrap();
-        let err = import_git(&mut store, dir.path(), &Redactor::new()).unwrap_err();
-        assert!(err.to_string().contains("not a git repository"), "{err}");
-        assert_eq!(store.observation_count().unwrap(), 0);
-    }
 
 }

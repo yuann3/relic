@@ -77,14 +77,28 @@ impl std::error::Error for GitError {}
 /// itself or a linked worktree. A worktree's own Git directory would make
 /// it a second source holding every reflog entry again. As bytes: a path
 /// need not be UTF-8, and a lossy one names no directory.
-pub fn git_dir(repo: &Path) -> Result<PathBuf, GitError> {
+fn git_dir(repo: &Path) -> Result<PathBuf, GitError> {
     use std::os::unix::ffi::OsStrExt;
     let out = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
     Ok(PathBuf::from(std::ffi::OsStr::from_bytes(out.strip_suffix(b"\n").unwrap_or(&out))))
 }
 
-/// Every reflog entry, oldest first, then every ref.
-pub fn read(repo: &Path) -> Result<Vec<RawRecord>, GitError> {
+/// A repository as read: what identifies it, and its records.
+pub struct Repository {
+    pub git_dir: PathBuf,
+    /// Every reflog entry, oldest first, then every ref.
+    pub records: Vec<RawRecord>,
+}
+
+/// Read the repository at `repo`: its top level, a subdirectory, its Git
+/// directory or a linked worktree.
+pub fn read(repo: &Path) -> Result<Repository, GitError> {
+    let git_dir = git_dir(repo)?;
+    let records = records(&git_dir)?;
+    Ok(Repository { git_dir, records })
+}
+
+fn records(repo: &Path) -> Result<Vec<RawRecord>, GitError> {
     // `%gD` with unix dates is `<ref>@{<seconds>}`; a ref name cannot hold
     // `@{`. One entry per line: a reflog subject is one line.
     let reflog = git(repo, &["log", "--walk-reflogs", "--all", "--date=unix", "--format=%gD%x00%H%x00%gs"])?;

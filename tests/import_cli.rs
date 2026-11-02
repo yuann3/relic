@@ -318,3 +318,24 @@ fn a_repository_whose_own_config_names_a_file_in_home_imports() {
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 }
+
+#[test]
+fn a_directory_git_cannot_read_leaves_no_database_and_is_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo_in(dir.path());
+    // A branch at an object that is not there: `git log` fails.
+    std::fs::write(repo.join(".git/refs/heads/broken"), format!("{}\n", "1".repeat(40))).unwrap();
+    let db = dir.path().join("relic.db");
+    let out = Command::new(env!("CARGO_BIN_EXE_relic")).arg("import").arg(&repo).arg("--db").arg(&db).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains(&format!("{}: git log failed", repo.display())), "{stderr}");
+    assert!(!db.exists(), "a database was left behind");
+
+    let plain = dir.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_relic")).arg("import").arg(&plain).arg("--db").arg(&db).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.code() == Some(2) && stderr.contains("not a git repository"), "{stderr}");
+    assert!(!db.exists(), "a database was left behind");
+}

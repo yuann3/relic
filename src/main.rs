@@ -92,14 +92,15 @@ fn run(cmd: Command) -> Result<ExitCode> {
             }
             let owns_dir = cli::owns_data_dir(&db);
             let db = cli::resolve_db(db)?;
-            // Git first, so a directory that is no repository leaves no store.
-            relic::source::git::git_dir(&path).map_err(|e| format!("{}: {e}", shown(&path)))?;
+            // All of Git before the store: a directory that is no repository,
+            // or one git cannot read, leaves no store behind.
+            let repo = relic::source::git::read(&path).map_err(|e| format!("{}: {e}", shown(&path)))?;
             if let Some(dir) = db.parent() {
                 std::fs::create_dir_all(dir)?;
             }
             tighten(&db, owns_dir);
             let r = match Store::open(&db).map_err(ImportError::from).and_then(|mut store| {
-                relic::import::import_git(&mut store, &path, &relic::redact::Redactor::new())
+                relic::import::import_git(&mut store, repo, &relic::redact::Redactor::new())
             }) {
                 Err(ImportError::Busy) => {
                     eprintln!("relic: busy: another import is writing {}; try again", shown(&db));
@@ -125,7 +126,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
             }
             let (moves, refs) = (r.reflog_stored, r.refs_stored);
             match r.outcome {
-                Outcome::Unchanged => eprintln!("{name}: no new reflog entries or refs since last import"),
+                Outcome::Unchanged => eprintln!("{name}: no new reflog entries or refs"),
                 Outcome::First => eprintln!("{name}: stored {moves} reflog entries and {refs} refs in {}", shown(&db)),
                 _ => eprintln!("{name}: added {moves} reflog entries and {refs} refs"),
             }
