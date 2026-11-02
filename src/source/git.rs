@@ -132,11 +132,19 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
         .arg(repo)
         .args(args)
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C");
+    // Passed on only when set: an empty PATH searches the current
+    // directory, where anyone could have left a `git`. HOME expands a `~` in
+    // the repository's own config; GIT_CONFIG_GLOBAL still keeps
+    // ~/.gitconfig out.
+    for var in ["PATH", "HOME"] {
+        if let Some(value) = std::env::var_os(var) {
+            cmd.env(var, value);
+        }
+    }
     let shown = args.first().copied().unwrap_or_default().to_string();
     match bounded(cmd, TIMEOUT, OUTPUT_MAX) {
         Ok(Run::Done { status, stdout, .. }) if status.success() => Ok(stdout),

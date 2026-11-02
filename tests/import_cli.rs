@@ -1,6 +1,7 @@
 //! `relic import` and `relic forget` as processes: a busy store, relative path
 //! spellings, the shell a file is read as, what a failed import leaves
-//! behind, rescrub, forgetting, and file modes.
+//! behind, rescrub, forgetting, file modes, and how a Git repository's
+//! import runs git.
 
 use std::process::Command;
 
@@ -254,4 +255,66 @@ fn a_write_open_leaves_relics_own_files_owner_only() {
     let (code, stderr) = relic(home.path(), &["import", ".zsh_history", "--db", other.path().join("x.db").to_str().unwrap()]);
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!((mode(other.path()), mode(&other.path().join("x.db"))), (0o755, 0o600));
+}
+
+/// `git` in `dir`, with no config but the repository's own.
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn repo_in(dir: &std::path::Path) -> std::path::PathBuf {
+    let repo = dir.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    repo
+}
+
+#[test]
+fn a_git_import_never_runs_a_git_left_in_the_current_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo_in(dir.path());
+    let trap = dir.path().join("trap");
+    std::fs::create_dir(&trap).unwrap();
+    std::fs::write(trap.join("git"), "#!/bin/sh\n/usr/bin/touch ran\n").unwrap();
+    std::fs::set_permissions(trap.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // No PATH at all: the default search path applies, not the current
+    // directory.
+    let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+        .current_dir(&trap)
+        .env_clear()
+        .arg("import")
+        .arg(&repo)
+        .arg("--db")
+        .arg(dir.path().join("relic.db"))
+        .output()
+        .unwrap();
+    assert!(!trap.join("ran").exists(), "relic ran ./git: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_repository_whose_own_config_names_a_file_in_home_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo_in(dir.path());
+    git(&repo, &["config", "include.path", "~/.gitconfig-extra"]);
+    let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+        .env("HOME", dir.path())
+        .arg("import")
+        .arg(&repo)
+        .arg("--db")
+        .arg(dir.path().join("relic.db"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 }
