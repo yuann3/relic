@@ -324,7 +324,8 @@ pub struct GitImportResult {
 /// Import a repository's reflog entries and refs, storing only what the
 /// store does not hold yet. Nothing is ever removed: a branch deleted or a
 /// reflog expired in Git stays evidence here, which is what recovering it
-/// needs. `repo` may be the top level, a subdirectory or the Git directory.
+/// needs. `repo` may be the top level, a subdirectory, the Git directory or
+/// a linked worktree.
 pub fn import_git(store: &mut Store, repo: &Path, redactor: &Redactor) -> Result<GitImportResult, ImportError> {
     // Before the store: a path that is no repository locks nothing.
     let git_dir = source::git::git_dir(repo).map_err(ImportError::Git)?;
@@ -1692,6 +1693,23 @@ mod tests {
         let after = git_texts(&store);
         assert_eq!(&after[..rows.len()], &rows[..]);
         assert!(after[rows.len()..].iter().all(|(_, _, s)| s.contains("three")), "{after:#?}");
+    }
+
+    #[test]
+    fn a_linked_worktree_is_the_repository_it_belongs_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&repo, &["worktree", "add", "-q", "-b", "side", "../wt"]);
+        git(&dir.path().join("wt"), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let mut store = Store::open_memory().unwrap();
+        let first = import_git(&mut store, &repo, &Redactor::new()).unwrap();
+        let rows = git_texts(&store);
+        assert!(rows.iter().any(|(_, _, s)| s.ends_with(" commit: two")), "the worktree's moves: {rows:#?}");
+        let again = import_git(&mut store, &dir.path().join("wt"), &Redactor::new()).unwrap();
+        assert_eq!((first.outcome, again.outcome), (Outcome::First, Outcome::Unchanged), "{:#?}", git_texts(&store));
     }
 
     #[test]

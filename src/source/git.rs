@@ -67,12 +67,15 @@ impl std::fmt::Display for GitError {
 
 impl std::error::Error for GitError {}
 
-/// The repository's absolute Git directory, which identifies it: the same
-/// from its top level, any subdirectory or the `.git` directory itself.
+/// The repository's absolute common Git directory, which identifies it:
+/// the same from its top level, any subdirectory, the `.git` directory
+/// itself or a linked worktree. A worktree's own Git directory would make
+/// it a second source holding every reflog entry again. As bytes: a path
+/// need not be UTF-8, and a lossy one names no directory.
 pub fn git_dir(repo: &Path) -> Result<PathBuf, GitError> {
-    let out = git(repo, &["rev-parse", "--absolute-git-dir"])?;
-    let dir = String::from_utf8_lossy(&out);
-    Ok(PathBuf::from(dir.trim_end_matches('\n')))
+    use std::os::unix::ffi::OsStrExt;
+    let out = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(out.strip_suffix(b"\n").unwrap_or(&out))))
 }
 
 /// Every reflog entry, oldest first, then every ref.
