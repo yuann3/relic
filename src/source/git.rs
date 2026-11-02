@@ -102,11 +102,10 @@ fn records(repo: &Path) -> Result<Vec<RawRecord>, GitError> {
     // `%gD` with unix dates is `<ref>@{<seconds>}`; a ref name cannot hold
     // `@{`. One entry per line: a reflog subject is one line.
     let reflog = git(repo, &["log", "--walk-reflogs", "--all", "--date=unix", "--format=%gD%x00%H%x00%gs"])?;
-    // `git log -g` is newest first within each ref: reversed, each ref runs
-    // oldest first, and a stable sort by time interleaves them.
+    // `git log -g --all` is newest first, every ref's entries interleaved
+    // by when they were written: reversed, the order things moved in.
     let mut records = parse(&reflog, "log", reflog_entry)?;
     records.reverse();
-    records.sort_by_key(|r| r.timestamp);
     let refs = git(repo, &["for-each-ref", "--format=%(refname)%00%(objectname)%00%(contents:subject)"])?;
     records.extend(parse(&refs, "for-each-ref", ref_entry)?);
     Ok(records)

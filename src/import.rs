@@ -1620,6 +1620,11 @@ mod tests {
     /// `git` in `dir` with a fixed identity and clock, so reflog times are
     /// known and repeated entries fall in one second.
     fn git(dir: &Path, args: &[&str]) -> String {
+        git_at(dir, 1_700_000_000, args)
+    }
+
+    /// [`git`] with the clock at `at` seconds.
+    fn git_at(dir: &Path, at: i64, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -1627,7 +1632,7 @@ mod tests {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
-            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .env("GIT_COMMITTER_DATE", format!("{at} +0000"))
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
@@ -1691,6 +1696,38 @@ mod tests {
         let after = git_texts(&store);
         assert_eq!(&after[..rows.len()], &rows[..]);
         assert!(after[rows.len()..].iter().all(|(_, _, s)| s.contains("three")), "{after:#?}");
+    }
+
+    #[test]
+    fn entries_are_stored_in_gits_order_and_a_repeat_of_a_stored_one_is_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        // Two in one second, then one later: HEAD's and main's entries
+        // interleave by time, and within a second keep Git's order.
+        git(repo, &["commit", "-q", "--allow-empty", "-m", "a"]);
+        git(repo, &["commit", "-q", "--allow-empty", "-m", "b"]);
+        git_at(repo, 1_700_000_100, &["commit", "-q", "--allow-empty", "-m", "c"]);
+        git_at(repo, 1_700_000_100, &["reset", "-q", "--hard", "HEAD"]);
+        // Long after the commit it points at: stored when the ref moved, not
+        // by commit date.
+        git_at(repo, 1_700_000_200, &["branch", "late", "HEAD~2"]);
+        let mut store = Store::open_memory().unwrap();
+        import_git(&mut store, read_git(repo), &Redactor::new()).unwrap();
+        let rows = git_texts(&store);
+        let reflog: Vec<_> = rows.iter().filter(|(k, _, _)| *k == ObservationKind::GitReflog).collect();
+        assert!(reflog.windows(2).all(|w| w[0].1 <= w[1].1), "oldest first: {reflog:#?}");
+        let head: Vec<&str> = reflog
+            .iter()
+            .filter(|(_, _, s)| s.starts_with("git reflog HEAD "))
+            .map(|(_, _, s)| s.rsplit_once(' ').unwrap().1)
+            .collect();
+        assert_eq!(head, ["a", "b", "c", "HEAD"], "{reflog:#?}");
+
+        // The same move again, in the same second: a second entry alike.
+        git_at(repo, 1_700_000_100, &["reset", "-q", "--hard", "HEAD"]);
+        let again = import_git(&mut store, read_git(repo), &Redactor::new()).unwrap();
+        assert_eq!((again.reflog_stored, again.refs_stored), (1, 0));
     }
 
     #[test]
