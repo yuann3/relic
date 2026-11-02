@@ -73,6 +73,8 @@ pub fn call_all(c: &mut Calls, jobs: Vec<Job>) -> Result<Replies, Stop> {
         while in_flight < c.concurrency.max(1) {
             let Some((i, job)) = pending.next() else { break };
             match admit(c, job)? {
+                // A stop raised while its audit was emitted holds it back.
+                Ok(_) if c.cancel.load(Ordering::Relaxed) => return Err(Stop::Cancelled),
                 Ok(flight) => {
                     match send(c, &tx, i, &flight.req, Duration::ZERO) {
                         Ok(()) => in_flight += 1,

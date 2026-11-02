@@ -572,7 +572,8 @@ impl RecallLog {
 /// Answer `question` from the evidence in `store` through a bounded
 /// investigation, logging it to `log`. Setting `cancel` from any thread or
 /// a signal handler ends it with [`RecallOutcome::Cancelled`]. A log that
-/// cannot be opened or written fails the recall: nothing leaves unaudited.
+/// cannot be opened or written fails the recall, setting `cancel` to stop
+/// it mid-way: nothing leaves unaudited.
 pub fn recall(
     question: &str,
     store: &Store,
@@ -584,25 +585,34 @@ pub fn recall(
     // Once, here: the report shows the question as it was sent.
     let question = Redactor::new().import(question);
     let log_error = |e: std::io::Error| format!("could not write the recall log {}: {e}", log.display());
+    let unlogged = |question, e| {
+        let failed = InvestigationResult {
+            status: InvestigationStatus::Failed(log_error(e)),
+            finish: None,
+            cited: HashMap::new(),
+            cost_microusd: None,
+            turns: 0,
+            child_calls: 0,
+        };
+        report(question, failed, Vec::new())
+    };
     let mut log = match RecallLog::open(log) {
         Ok(log) => log,
-        Err(e) => {
-            let failed = InvestigationResult {
-                status: InvestigationStatus::Failed(log_error(e)),
-                finish: None,
-                cited: HashMap::new(),
-                cost_microusd: None,
-                turns: 0,
-                child_calls: 0,
-            };
-            return report(question, failed, Vec::new());
-        }
+        Err(e) => return unlogged(question, e),
     };
     let target = model.target();
     log.line("start", serde_json::json!({"relic_version": env!("CARGO_PKG_VERSION"), "profile": target.profile, "origin": target.origin}));
+    if let Some(e) = log.failed.take() {
+        return unlogged(question, e);
+    }
     let mut models: Vec<String> = Vec::new();
     let mut progress = |p: Progress| {
         log.progress(&p);
+        // A request whose audit line failed must not leave: stop before it
+        // is sent. `finish` turns the stop into the log's failure.
+        if log.failed.is_some() {
+            cancel.store(true, Ordering::SeqCst);
+        }
         if let Progress::Replied { returned_model: Some(m), .. } = &p
             && !models.contains(m)
         {
@@ -995,5 +1005,28 @@ mod tests {
     fn missing_evidence_is_none() {
         let store = store_with(&["ls"]);
         assert!(open_evidence(&store, 999, 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_log_that_breaks_after_it_opened_stops_the_request_it_could_not_audit() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A pipe whose reader goes away after the start line: the send line
+        // then fails with EPIPE.
+        let log = dir.path().join("relic.db.recall.log");
+        let c_path = std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
+        // SAFETY: mkfifo of a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let mut reader = Some(std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&log).unwrap());
+        let model = Arc::new(crate::rlm::model::FakeModel::new());
+        let r = recall("q", &store_with(&["ls"]), model.clone(), &log, &Arc::default(), &mut |p| {
+            if matches!(p, Progress::RootCall { .. }) {
+                drop(reader.take());
+            }
+        });
+        assert_eq!(r.outcome, RecallOutcome::Failed);
+        assert!(r.error.as_deref().is_some_and(|e| e.contains("could not write the recall log")), "{:?}", r.error);
+        assert!(model.requests().is_empty(), "a request left without its audit");
     }
 }

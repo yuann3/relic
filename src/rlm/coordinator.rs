@@ -775,11 +775,15 @@ mod tests {
             contradictions: vec![],
             missing: vec!["m".into()],
         };
-        model.add_root_response(RootActionV1 { version: 1, expected_state_version: 0, kind: RootActionKind::Finish, plan: None, finish: Some(finish) });
-
+        let action = RootActionV1 { version: 1, expected_state_version: 0, kind: RootActionKind::Finish, plan: None, finish: Some(finish) };
         // Ctrl-C while the root call is out.
         let cancel = Arc::new(AtomicBool::new(false));
-        let result = run_investigation("q", &store, model.clone(), BudgetV1::prototype_default(), &cancel, &mut |_| cancel.store(true, Ordering::Relaxed));
+        let flag = Arc::clone(&cancel);
+        model.add_root_fn(move |_| {
+            flag.store(true, Ordering::Relaxed);
+            serde_json::to_string(&action).unwrap()
+        });
+        let result = run_investigation("q", &store, model.clone(), BudgetV1::prototype_default(), &cancel, &mut |_| {});
         assert_eq!(model.root_states().len(), 1, "the call was made");
         assert_eq!(result.status, InvestigationStatus::Cancelled);
         assert!(result.finish.is_none());
