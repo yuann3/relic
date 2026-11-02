@@ -45,7 +45,7 @@ pub enum Stop {
 pub struct Calls<'r> {
     pub model: &'r Arc<dyn ModelBoundary>,
     pub ledger: &'r mut BudgetLedger,
-    pub cancel: &'r AtomicBool,
+    pub cancel: &'r Arc<AtomicBool>,
     pub progress: &'r mut dyn FnMut(Progress),
     pub deadline: Instant,
     pub concurrency: usize,
@@ -171,11 +171,15 @@ fn send(
     req: &EgressRequest,
     delay: Duration,
 ) -> Result<(), String> {
-    let (model, req, tx, deadline) = (Arc::clone(c.model), req.clone(), tx.clone(), c.deadline);
+    let (model, req, tx, deadline, cancel) = (Arc::clone(c.model), req.clone(), tx.clone(), c.deadline, Arc::clone(c.cancel));
     let builder = std::thread::Builder::new().name("relic-model".into());
     crate::signal::spawn(builder, move || {
         std::thread::sleep(delay);
-        let _ = tx.send((i, model.call(&req, deadline)));
+        // A stop while waiting out a Retry-After: `call_all` has returned,
+        // and nothing may leave after it.
+        if !cancel.load(Ordering::Relaxed) {
+            let _ = tx.send((i, model.call(&req, deadline)));
+        }
     })
     .map(drop)
     .map_err(|e| format!("could not start a model call: {e}"))
@@ -246,7 +250,7 @@ mod tests {
         model: Arc<Script>,
         budget: BudgetV1,
         jobs: Vec<Job>,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> (Result<Replies, Stop>, Vec<Progress>, BudgetLedger, u16) {
         let model: Arc<dyn ModelBoundary> = model;
         let mut ledger = BudgetLedger::new(budget.clone());
@@ -278,7 +282,7 @@ mod tests {
             _ => None,
         };
         let budget = BudgetV1 { max_concurrency: 1, ..BudgetV1::prototype_default() };
-        let (out, events, _, _) = run(script(vec![ok(), ok()]), budget.clone(), jobs(2), &AtomicBool::new(false));
+        let (out, events, _, _) = run(script(vec![ok(), ok()]), budget.clone(), jobs(2), &Arc::default());
         assert!(out.is_ok());
         let seen: Vec<String> = events.iter().filter_map(label).collect();
         let send = seen[1].clone();
@@ -288,7 +292,7 @@ mod tests {
         // Out of output tokens after the bytes were counted: nothing leaves,
         // so nothing is audited as leaving.
         let budget = BudgetV1 { reserved_output_tokens: 0, ..budget };
-        let (out, events, _, _) = run(script(vec![ok()]), budget, jobs(1), &AtomicBool::new(false));
+        let (out, events, _, _) = run(script(vec![ok()]), budget, jobs(1), &Arc::default());
         assert!(out.is_err());
         assert!(events.iter().all(|e| label(e).is_none()), "{events:?}");
     }
@@ -314,7 +318,7 @@ mod tests {
         for (outcomes, succeeds, expected_retries) in cases {
             let label = format!("{outcomes:?}");
             let model = script(outcomes);
-            let (out, events, ledger, _) = run(model.clone(), BudgetV1::prototype_default(), jobs(1), &AtomicBool::new(false));
+            let (out, events, ledger, _) = run(model.clone(), BudgetV1::prototype_default(), jobs(1), &Arc::default());
             let reply = out.unwrap().remove(0);
             assert_eq!(reply.is_ok(), succeeds, "{label}");
             assert_eq!(retries(&events), expected_retries, "{label}");
@@ -328,7 +332,7 @@ mod tests {
     #[test]
     fn at_most_max_concurrency_children_are_in_flight_and_replies_keep_job_order() {
         let model = Arc::new(Script { delay: Duration::from_millis(30), ..Script::default() });
-        let (out, _, _, _) = run(model.clone(), BudgetV1::prototype_default(), jobs(6), &AtomicBool::new(false));
+        let (out, _, _, _) = run(model.clone(), BudgetV1::prototype_default(), jobs(6), &Arc::default());
         assert_eq!(model.most_live.load(Ordering::SeqCst), 4);
         // The script echoes each request, so a reply filed under the wrong
         // job shows here.
@@ -355,12 +359,27 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_waiting_out_its_retry_after_is_never_sent_once_cancelled() {
+        let model = script(vec![Err(ModelError::RateLimited { retry_after: Some(Duration::from_millis(300)) })]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let (out, _, _, _) = run(model.clone(), BudgetV1::prototype_default(), jobs(1), &cancel);
+        assert_eq!(out.unwrap_err(), Stop::Cancelled);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1, "the retry stayed home");
+    }
+
+    #[test]
     fn every_fence_stops_admission() {
         let fence = |edit: &dyn Fn(&mut BudgetV1), prices: Option<Prices>| {
             let mut budget = BudgetV1::prototype_default();
             edit(&mut budget);
             let model = Arc::new(Script { prices, ..Script::default() });
-            let (out, _, _, admitted) = run(model, budget, jobs(3), &AtomicBool::new(false));
+            let (out, _, _, admitted) = run(model, budget, jobs(3), &Arc::default());
             (out.unwrap_err(), admitted)
         };
         use BudgetExhausted::*;
@@ -374,14 +393,14 @@ mod tests {
         let dollar = Some(Prices { input_per_mtok: 1_000_000, output_per_mtok: 0 });
         assert_eq!(fence(&|b| b.max_cost_microusd = Some(3000), dollar), (Stop::Budget(Cost), 1));
         // Without prices the cost is unknown, not fenced.
-        let (out, _, _, _) = run(script(vec![]), BudgetV1 { max_cost_microusd: Some(0), ..BudgetV1::prototype_default() }, jobs(3), &AtomicBool::new(false));
+        let (out, _, _, _) = run(script(vec![]), BudgetV1 { max_cost_microusd: Some(0), ..BudgetV1::prototype_default() }, jobs(3), &Arc::default());
         assert!(out.is_ok());
     }
 
     #[test]
     fn reported_usage_gives_back_what_a_call_did_not_spend() {
         let usage = |completion| Ok(Reply { usage: Some(Usage { prompt_tokens: 10, completion_tokens: completion }), ..Reply::default() });
-        let (_, _, ledger, _) = run(script(vec![usage(100), Ok(Reply::default())]), BudgetV1::prototype_default(), jobs(2), &AtomicBool::new(false));
+        let (_, _, ledger, _) = run(script(vec![usage(100), Ok(Reply::default())]), BudgetV1::prototype_default(), jobs(2), &Arc::default());
         // 768 reserved each; the first reported 100, the second nothing.
         assert_eq!(BudgetV1::prototype_default().reserved_output_tokens - ledger.remaining().reserved_output_tokens, 100 + 768);
     }
