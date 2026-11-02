@@ -31,12 +31,16 @@ pub enum IntegrityError {
     RevisionMismatch,
     OrdinalMismatch,
     WrongInvestigation,
-    ObservationNotFound,
 }
 
 impl std::fmt::Display for IntegrityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(match self {
+            Self::ContentHashMismatch => "the record's text changed since it was cited",
+            Self::RevisionMismatch => "the record is in another revision than the one cited",
+            Self::OrdinalMismatch => "the record is at another place than the one cited",
+            Self::WrongInvestigation => "the evidence id is from another investigation",
+        })
     }
 }
 

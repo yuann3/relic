@@ -11,7 +11,12 @@ pub enum FinishValidationError {
 
 impl std::fmt::Display for FinishValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::UnresolvableCitation(id) => write!(f, "it cites {id}, which this investigation never showed it"),
+            Self::UncitedClaim { claim_text } => write!(f, "the claim \"{claim_text}\" cites no record"),
+            Self::UncitedProcedureStep { step_text } => write!(f, "the step \"{step_text}\" cites no record"),
+            Self::AnsweredWithoutClaims => f.write_str("it answered without any claim"),
+        }
     }
 }
 

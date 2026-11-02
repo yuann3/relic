@@ -652,7 +652,7 @@ mod tests {
         let relate = json!({"version": 1, "expected_state_version": 0, "kind": "plan", "finish": null,
             "plan": {"ops": [{"op": "relate", "op_id": "r1"}]}});
         let (_, verdict, _, _) = run(child("item_0"), relate.to_string());
-        assert!(verdict.unwrap_err().starts_with("root call: NotExecuted"));
+        assert!(verdict.unwrap_err().starts_with("root call: relate is not run in this version"));
     }
 
     #[test]

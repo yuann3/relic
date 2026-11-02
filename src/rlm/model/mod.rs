@@ -133,6 +133,15 @@ pub enum OutputError {
     Malformed(String),
 }
 
+impl std::fmt::Display for OutputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Oversize { bytes } => write!(f, "{bytes} bytes, over the cap"),
+            Self::Malformed(e) => write!(f, "malformed: {e}"),
+        }
+    }
+}
+
 /// Parse a model's JSON output: refused over `max` bytes before parsing, every
 /// string redacted before anything stores or shows it (ADR 0004), then
 /// typed, which refuses unknown fields.

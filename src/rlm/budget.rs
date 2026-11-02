@@ -38,7 +38,19 @@ pub enum BudgetExhausted {
 
 impl std::fmt::Display for BudgetExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(match self {
+            Self::RootCalls => "out of root calls",
+            Self::PlanOps => "out of plan operations",
+            Self::ChildCalls => "out of child calls",
+            Self::RowsReturned => "out of rows to return",
+            Self::EvidenceHandles => "out of evidence handles",
+            Self::LocalMaterializedBytes => "out of bytes to read from the store",
+            Self::ModelEgressBytes => "out of bytes to send to the model",
+            Self::ProviderAttempts => "out of provider attempts",
+            Self::OutputTokens => "out of output tokens",
+            Self::Cost => "out of money: the cost cap is spent",
+            Self::WallClock => "out of time",
+        })
     }
 }
 

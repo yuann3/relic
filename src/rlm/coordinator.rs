@@ -10,9 +10,9 @@ use crate::rlm::executor::{self, ExecError};
 use crate::rlm::finish;
 use crate::rlm::calls::{Calls, Job, Stop, call_all};
 use crate::rlm::model::egress::{PayloadAudit, Role};
-use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary, ModelError, parse_output};
+use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary, parse_output};
 use crate::rlm::protocol::*;
-use crate::rlm::validate::{self, HandleKind, Op, ValidationError};
+use crate::rlm::validate::{self, HandleKind, Op};
 use crate::store::Store;
 
 /// Terminal result of an investigation.
@@ -89,16 +89,16 @@ impl std::fmt::Display for Progress {
 
 #[derive(Debug)]
 pub enum CoordinatorError {
-    Validation(ValidationError),
     Execution(ExecError),
-    Model(ModelError),
     Budget(BudgetExhausted),
-    InvalidAction(String),
 }
 
 impl std::fmt::Display for CoordinatorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Execution(e) => e.fmt(f),
+            Self::Budget(b) => b.fmt(f),
+        }
     }
 }
 
@@ -202,7 +202,7 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
         run.turns += 1;
         let action: RootActionV1 = match parse_output(&reply.body, ROOT_RESULT_MAX) {
             Ok(action) => action,
-            Err(e) => return (InvestigationStatus::Failed(format!("root action: {e:?}")), None),
+            Err(e) => return (InvestigationStatus::Failed(format!("root action: {e}")), None),
         };
         // A reply that lands after cancel is dropped, not acted on: a late
         // finish must not pass for a completed investigation.

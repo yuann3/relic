@@ -52,7 +52,14 @@ impl std::fmt::Display for ChildRejection {
 
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Store(e) => write!(f, "reading the store: {e}"),
+            Self::Search(e) => e.fmt(f),
+            Self::HandleNotFound(h) => write!(f, "no result named {h}"),
+            Self::WrongKind { handle, expected } => write!(f, "{handle} is not {expected}"),
+            Self::Budget(b) => b.fmt(f),
+            Self::Cancelled => f.write_str("cancelled"),
+        }
     }
 }
 

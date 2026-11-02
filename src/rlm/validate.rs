@@ -45,9 +45,40 @@ pub enum ValidationError {
     ExpandWindowExceeded { op_id: String, per_side: u32, max: u32 },
 }
 
+impl std::fmt::Display for HandleKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EvidenceSet => "an evidence set",
+            Self::AssessmentSet => "an assessment set",
+            Self::Inspection => "an inspection",
+        })
+    }
+}
+
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::EmptyPlan => f.write_str("the plan has no operations"),
+            Self::NotExecuted(op) => write!(f, "{op} is not run in this version"),
+            Self::TooManyOps { count, max } => write!(f, "{count} operations, over the {max} a plan may hold"),
+            Self::DuplicateOpId(id) => write!(f, "op_id {id} is used twice"),
+            Self::UnknownInputRef { op_id, ref_id } => write!(f, "{op_id} reads {ref_id}, which no operation made"),
+            Self::ForwardReference { op_id, ref_id } => write!(f, "{op_id} reads {ref_id} before it is made"),
+            Self::WrongInputKind { op_id, expected, got } => write!(f, "{op_id} needs {expected}, not {got}"),
+            Self::StaleStateVersion { expected, got } => {
+                write!(f, "the plan is for state version {got}, and the state is at {expected}")
+            }
+            Self::SearchTooManyTerms { op_id, count, max } => write!(f, "{op_id} searches {count} terms, over the {max} allowed"),
+            Self::SearchNoTerms { op_id } => write!(f, "{op_id} searches no terms"),
+            Self::LimitZero { op_id } => write!(f, "{op_id} has a limit of 0"),
+            Self::AssessObjectiveTooLong { op_id, bytes, max } => {
+                write!(f, "{op_id}'s objective is {bytes} bytes, over the {max} allowed")
+            }
+            Self::AssessMaxItemsExceeded { op_id, count, max } => write!(f, "{op_id} assesses {count} items, over the {max} allowed"),
+            Self::ExpandWindowExceeded { op_id, per_side, max } => {
+                write!(f, "{op_id} expands {per_side} records each side, over the {max} allowed")
+            }
+        }
     }
 }
 
