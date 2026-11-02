@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::redact::Redactor;
 use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
 use crate::rlm::coordinator::Progress;
 use crate::rlm::model::egress::{EgressError, EgressRequest, Role};
@@ -96,7 +97,9 @@ pub fn call_all(c: &mut Calls, jobs: Vec<Job>) -> Result<Replies, Stop> {
         match outcome {
             Ok(reply) => {
                 release_unspent(c, flight, &reply);
-                (c.progress)(Progress::Replied { role: flight.req.role(), returned_model: reply.returned_model.clone() });
+                // Provider text: redacted once, here, for every sink after.
+                let returned_model = reply.returned_model.as_deref().map(|m| Redactor::new().redact(m));
+                (c.progress)(Progress::Replied { role: flight.req.role(), returned_model });
                 results[i] = Some(Ok(reply));
             }
             Err(e) => match retry(c, flight, &e) {

@@ -20,6 +20,11 @@ type Script = dyn Fn(&Value) -> Option<Value> + Send + Sync;
 /// A Chat Completions server answering each request with `script`, which
 /// sees the request's user message: the root state or the child packet.
 fn serve(script: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static) -> (String, Bodies) {
+    serve_as("scripted", script)
+}
+
+/// [`serve`], saying `model` answered.
+fn serve_as(model: &'static str, script: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static) -> (String, Bodies) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let bodies = Bodies::default();
@@ -28,13 +33,13 @@ fn serve(script: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static) -> (S
         for stream in listener.incoming() {
             let Ok(stream) = stream else { return };
             let (seen, script) = (Arc::clone(&seen), Arc::clone(&script));
-            std::thread::spawn(move || answer(stream, &seen, &*script));
+            std::thread::spawn(move || answer(stream, model, &seen, &*script));
         }
     });
     (url, bodies)
 }
 
-fn answer(mut stream: TcpStream, seen: &Bodies, script: &Script) {
+fn answer(mut stream: TcpStream, model: &str, seen: &Bodies, script: &Script) {
     let mut reader = BufReader::new(&stream);
     let mut length = 0;
     loop {
@@ -53,7 +58,7 @@ fn answer(mut stream: TcpStream, seen: &Bodies, script: &Script) {
     let user = user_message(&body);
     let (status, body) = match script(&user) {
         Some(content) => {
-            let reply = json!({"model": "scripted", "choices": [{"message": {"content": content.to_string()}, "finish_reason": "stop"}]});
+            let reply = json!({"model": model, "choices": [{"message": {"content": content.to_string()}, "finish_reason": "stop"}]});
             ("200 OK", reply.to_string())
         }
         None => ("500 Internal Server Error", json!({"error": {"message": "the scripted model is down"}}).to_string()),
@@ -359,8 +364,9 @@ fn privacy_canary_gate() {
         assert_eq!(redactor.redact(&safe), safe, "redact(redact(x)) != redact(x) for {raw:?}");
     }
 
-    // The model echoes secrets back too, in its answer and its child claims.
-    let (url, bodies) = serve(|user| {
+    // The model echoes secrets back too, in its answer, its child claims and
+    // the name the provider says answered.
+    let (url, bodies) = serve_as("token=Zq9CanaryModel9abcdefgh", |user| {
         if is_child(user) {
             return Some(supports_all(user, "it ran with token=Zq9CanaryChild8"));
         }

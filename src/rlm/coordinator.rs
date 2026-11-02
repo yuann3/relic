@@ -51,7 +51,8 @@ pub enum Progress {
     Note(String),
     /// A request is about to leave: what, where and how big (ADR 0004).
     Egress(PayloadAudit),
-    /// A model call came back; `returned_model` is what actually answered.
+    /// A model call came back; `returned_model` is what actually answered,
+    /// redacted: the provider wrote it.
     Replied { role: Role, returned_model: Option<String> },
     /// A failed call is sent again, as the retry rule allows once.
     Retry { role: Role, attempt: u8, reason: String },
