@@ -1,6 +1,6 @@
 # 0013. Skills live in a separate content-addressed catalog and activate by symlink swap
 
-Status: Accepted — provisional internals · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture](https://github.com/yuann3/relic/issues/11)
+Status: Accepted · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture](https://github.com/yuann3/relic/issues/11)
 
 ## Context
 
@@ -23,18 +23,17 @@ Binding:
 - A skill bundle is immutable content-addressed content. A skill name is a stable pointer to a bundle. Activation and rollback are explicit user actions.
 - Skill frontmatter comes from a hand-written emitter. No YAML crate ([0015](0015-dependency-envelope.md)).
 
-Provisional (the validate → compile → activate → rollback prototype confirms or replaces each item):
+Settled by the [V2](https://github.com/yuann3/relic/issues/33) prototype (`src/catalog/`), each item marked confirmed or replaced:
 
-- Storage: a separate `catalog.db` with `synchronous=FULL`, plus a content-addressed directory under the XDG data directory. The split is justified by FULL sync and its own failure blast radius, not by reconstructibility: neither skills nor the observation store can be fully rebuilt from sources.
-- Skills cite evidence durably by revision + ordinal + content hash, never by a per-investigation evidence handle.
-- Activation is an atomic symlink swap of `~/.claude/skills/<name>` (or project `.claude/skills/<name>`) to a `<hash>/<name>/` bundle. It requires an explicit target flag and a confirmation.
-- Rollback swaps the symlink back.
-- For any other consumer, activation in v0.1 only updates the catalog and writes nothing outside Relic's directories.
-- Prime activation is deferred until research finds a documented skills directory.
+- Confirmed, with one change: a separate `catalog.db` with `synchronous=FULL`, and also `fullfsync=ON` and `checkpoint_fullfsync=ON`, because FULL alone is not durable on macOS. Replaced: the content-addressed directory and `catalog.db` sit beside the store in `<db>.catalog/`, not in a fixed XDG path, so a `--db` store keeps its own skills. The split is justified by FULL sync and its own failure blast radius, not by reconstructibility: neither skills nor the observation store can be fully rebuilt from sources.
+- Replaced: skills cite evidence durably by observation id plus a keyed blake3 hash of its safe text, never by a per-investigation evidence handle. Revision + ordinal breaks on exactly the events an id does and adds nothing.
+- Replaced: activation is an atomic symlink swap of `~/.agents/skills/<name>` (`--user`) or `<project>/.agents/skills/<name>` (`--project`) to a `<hash>/<name>/` bundle, plus the same under `.claude/skills` with `--claude`. It requires that target flag and a confirmation (`--yes` when there is no terminal). It refuses a path holding anything Relic did not link, and swaps every link or none.
+- Confirmed: rollback swaps each link back to what it held before its newest activation not yet undone, or removes it.
+- Replaced: no consumer is catalog-only. `.agents/skills` reaches most harnesses, Prime included; Kiro, which does not follow skill symlinks, is not supported.
 
 ## Amends
 
-Provisional, like the items above. Both change the storage research behind [Choose the storage, search, and runtime architecture](https://github.com/yuann3/relic/issues/4):
+Both change the storage research behind [Choose the storage, search, and runtime architecture](https://github.com/yuann3/relic/issues/4):
 
 - Catalog transactions leave `store/` (the sketch at docs/research/storage-search-runtime-architecture.md:223). The open question at :49 is answered with a separate durable metadata path rather than FULL sync on the observation DB.
 - The sketch's `compile/` module (:230) becomes `catalog/`.
@@ -42,10 +41,10 @@ Provisional, like the items above. Both change the storage research behind [Choo
 ## Consequences
 
 - Quarantining or rebuilding the observation DB never touches `catalog.db` or the bundle directory.
-- Activation writes outside Relic's directories only into Claude Code's skills directory, and only after an explicit target flag and a confirmation.
+- Activation writes outside Relic's directories only into the `.agents/skills` and, on request, `.claude/skills` directory it is pointed at, and only after an explicit target flag and a confirmation.
 - The catalog adds stored state, so the privacy canary gate ([0004](0004-egress-seam-and-privacy-canary.md)) covers `catalog.db` and the bundles.
 - The pre-recall step of the reuse gate reads active catalog metadata ([0016](0016-acceptance-fixture-and-reuse-gate.md)).
-- Owner: S4, the validation/skill tracer. Order: research, then the prototype on the Git fixture, then compile, catalog, activate and rollback. When the prototype finishes, this ADR must be updated to state each provisional item as either confirmed or replaced.
+- Owner: S4, the validation/skill tracer. Order: research, then the prototype on the Git fixture, then compile, catalog, activate and rollback. V2 stated each provisional item as confirmed or replaced.
 
 ## Rejected alternatives
 
@@ -54,7 +53,8 @@ Provisional, like the items above. Both change the storage research behind [Choo
 - Citing evidence by evidence handle: evidence handles are random per investigation, and the integrity check rejects them in any other investigation by design.
 - Activation by copying the bundle into the consumer directory with a marker file: rollback would overwrite files non-atomically, and drift detection would be needed.
 - Activation that only updates the catalog, for Claude Code too: activation would then change nothing an agent loads, so no release session could show an agent picking the skill.
-- Activation for several consumers, or for Prime, in v0.1: several consumers is the out-of-scope control plane, and no documented Prime skills directory is known yet.
+- Activation for several consumers, or for Prime, in v0.1: several consumers is the out-of-scope control plane, and no documented Prime skills directory is known yet. (Superseded by V1: one cross-client directory reaches them all, with no per-consumer control plane.)
+- Activation into `~/.claude/skills` only: Claude Code is one harness of many, and the Agent Skills standard's `.agents/skills` is the directory the others share.
 
 ## Open facts
 
@@ -63,7 +63,7 @@ Provisional, like the items above. Both change the storage research behind [Choo
   - How a cited procedure that contains `[REDACTED:*]` spans becomes a reusable skill.
   - Whether skills may ship `scripts/`.
   - Whether a skill the model can invoke, and that tells an agent to run recovered steps, conflicts with the out-of-scope "silently executing recovered procedures". `disable-model-invocation: true` hides the skill from the model, so the release session in [0016](0016-acceptance-fixture-and-reuse-gate.md) could not show the model invoking it.
-- Whether the `<hash>/<name>/` layout satisfies both the spec's name-matches-directory rule and Claude Code's symlink loading. Untested.
+- Confirmed by V2: the `<hash>/<name>/` layout satisfies the spec's name-matches-directory rule, since the link and the bundle directory are both `<name>`, and V1 showed Claude Code loading it through a symlink.
 - What happens to durable citations after the observation DB is quarantined and rebuilt, and after a rescrub purges a revision ([0003](0003-redaction-policy.md) turns citations to purged rows into stale-handle errors).
-- The cost of FULL-sync pointer transactions in `catalog.db`, and how CAS fsync and rename behave on macOS and on Linux.
+- Measured on macOS by V1 (about 18 ms per activation with full syncs). A bare-ext4 Linux run is still owed to the release slice.
 - Whether Prime Agent has a documented skills directory, and where it is.

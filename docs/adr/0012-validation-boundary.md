@@ -26,7 +26,7 @@ Validation boundary (binding):
 
 Procedure shape:
 
-- `FinishV1.procedure` keeps the shape `{ text, supports }` and is marked provisional.
+- `FinishV1.procedure` keeps the shape `{ text, supports }`. [V2](https://github.com/yuann3/relic/issues/33) settled it: the compiler needs only step text and cited record ids, and takes every command from the store, not from the step.
 - A procedure step may reference only cited observations.
 - The model never authors executable argv.
 - The validation/skill prototype decides the final field set.

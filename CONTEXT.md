@@ -20,8 +20,8 @@ Relic imports local experience artifacts: shell history, shell hooks, Git and ag
 | Search | Owns query compilation, recently-imported-first ordering, opt-in `--rank`, the query budget, hot prefixes and the fzf picker. | query methods in `src/store/mod.rs`; `search` and `SearchPage` in `src/app.rs`; `src/picker.rs` | [0006](docs/adr/0006-search-ordering-and-query-budget.md), [0007](docs/adr/0007-gate-change-warm-fts-hot-prefixes.md) |
 | Recall | Owns the RLM kernel: plan admission, five executed operators, evidence handles, the budget ledger, the finish gate, cancellation and progress. | `src/rlm/{protocol,validate,evidence,budget,executor,coordinator,finish}.rs` | [0009](docs/adr/0009-rlm-kernel.md) |
 | Model Boundary | Owns the one Chat Completions adapter, `EgressRequest`, retries, pinning, fences and `relic model check`. Model adapters are the second polymorphic seam. | `src/rlm/model/` (`ModelBoundary`, `FakeModel`; `egress.rs` the `EgressRequest`, `prompt.rs` instructions and schemas, `chat.rs` the ureq client and `model check`), `src/rlm/calls.rs` (admission, fences, retry, the child pool) | [0010](docs/adr/0010-model-boundary.md), [0004](docs/adr/0004-egress-seam-and-privacy-canary.md) |
-| Validation | Owns verifier runs and validation records. | none yet (`validation/` reserved) | [0012](docs/adr/0012-validation-boundary.md) |
-| Skill Catalog | Owns skill compilation, CAS bundles, `catalog.db`, activation and rollback. | none yet (`catalog/` reserved) | [0013](docs/adr/0013-skill-catalog-direction.md) |
+| Validation | Owns verifier runs and validation records. | `src/validation.rs`, `src/subprocess.rs` (the bounded runner, shared with the Git source) | [0012](docs/adr/0012-validation-boundary.md) |
+| Skill Catalog | Owns skill compilation, CAS bundles, `catalog.db`, activation, rollback and the active-skill match the pre-recall host step uses. | `src/catalog/{mod,compile}.rs` | [0013](docs/adr/0013-skill-catalog-direction.md) |
 | Reuse Evaluation | Owns the acceptance fixture, the seeded investigations, the reuse gate and the gate harness. | `src/fixture.rs`, `benches/{gates,fixture_db,interactive_fts}.rs` | [0016](docs/adr/0016-acceptance-fixture-and-reuse-gate.md), [0014](docs/adr/0014-performance-contract.md) |
 | Presentation | Owns the CLI and versioned JSON, the TUI, the terminal, signals and exit codes. | `src/main.rs`, `src/cli.rs`, `src/app.rs` (the use-case layer shared by CLI and TUI), `src/signal.rs` (fatal signals for the TUI and `search --fzf`), `src/ui/{mod,model,view,term,recall}.rs` | [0011](docs/adr/0011-terminal-and-cli-contract.md) |
 
@@ -64,16 +64,16 @@ One canonical term per concept. Use the term, not the words in the Avoid column.
 | Finish gate | `src/rlm/finish.rs`: every final claim and procedure step must cite evidence that resolves. | finish validation, verify |
 | Handle integrity check | `verify_handle`: the check that an evidence handle is genuine, current and belongs to this investigation. | verify, verification, validation |
 | Evidence handle | A random ID that can be cited, scoped to one investigation. Invalid in any other investigation. | evidence ID in skills, citation (for durable use) |
-| Durable citation | Revision + ordinal + content hash. Skills cite evidence this way. | evidence ID, handle |
+| Durable citation | An observation id plus a keyed blake3 hash of its `safe_text`, stored per bundle in `catalog.db`. Stale once the row is gone or its text hashes differently. Skills cite evidence this way. | evidence ID, handle |
 | Budget lease | An RLM budget reservation. Used only in Recall. | lease (anywhere else) |
 | Validation | A run of a user-approved verifier, and nothing else. Relic never runs the procedure itself. | plan or finish validation, verify |
 | Verifier | A fixed argv written by the user, run with no shell, in a cwd the user chooses, with bounded output and time. | test, check script, replay |
 | Validation record | `{ redacted argv, cwd, exit status, duration, Relic version, workspace assurance label }`, stored as `ConfirmedByValidation`. A user's word alone is `UserAsserted`, a lower grade. | validation result, attestation |
 | Workspace | The directory where a verifier runs, with an assurance label. | sandbox |
-| Skill bundle | Immutable content-addressed skill content (provisional layout `<hash>/<name>/SKILL.md`, [0013](docs/adr/0013-skill-catalog-direction.md)). | candidate, skill version, artifact |
+| Skill bundle | Immutable content-addressed skill content: `<db>.catalog/<blake3 of SKILL.md>/<name>/SKILL.md`, spec frontmatter only ([0013](docs/adr/0013-skill-catalog-direction.md)). | candidate, skill version, artifact |
 | Skill name | The stable pointer to the active bundle. | alias, slug |
-| Activation | An explicit, confirmed pointer swap that makes a bundle live. Provisionally a symlink swap for Claude Code and catalog-only for any other consumer ([0013](docs/adr/0013-skill-catalog-direction.md)). | install, promote, deploy |
-| Rollback | Swapping a skill name back to the bundle it pointed to before. | uninstall, revert |
+| Activation | An explicit, confirmed atomic symlink swap of `.agents/skills/<name>` under the home directory (`--user`) or a project (`--project`), plus `.claude/skills/<name>` with `--claude`, to a bundle ([0013](docs/adr/0013-skill-catalog-direction.md)). | install, promote, deploy |
+| Rollback | Undoing a link's newest activation not yet undone: back to the bundle it pointed to before, or no link. Repeated, it steps further back. | uninstall, revert |
 | Shell hook | A metadata-only zsh or Bash hook that records command frames, including exit status. | hook (alone) |
 | Agent hook | A hook in an agent tool such as Claude Code. | hook (alone) |
 | SQLite progress handler | The rusqlite `hooks`-feature callback that enforces the query deadline and cancellation. | hook (alone) |
