@@ -100,7 +100,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
             let catalog = relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
             let (record, said) = relic::validation::run(&argv, &cwd)?;
             let id = catalog.add_validation(&digest, &record)?;
-            let ran = app::display_line(&record.argv.join(" "));
+            let ran = app::display_line(&record.command);
             if record.confirmed() {
                 eprintln!("relic: validation {id}: `{ran}` passed in {} ms; this report can be compiled", record.duration_ms);
             } else {

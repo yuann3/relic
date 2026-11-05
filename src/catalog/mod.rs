@@ -460,7 +460,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(&dir.path().join("relic.db.catalog")).unwrap();
         let v = ValidationRecord {
-            argv: vec!["true".into()],
+            command: "true".into(),
             cwd: "/".into(),
             outcome: crate::validation::Outcome::Passed,
             exit_code: Some(0),
