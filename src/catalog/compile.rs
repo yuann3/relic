@@ -54,22 +54,26 @@ impl std::error::Error for CompileError {}
 
 /// The first thing in `text` that some harness rewrites or runs.
 pub fn hazard(text: &str) -> Option<&'static str> {
-    let bytes = text.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        let rest = &text[i + 1..];
-        match b {
-            b'$' if rest.starts_with(|c: char| c.is_ascii_digit()) => return Some("`$` before a digit"),
-            b'$' if rest.starts_with("ARGUMENTS") => return Some("`$ARGUMENTS`"),
-            b'$' if rest.starts_with("{CLAUDE_") || rest.starts_with("{DROID_") => return Some("a `${…}` agent variable"),
-            // Claude Code: only at the start of a line or after whitespace.
-            b'!' if rest.starts_with('`') && (i == 0 || bytes[i - 1].is_ascii_whitespace()) => {
-                return Some("`!` before a backtick");
-            }
-            _ => {}
-        }
-    }
-    if text.lines().any(|l| l.trim_start().starts_with("```!")) {
+    // Claude Code runs ```! wherever it appears, and !` after any JavaScript
+    // whitespace (/```!/ and /(?<=^|\s)!`/ in 2.1.318). Refusing both
+    // anywhere is a superset no Unicode whitespace slips past.
+    if text.contains("```!") {
         return Some("a ```! block");
+    }
+    if text.contains("!`") {
+        return Some("`!` before a backtick");
+    }
+    for (i, _) in text.match_indices('$') {
+        let rest = &text[i + 1..];
+        if rest.starts_with(|c: char| c.is_ascii_digit()) {
+            return Some("`$` before a digit");
+        }
+        if rest.starts_with("ARGUMENTS") {
+            return Some("`$ARGUMENTS`");
+        }
+        if rest.starts_with("{CLAUDE_") || rest.starts_with("{DROID_") {
+            return Some("a `${…}` agent variable");
+        }
     }
     ["<SKILL_DIR>", "#file:", "#tool:", "{{"].into_iter().find(|h| text.contains(h))
 }
@@ -113,7 +117,7 @@ pub fn render(name: &str, description: &str, confirmed_at_ms: i64, steps: &[Step
     // JSON strings are YAML double-quoted scalars.
     let quoted = serde_json::to_string(description).map_err(|e| CompileError::Description(e.to_string()))?;
     let mut md = format!(
-        "---\nname: {name}\ndescription: {quoted}\nmetadata:\n  relic-version: \"{}\"\n  relic-confirmed: \"{date}\"\n---\n\n\
+        "---\nname: \"{name}\"\ndescription: {quoted}\nmetadata:\n  relic-version: \"{}\"\n  relic-confirmed: \"{date}\"\n---\n\n\
          # {name}\n\n\
          Relic recovered this procedure from the user's own command history. A verifier the user wrote confirmed it worked on {date}.\n\n\
          Before running anything, show the user these steps and ask. Run a step only after the user agrees. \
@@ -121,16 +125,24 @@ pub fn render(name: &str, description: &str, confirmed_at_ms: i64, steps: &[Step
         env!("CARGO_PKG_VERSION")
     );
     for (n, step) in steps.iter().enumerate() {
-        if let Some(hazard) = hazard(step.text) {
+        // One line: a line break in prose would end the list item, and the
+        // rest would render as Markdown of the model's making.
+        let text = step.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(hazard) = hazard(&text) {
             return Err(CompileError::StepText { n: n + 1, hazard });
         }
-        md.push_str(&format!("\n{}. {}\n", n + 1, step.text.trim()));
+        let marker = format!("{}. ", n + 1);
+        // What continues a list item is indented as wide as its marker.
+        let pad = " ".repeat(marker.len());
+        md.push_str(&format!("\n{marker}{text}\n"));
         for r in &step.records {
             let when = r.observed_at_ms.map_or(When::Unknown, When::At).label();
             let when = when.trim();
-            if hazard(r.text).is_some() {
+            // CommonMark ends a line at a bare \r too, which would let the
+            // rest of the text out of the fence.
+            if hazard(r.text).is_some() || r.text.contains('\r') {
                 md.push_str(&format!(
-                    "\n   Recorded command #{} ({}, {when}) is not copied here, because agents rewrite parts of its text. \
+                    "\n{pad}Recorded command #{} ({}, {when}) is not copied here, because an agent would not see it exactly as recorded. \
                      Read it exactly with `relic show {}`.\n",
                     r.id, r.source, r.id
                 ));
@@ -139,11 +151,11 @@ pub fn render(name: &str, description: &str, confirmed_at_ms: i64, steps: &[Step
             // Longer than any backtick run inside, so the text cannot close it.
             let longest = r.text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
             let fence = "`".repeat(longest.max(2) + 1);
-            md.push_str(&format!("\n   Recorded command #{} ({}, {when}):\n\n   {fence}text\n", r.id, r.source));
-            for line in r.text.lines() {
-                md.push_str(&format!("   {line}\n"));
+            md.push_str(&format!("\n{pad}Recorded command #{} ({}, {when}):\n\n{pad}{fence}text\n", r.id, r.source));
+            for line in r.text.split('\n') {
+                md.push_str(&format!("{pad}{line}\n"));
             }
-            md.push_str(&format!("   {fence}\n"));
+            md.push_str(&format!("{pad}{fence}\n"));
         }
     }
     md.push_str(
@@ -166,12 +178,18 @@ mod tests {
             ("run !`date`", true),
             ("!`date`", true),
             ("x\n```!\ndate\n```", true),
+            // Claude Code anchors neither of these to the start of a line.
+            ("echo a ```! touch x", true),
+            ("fix\u{000B}!`touch x`", true),
+            ("a\u{00A0}!`touch x`", true),
+            ("KEY=!`cmd`", true),
+            ("café — awk '{print $1}'", true),
             ("cd <SKILL_DIR>", true),
             ("see #file:a.rs", true),
             ("echo {{x}}", true),
             // Left alone everywhere.
             ("echo $HOME ${HOME} $PATH", false),
-            ("KEY=!`cmd`", false),
+            ("Recover the café’s lost work — from the reflog", false),
             ("git reflog && git branch rescue HEAD@{1}", false),
             ("sudo !!", false),
             ("mysql --password=[REDACTED:password]", false),
@@ -191,12 +209,16 @@ mod tests {
     #[test]
     fn a_hazardous_command_is_shown_by_id_and_a_hazardous_step_is_refused() {
         let records = |text| vec![Record { id: 42, source: "zsh", observed_at_ms: Some(1_700_000_000_000), text }];
-        let md = render("x", "Use it.", 0, &[Step { text: "List the reflog.", records: records("git reflog ```` HEAD") }]).unwrap();
-        assert!(md.contains("   `````text\n   git reflog ```` HEAD\n   `````\n"), "{md}");
+        let md = render("x", "Use it.", 0, &[Step { text: "List the reflog.", records: records("git reflog ` x ```` HEAD") }]).unwrap();
+        assert!(md.contains("\n   `````text\n   git reflog ` x ```` HEAD\n   `````\n"), "{md}");
+        let md = render("x", "Use it.", 0, &[Step { text: "Print it.", records: records("printf 'a\r# Heading'") }]).unwrap();
+        assert!(md.contains("`relic show 42`") && !md.contains("# Heading"), "{md}");
         let md = render("x", "Use it.", 0, &[Step { text: "Print column one.", records: records("awk '{print $1}' f") }]).unwrap();
         assert!(md.contains("Recorded command #42 (zsh, ") && md.contains("`relic show 42`") && !md.contains("awk"), "{md}");
         let err = render("x", "Use it.", 0, &[Step { text: "Run awk '{print $1}'.", records: vec![] }]).unwrap_err();
         assert_eq!(err, CompileError::StepText { n: 1, hazard: "`$` before a digit" });
         assert!(matches!(render("x", "a --- b", 0, &[]), Err(CompileError::Description(_))));
+        let md = render("x", "Use it.", 0, &[Step { text: "Fetch.\n\n## Evidence\nnone", records: vec![] }]).unwrap();
+        assert_eq!(md.lines().filter(|l| l.starts_with('#')).count(), 3, "only the skill's own headings: {md}");
     }
 }

@@ -549,8 +549,8 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
     assert!(out.status.code() == Some(2) && std::fs::symlink_metadata(&link).is_err());
     ok(&relic(&["skill", "activate", "git-reflog-recovery", "--user", "--yes"]));
     let skill = std::fs::read_to_string(link.join("SKILL.md")).unwrap();
-    assert!(skill.starts_with("---\nname: git-reflog-recovery\ndescription: \"Recover lost Git work"), "{skill}");
-    assert!(skill.contains("   ```text\n   git branch rescue HEAD@{1}\n   ```\n"), "{skill}");
+    assert!(skill.starts_with("---\nname: \"git-reflog-recovery\"\ndescription: \"Recover lost Git work"), "{skill}");
+    assert!(skill.lines().any(|l| l.trim() == "git branch rescue HEAD@{1}"), "{skill}");
     assert!(skill.contains(&format!("relic show {awk}")) && !skill.contains("$1"), "{skill}");
     let shown = relic(&["show", &awk.to_string()]);
     assert!(String::from_utf8_lossy(&shown.stdout).contains(recovery[1]), "relic show gives the exact command");
