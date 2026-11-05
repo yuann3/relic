@@ -6,11 +6,11 @@
 //! Git is enrichment, not a command log: a reflog entry says a ref moved,
 //! not which command moved it (research, source contracts).
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
+
+use crate::subprocess::{Run, bounded};
 
 pub const PARSER_CONTRACT: &str = "git-v1";
 
@@ -18,8 +18,6 @@ pub const PARSER_CONTRACT: &str = "git-v1";
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Most bytes of one run's output. About 100k reflog entries.
 const OUTPUT_MAX: usize = 16 << 20;
-/// Most bytes of `git`'s stderr kept for an error message.
-const STDERR_MAX: usize = 4096;
 /// Most bytes of one record's text: a ref name and a subject, not a page.
 pub const RECORD_MAX: usize = 4096;
 
@@ -193,109 +191,9 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     }
 }
 
-enum Run {
-    Done { status: std::process::ExitStatus, stdout: Vec<u8>, stderr: Vec<u8> },
-    TimedOut,
-    TooLarge,
-}
-
-/// Run `cmd` with no stdin, stopping it once `timeout` passes or its stdout
-/// passes `max` bytes. The timeout covers its output too: a process it
-/// started can hold the pipes open after it exits.
-fn bounded(mut cmd: Command, timeout: Duration, max: usize) -> std::io::Result<Run> {
-    use std::os::unix::process::CommandExt;
-    let deadline = Instant::now() + timeout;
-    // Its own group, so a timeout stops what it started as well.
-    let mut child = cmd.process_group(0).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let stdout = capped(child.stdout.take(), max, false);
-    let stderr = capped(child.stderr.take(), STDERR_MAX, true);
-    let stop = |child: &mut std::process::Child| {
-        let group = libc::pid_t::try_from(child.id()).map_err(std::io::Error::other)?;
-        // SAFETY: kill(2) of the group this child leads; at worst ESRCH.
-        unsafe { libc::kill(-group, libc::SIGKILL) };
-        child.wait()?;
-        Ok(Run::TimedOut)
-    };
-    let read = |rx: &mpsc::Receiver<_>| match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(read) => Ok(Some(read)),
-        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other("a git output reader panicked")),
-    };
-    let (Some(out), Some(err)) = (read(&stdout)?, read(&stderr)?) else {
-        return stop(&mut child);
-    };
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            return stop(&mut child);
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    };
-    let stdout = out?;
-    if stdout.len() > max {
-        return Ok(Run::TooLarge);
-    }
-    Ok(Run::Done { status, stdout, stderr: err.unwrap_or_default() })
-}
-
-/// The first `keep` bytes of `pipe` (stdout: one more, to tell a cut), read
-/// on a thread. Stdout is dropped at the cap, so a writer past it dies of
-/// EPIPE; stderr is read to its end, so a run that only warns a lot still
-/// succeeds.
-fn capped<R: Read + Send + 'static>(pipe: Option<R>, keep: usize, drain: bool) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let read = pipe.map_or(Ok(()), |mut p| {
-            let limit = if drain { keep } else { keep + 1 };
-            p.by_ref().take(limit as u64).read_to_end(&mut out)?;
-            if drain {
-                std::io::copy(&mut p, &mut std::io::sink())?;
-            }
-            Ok(())
-        });
-        let _ = tx.send(read.map(|()| out));
-    });
-    rx
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sh(script: &str) -> Command {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", script]);
-        cmd
-    }
-
-    #[test]
-    fn a_run_is_stopped_at_its_timeout_and_at_its_output_cap() {
-        let t = Instant::now();
-        assert!(matches!(bounded(sh("sleep 5"), Duration::from_millis(100), 64).unwrap(), Run::TimedOut));
-        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
-
-        let t = Instant::now();
-        assert!(matches!(bounded(sh("yes"), Duration::from_secs(5), 1000).unwrap(), Run::TooLarge));
-        assert!(t.elapsed() < Duration::from_secs(2), "the writer died at the cap: {:?}", t.elapsed());
-
-        let Run::Done { status, stdout, stderr } = bounded(sh("printf out; echo why >&2; exit 3"), Duration::from_secs(5), 3).unwrap() else {
-            panic!()
-        };
-        assert_eq!((status.code(), stdout.as_slice(), stderr.as_slice()), (Some(3), &b"out"[..], &b"why\n"[..]));
-
-        // Exited, but what it started still holds stdout open.
-        let t = Instant::now();
-        assert!(matches!(bounded(sh("sleep 5 & exit 0"), Duration::from_millis(100), 64).unwrap(), Run::TimedOut));
-        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
-
-        // Warnings past what is kept do not kill it.
-        let warns = "i=0; while [ $i -lt 2000 ]; do echo warning >&2; i=$((i+1)); done; printf done";
-        let Run::Done { status, stdout, stderr } = bounded(sh(warns), Duration::from_secs(5), 64).unwrap() else { panic!() };
-        assert_eq!((status.code(), stdout.as_slice(), stderr.len()), (Some(0), &b"done"[..], STDERR_MAX));
-    }
 
     #[test]
     fn records_are_one_line_each_and_cut_at_their_cap() {

@@ -10,5 +10,6 @@ pub mod rlm;
 pub mod signal;
 pub mod source;
 pub mod store;
+pub mod subprocess;
 #[cfg(feature = "tui")]
 pub mod ui;
