@@ -91,6 +91,60 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
+        Command::Validate { report, cwd, db, argv } => {
+            let (_, digest) = relic::catalog::read_report(&std::fs::read(&report)?)?;
+            let cwd = match cwd {
+                Some(dir) => dir,
+                None => std::env::current_dir()?,
+            };
+            let catalog = relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
+            let (record, said) = relic::validation::run(&argv, &cwd)?;
+            let id = catalog.add_validation(&digest, &record)?;
+            let ran = app::display_line(&record.argv.join(" "));
+            if record.confirmed() {
+                eprintln!("relic: validation {id}: `{ran}` passed in {} ms; this report can be compiled", record.duration_ms);
+            } else {
+                let how = match record.outcome {
+                    relic::validation::Outcome::TimedOut => "ran past its time limit".into(),
+                    relic::validation::Outcome::TooLarge => "wrote more output than Relic reads".into(),
+                    _ => record.exit_code.map_or("was killed by a signal".into(), |c| format!("exited {c}")),
+                };
+                let said = said.map(|l| format!(": {}", app::display_line(&l))).unwrap_or_default();
+                eprintln!("relic: validation {id}: `{ran}` {how}{said}");
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::SkillCompile { report, name, description, db } => {
+            let db = existing_db(db)?;
+            let catalog = relic::catalog::Catalog::open(&relic::catalog::dir_for(&db))?;
+            let bundle = catalog.compile(&Store::open_read_only(&db)?, &std::fs::read(&report)?, &name, &description)?;
+            eprintln!("relic: compiled {name} as {}; activate it with relic skill activate {name}", shown(&bundle.path));
+        }
+        Command::SkillActivate { name, scope, claude, yes, db } => {
+            let catalog = relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
+            let bundle = catalog.bundle(&name)?;
+            let links = skill_links(&name, &scope, claude)?;
+            eprintln!("relic: {name} ({}) will be linked from:", &bundle.hash[..12]);
+            for link in &links {
+                eprintln!("    {}", shown(link));
+            }
+            if !yes && !confirm("Agents that read these directories will load it. Activate?")? {
+                eprintln!("relic: not activated");
+                return Ok(ExitCode::FAILURE);
+            }
+            catalog.activate(&bundle, &links)?;
+            eprintln!("relic: activated {name}; an agent already running may need a restart or skill reload to see it");
+        }
+        Command::SkillRollback { name, scope, claude, db } => {
+            let catalog = relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
+            let links = skill_links(&name, &scope, claude)?;
+            for (link, now) in links.iter().zip(catalog.rollback(&links)?) {
+                match now {
+                    Some(hash) => eprintln!("relic: {} points at {} again", shown(link), &hash[..12]),
+                    None => eprintln!("relic: removed {}", shown(link)),
+                }
+            }
+        }
         Command::Forget { ids, db } => {
             let owns_dir = cli::owns_data_dir(&db);
             let db = existing_db(db)?;
@@ -196,6 +250,29 @@ fn run(cmd: Command) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Where a skill's links go: `.agents/skills`, which most agents read, and
+/// `.claude/skills`, for Claude Code, on request.
+fn skill_links(name: &str, scope: &cli::Scope, claude: bool) -> Result<Vec<PathBuf>> {
+    let base = match scope {
+        cli::Scope::User => PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty()).ok_or("HOME is not set")?),
+        cli::Scope::Project(dir) => std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", shown(dir)))?,
+    };
+    let dirs: &[&str] = if claude { &[".agents", ".claude"] } else { &[".agents"] };
+    Ok(dirs.iter().map(|d| base.join(d).join("skills").join(name)).collect())
+}
+
+/// A yes on the terminal; anything else, or no terminal, is no.
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::{BufRead, IsTerminal};
+    if !std::io::stdin().is_terminal() {
+        return Err("no terminal to confirm on; pass --yes".into());
+    }
+    eprint!("{question} [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
 /// What an import of either kind of source did to the store as a whole.

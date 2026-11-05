@@ -22,6 +22,10 @@ USAGE:
             "    relic import <HISTORY_FILE | GIT_REPO> [--shell zsh|bash] [--db PATH]
     relic show <ID>... [--db PATH] [--json]
     relic forget <ID>... [--db PATH]
+    relic validate <REPORT.json> [--cwd DIR] [--db PATH] -- <VERIFIER>...
+    relic skill compile <REPORT.json> --name NAME --description TEXT [--db PATH]
+    relic skill activate <NAME> (--user | --project DIR) [--claude] [--yes] [--db PATH]
+    relic skill rollback <NAME> (--user | --project DIR) [--claude] [--db PATH]
     relic model check
     relic --help | --version
 
@@ -52,6 +56,16 @@ OPTIONS:
                   its reflogs (HEAD, branches, stash) and refs, never its
                   files or diffs. Re-import to add what moved since; what
                   Git deletes or expires stays in relic
+    validate      Run a verifier you wrote for a recall --json report, to
+                  confirm its procedure worked: its argv as given, no shell,
+                  in --cwd (default: here), unsandboxed, for at most 60 s.
+                  Relic never runs the procedure itself. Exit 1 if it fails
+    skill         compile turns a validated report into an Agent Skill in
+                  <db>.catalog; activate links it, after you confirm, into
+                  .agents/skills under your home (--user) or DIR (--project),
+                  and .claude/skills too with --claude; rollback restores
+                  what each link held before. Recall then names the active
+                  skill a question needs
     --shell       History format for import. Default: what the file was imported
                   as before, else what its content or name shows. A --shell
                   that differs from the stored one replaces that file's records
@@ -108,7 +122,18 @@ pub enum Command {
     Import { path: PathBuf, shell: Option<SourceKind>, db: Option<PathBuf> },
     Forget { ids: Vec<i64>, db: Option<PathBuf> },
     Show { ids: Vec<i64>, db: Option<PathBuf>, json: bool },
+    Validate { report: PathBuf, cwd: Option<PathBuf>, db: Option<PathBuf>, argv: Vec<String> },
+    SkillCompile { report: PathBuf, name: String, description: String, db: Option<PathBuf> },
+    SkillActivate { name: String, scope: Scope, claude: bool, yes: bool, db: Option<PathBuf> },
+    SkillRollback { name: String, scope: Scope, claude: bool, db: Option<PathBuf> },
     ModelCheck,
+}
+
+/// Whose skills directory a skill is linked into. Always named: no default.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Scope {
+    User,
+    Project(PathBuf),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -220,8 +245,73 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             }
             Ok(if sub == "show" { Command::Show { ids, db, json } } else { Command::Forget { ids, db } })
         }
+        "validate" => {
+            let (mut report, mut cwd, mut db, mut argv) = (None, None, None, Vec::new());
+            while let Some(a) = args.next().transpose()? {
+                match a.as_str() {
+                    // The verifier's own flags are its own, `-h` included.
+                    "--" => argv = args.by_ref().collect::<Result<_, _>>()?,
+                    "-h" | "--help" => return Ok(Command::Help),
+                    "--db" => db = Some(value(&mut args, "--db")?.into()),
+                    "--cwd" => cwd = Some(value(&mut args, "--cwd")?.into()),
+                    f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
+                    _ if report.is_none() => report = Some(PathBuf::from(a)),
+                    _ => return Err(format!("unexpected argument for validate: {a}; put the verifier after --")),
+                }
+            }
+            let report = report.ok_or("validate needs a recall --json report")?;
+            if argv.is_empty() {
+                return Err("validate needs a verifier after --".into());
+            }
+            Ok(Command::Validate { report, cwd, db, argv })
+        }
+        "skill" => parse_skill(args),
         other => Err(format!("unknown command: {other}")),
     }
+}
+
+fn parse_skill(mut args: impl Iterator<Item = Result<String, String>>) -> Result<Command, String> {
+    let sub = args.next().transpose()?.ok_or("skill needs a command: compile, activate or rollback")?;
+    if !matches!(sub.as_str(), "compile" | "activate" | "rollback") {
+        return Ok(match sub.as_str() {
+            "-h" | "--help" => Command::Help,
+            _ => return Err(format!("unknown skill command: {sub}")),
+        });
+    }
+    let (mut target, mut db, mut name, mut description) = (None, None, None, None);
+    let (mut user, mut project, mut claude, mut yes) = (false, None, false, false);
+    while let Some(a) = args.next().transpose()? {
+        match a.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--db" => db = Some(value(&mut args, "--db")?.into()),
+            "--name" if sub == "compile" => name = Some(value(&mut args, "--name")?),
+            "--description" if sub == "compile" => description = Some(value(&mut args, "--description")?),
+            "--user" if sub != "compile" => user = true,
+            "--project" if sub != "compile" => project = Some(PathBuf::from(value(&mut args, "--project")?)),
+            "--claude" if sub != "compile" => claude = true,
+            "--yes" if sub == "activate" => yes = true,
+            f if f.starts_with("--") => return Err(format!("unknown option for skill {sub}: {f}")),
+            _ if target.is_none() => target = Some(a),
+            _ => return Err(format!("unexpected argument for skill {sub}: {a}")),
+        }
+    }
+    if sub == "compile" {
+        let report = target.ok_or("skill compile needs a recall --json report")?.into();
+        let name = name.ok_or("skill compile needs --name")?;
+        let description = description.ok_or("skill compile needs --description: when an agent should use it")?;
+        return Ok(Command::SkillCompile { report, name, description, db });
+    }
+    let name = target.ok_or_else(|| format!("skill {sub} needs a skill name"))?;
+    let scope = match (user, project) {
+        (true, None) => Scope::User,
+        (false, Some(dir)) => Scope::Project(dir),
+        _ => return Err(format!("skill {sub} needs one of --user or --project DIR")),
+    };
+    Ok(if sub == "activate" {
+        Command::SkillActivate { name, scope, claude, yes, db }
+    } else {
+        Command::SkillRollback { name, scope, claude, db }
+    })
 }
 
 fn parse_search(
@@ -397,6 +487,34 @@ mod tests {
             Command::Recall { question: "how did --db x".into(), db: None, json: true, allow_unknown_cost: false }
         );
         assert!(p(&["recall"]).is_err() && p(&["recall", "--json"]).is_err() && p(&["recall", "x", "--fzf"]).is_err());
+    }
+
+    #[test]
+    fn a_verifier_keeps_its_own_flags_and_a_skill_always_names_where_it_goes() {
+        assert_eq!(
+            p(&["validate", "r.json", "--cwd", "/w", "--", "git", "--help", "--db", "x"]).unwrap(),
+            Command::Validate {
+                report: "r.json".into(),
+                cwd: Some("/w".into()),
+                db: None,
+                argv: ["git", "--help", "--db", "x"].map(String::from).to_vec(),
+            }
+        );
+        assert!(p(&["validate", "r.json"]).is_err() && p(&["validate", "r.json", "git"]).is_err());
+        assert_eq!(
+            p(&["skill", "activate", "git-x", "--project", "/p", "--claude", "--yes"]).unwrap(),
+            Command::SkillActivate { name: "git-x".into(), scope: Scope::Project("/p".into()), claude: true, yes: true, db: None }
+        );
+        assert!(matches!(p(&["skill", "rollback", "git-x", "--user"]).unwrap(), Command::SkillRollback { scope: Scope::User, .. }));
+        for bad in [
+            &["skill", "activate", "git-x"][..],
+            &["skill", "activate", "git-x", "--user", "--project", "/p"],
+            &["skill", "rollback", "git-x", "--user", "--yes"],
+            &["skill", "compile", "r.json", "--name", "git-x"],
+            &["skill", "compile", "r.json", "--name", "n", "--description", "d", "--user"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -440,3 +440,150 @@ fn privacy_canary_gate() {
         assert!(!folded.windows(9).any(|w| w == b"zq9canary"), "a canary in {name}");
     }
 }
+
+/// V2 (#33): on a lost-commit fixture, a recalled procedure is validated by
+/// a verifier the user wrote, compiled into a skill, activated into
+/// `~/.agents/skills` and rolled back, and while active the host step picks
+/// it for a sibling question before any request leaves.
+#[test]
+fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let (home, repo) = (dir.path().join("home"), dir.path().join("repo"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "the work that got lost"]);
+    let lost = git(&["rev-parse", "HEAD"]);
+    git(&["reset", "-q", "--hard", "HEAD~1"]);
+    let recovery = [
+        "git reset --hard HEAD~1",
+        // `$1` is rewritten by Claude Code and Goose: shown by id only.
+        "git reflog | awk '{print $1}'",
+        "git branch rescue HEAD@{1}",
+        "git push https://bob:Zq9CanaryUrl3@git.test/rescue.git rescue",
+    ];
+    let db = store_with(dir.path(), &recovery);
+    let (url, bodies) = serve(|state| {
+        Some(match state["state_version"].as_u64().unwrap() {
+            0 => plan(json!([
+                {"op": "search", "op_id": "s1", "terms": ["git"], "match": "any", "limit": 20},
+                {"op": "inspect", "op_id": "i1", "input": {"output": "s1"}, "limit": 20, "max_item_bytes": 2048},
+            ])),
+            v => finish(v, json!({"status": "answered", "answer": "From the reflog.",
+                "claims": [{"text": "a branch on HEAD@{1} kept it", "supports": [cite(state, "branch rescue")]}], "procedure": [
+                {"text": "Find the lost commit in the reflog", "supports": [cite(state, "awk")]},
+                {"text": "Put a branch on it", "supports": [cite(state, "branch rescue")]},
+                {"text": "Push the branch", "supports": [cite(state, "git push")]},
+            ]})),
+        })
+    });
+    let relic = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_relic"))
+            .args(args)
+            .env("RELIC_DB", &db)
+            .env("HOME", &home)
+            .env_remove("RELIC_MODEL_API_KEY")
+            .env("RELIC_MODEL_PROFILE", "llama_cpp")
+            .env("RELIC_MODEL_URL", &url)
+            .env("RELIC_MODEL_NAME", "scripted")
+            .output()
+            .unwrap()
+    };
+    let ok = |out: &Output| assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let recall = |question: &str| {
+        let sent = bodies.lock().unwrap().len();
+        let out = relic(&["recall", question, "--json"]);
+        ok(&out);
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let log = std::fs::read_to_string(dir.path().join("relic.db.recall.log")).unwrap();
+        let events: Vec<String> = log
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|l| l["recall"] == serde_json::from_str::<Value>(log.lines().last().unwrap()).unwrap()["recall"])
+            .map(|l| l["event"].as_str().unwrap().to_string())
+            .collect();
+        assert!(bodies.lock().unwrap().len() > sent);
+        (report, events)
+    };
+
+    let (report, events) = recall("how did I get back the commit git reset lost?");
+    assert!(report.get("skill").is_none() && !events.contains(&"skill".into()), "no skill is active yet");
+    let report_path = dir.path().join("report.json");
+    std::fs::write(&report_path, serde_json::to_vec(&report).unwrap()).unwrap();
+    let report_arg = report_path.to_str().unwrap();
+    let (awk, push) = (record_of(&report, "awk"), record_of(&report, "git push"));
+
+    // Only a verifier that passes, for exactly this report, lets it compile.
+    let compile = |report: &str| {
+        relic(&["skill", "compile", report, "--name", "git-reflog-recovery", "--description",
+            "Recover lost Git work, such as commits, branches or stashes, from the reflog"])
+    };
+    let repo_arg = repo.to_str().unwrap();
+    let failed = relic(&["validate", report_arg, "--cwd", repo_arg, "--", "git", "rev-parse", "--verify", "-q", "deadbeef"]);
+    assert_eq!(failed.status.code(), Some(1), "{}", String::from_utf8_lossy(&failed.stderr));
+    assert_eq!(compile(report_arg).status.code(), Some(2));
+    // A secret in the verifier's own argv is stored redacted.
+    ok(&relic(&["validate", report_arg, "--cwd", repo_arg, "--", "env", "TOKEN=Zq9CanaryArgv7abcdefgh", "git", "rev-parse", "--verify", &lost]));
+    let edited = dir.path().join("edited.json");
+    std::fs::write(&edited, [std::fs::read(&report_path).unwrap(), b"\n".to_vec()].concat()).unwrap();
+    let out = compile(edited.to_str().unwrap());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no verifier has passed"), "an edited report needs its own validation");
+    ok(&compile(report_arg));
+
+    // Activation is confirmed: with no terminal to ask on, only --yes.
+    let link = home.join(".agents/skills/git-reflog-recovery");
+    let out = relic(&["skill", "activate", "git-reflog-recovery", "--user"]);
+    assert!(out.status.code() == Some(2) && std::fs::symlink_metadata(&link).is_err());
+    ok(&relic(&["skill", "activate", "git-reflog-recovery", "--user", "--yes"]));
+    let skill = std::fs::read_to_string(link.join("SKILL.md")).unwrap();
+    assert!(skill.starts_with("---\nname: git-reflog-recovery\ndescription: \"Recover lost Git work"), "{skill}");
+    assert!(skill.contains("   ```text\n   git branch rescue HEAD@{1}\n   ```\n"), "{skill}");
+    assert!(skill.contains(&format!("relic show {awk}")) && !skill.contains("$1"), "{skill}");
+    let shown = relic(&["show", &awk.to_string()]);
+    assert!(String::from_utf8_lossy(&shown.stdout).contains(recovery[1]), "relic show gives the exact command");
+    assert!(skill.contains(&format!("#{push}")) && skill.contains("[REDACTED:"), "{skill}");
+
+    let bundle = std::fs::read_link(&link).unwrap();
+    let hash = bundle.parent().unwrap().file_name().unwrap().to_str().unwrap().to_string();
+    let (report, events) = recall("I dropped a stash by mistake, how do I recover it with git?");
+    assert_eq!(report["skill"], json!({"name": "git-reflog-recovery", "bundle": hash}));
+    assert_eq!(&events[..3], ["start", "skill", "send"], "the pick precedes every request");
+    let (report, events) = recall("how did I renew the certbot certificate?");
+    assert!(report.get("skill").is_none() && !events.contains(&"skill".into()), "{report}");
+
+    ok(&relic(&["skill", "rollback", "git-reflog-recovery", "--user"]));
+    assert!(std::fs::symlink_metadata(&link).is_err(), "nothing was there before");
+    let (report, _) = recall("I dropped a stash by mistake, how do I recover it with git?");
+    assert!(report.get("skill").is_none(), "a rolled-back skill is not picked");
+
+    // No secret reached the catalog: its database (the WAL goes when the
+    // last connection closes) or the bundle.
+    let catalog = dir.path().join("relic.db.catalog");
+    let mut files = vec![bundle.join("SKILL.md")];
+    files.extend(std::fs::read_dir(&catalog).unwrap().map(|e| e.unwrap().path()).filter(|p| p.is_file()));
+    assert!(files.iter().any(|f| f.ends_with("catalog.db")), "{files:?}");
+    for f in &files {
+        let bytes = std::fs::read(f).unwrap().to_ascii_lowercase();
+        assert!(!bytes.windows(9).any(|w| w == b"zq9canary"), "a canary in {}", f.display());
+    }
+}
+
+/// The id of the one evidence record in `report` whose text holds `needle`.
+fn record_of(report: &Value, needle: &str) -> i64 {
+    let hits: Vec<&Value> = report["evidence"].as_array().unwrap().iter().filter(|e| e["text"].as_str().unwrap().contains(needle)).collect();
+    assert_eq!(hits.len(), 1, "{report}");
+    hits[0]["id"].as_i64().unwrap()
+}
