@@ -543,11 +543,16 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
     assert!(String::from_utf8_lossy(&out.stderr).contains("no verifier has passed"), "an edited report needs its own validation");
     ok(&compile(report_arg));
 
-    // Activation is confirmed: with no terminal to ask on, only --yes.
+    // Activation is confirmed: with no terminal to ask on, only --yes. Here
+    // .claude/skills is a link to .agents/skills, as many users set it up,
+    // so both paths name one link.
+    std::fs::create_dir_all(home.join(".agents/skills")).unwrap();
+    std::fs::create_dir(home.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(home.join(".agents/skills"), home.join(".claude/skills")).unwrap();
     let link = home.join(".agents/skills/git-reflog-recovery");
-    let out = relic(&["skill", "activate", "git-reflog-recovery", "--user"]);
+    let out = relic(&["skill", "activate", "git-reflog-recovery", "--user", "--claude"]);
     assert!(out.status.code() == Some(2) && std::fs::symlink_metadata(&link).is_err());
-    ok(&relic(&["skill", "activate", "git-reflog-recovery", "--user", "--yes"]));
+    ok(&relic(&["skill", "activate", "git-reflog-recovery", "--user", "--claude", "--yes"]));
     let skill = std::fs::read_to_string(link.join("SKILL.md")).unwrap();
     assert!(skill.starts_with("---\nname: \"git-reflog-recovery\"\ndescription: \"Recover lost Git work"), "{skill}");
     assert!(skill.lines().any(|l| l.trim() == "git branch rescue HEAD@{1}"), "{skill}");
@@ -564,7 +569,7 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
     let (report, events) = recall("how did I renew the certbot certificate?");
     assert!(report.get("skill").is_none() && !events.contains(&"skill".into()), "{report}");
 
-    ok(&relic(&["skill", "rollback", "git-reflog-recovery", "--user"]));
+    ok(&relic(&["skill", "rollback", "git-reflog-recovery", "--user", "--claude"]));
     assert!(std::fs::symlink_metadata(&link).is_err(), "nothing was there before");
     let (report, _) = recall("I dropped a stash by mistake, how do I recover it with git?");
     assert!(report.get("skill").is_none(), "a rolled-back skill is not picked");

@@ -256,11 +256,17 @@ fn run(cmd: Command) -> Result<ExitCode> {
 /// `.claude/skills`, for Claude Code, on request.
 fn skill_links(name: &str, scope: &cli::Scope, claude: bool) -> Result<Vec<PathBuf>> {
     let base = match scope {
-        cli::Scope::User => PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty()).ok_or("HOME is not set")?),
+        cli::Scope::User => home().ok_or("HOME is not set")?,
         cli::Scope::Project(dir) => std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", shown(dir)))?,
     };
     let dirs: &[&str] = if claude { &[".agents", ".claude"] } else { &[".agents"] };
     Ok(dirs.iter().map(|d| base.join(d).join("skills").join(name)).collect())
+}
+
+/// `$HOME`, resolved like the cwd recall matches project links against.
+fn home() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty())?);
+    Some(std::fs::canonicalize(&home).unwrap_or(home))
 }
 
 /// A yes on the terminal; anything else, or no terminal, is no.
@@ -410,7 +416,10 @@ fn recall(question: &str, db: Option<PathBuf>, json: bool, allow_unknown_cost: b
     }
     // A recall never creates a catalog; it reads the one skills came from.
     let skills = match relic::catalog::Catalog::open_existing(&relic::catalog::dir_for(&db))? {
-        Some(catalog) => catalog.active()?,
+        Some(catalog) => {
+            let here = std::env::current_dir().and_then(std::fs::canonicalize)?;
+            relic::catalog::visible(catalog.active()?, home().as_deref(), &here)
+        }
         None => Vec::new(),
     };
     let cancel = Arc::new(AtomicBool::new(false));

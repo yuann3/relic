@@ -32,6 +32,8 @@ pub enum CatalogError {
     /// Every activation of this link is already rolled back.
     NothingToRollBack(PathBuf),
     NoSuchSkill(String),
+    /// A swap failed part-way, and putting these links back failed too.
+    Stranded(Box<CatalogError>, Vec<PathBuf>),
 }
 
 impl std::fmt::Display for CatalogError {
@@ -45,6 +47,10 @@ impl std::fmt::Display for CatalogError {
             Self::NotOurs(p) => write!(f, "{} exists and is not a skill Relic activated; leaving it alone", p.display()),
             Self::NothingToRollBack(p) => write!(f, "{}: no activation left to roll back", p.display()),
             Self::NoSuchSkill(name) => write!(f, "no compiled skill named {name}"),
+            Self::Stranded(e, links) => {
+                let links: Vec<String> = links.iter().map(|l| l.display().to_string()).collect();
+                write!(f, "{e}; and could not put back {}", links.join(", "))
+            }
         }
     }
 }
@@ -112,6 +118,8 @@ pub struct ActiveSkill {
     pub name: String,
     pub description: String,
     pub bundle: String,
+    /// `<base>/.agents/skills/<name>` or `<base>/.claude/skills/<name>`.
+    pub link: PathBuf,
 }
 
 pub struct Catalog {
@@ -128,13 +136,16 @@ CREATE TABLE IF NOT EXISTS validation (
     at_ms         INTEGER NOT NULL
 );
 -- cites: [[record id, keyed hash of its safe text], ...], the durable form.
+-- compiled: raised on every compile, a recompile of old content included,
+-- so a name means the bundle compiled last.
 CREATE TABLE IF NOT EXISTS bundle (
     hash          TEXT PRIMARY KEY,
     name          TEXT NOT NULL,
     description   TEXT NOT NULL,
     validation_id INTEGER NOT NULL REFERENCES validation(id),
     cites         TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL
+    created_at_ms INTEGER NOT NULL,
+    compiled      INTEGER NOT NULL
 );
 -- Append-only: each swap of a link, and what it pointed at before. A
 -- rollback's row names the activation it undid.
@@ -159,10 +170,30 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
+/// Create `dir` and its missing parents, each synced into its parent: a
+/// link synced into a directory a power loss then drops is lost too. `mode`
+/// is set on each one created.
+fn make_dirs(dir: &Path, mode: Option<u32>) -> io::Result<()> {
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    let parent = dir.parent().unwrap_or(Path::new(""));
+    make_dirs(parent, mode)?;
+    match fs::create_dir(dir) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        r => r?,
+    }
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode))?;
+    }
+    sync_dir(if parent.as_os_str().is_empty() { Path::new(".") } else { parent })
+}
+
 impl Catalog {
     /// Open the catalog, creating it on first use.
     pub fn open(dir: &Path) -> Result<Self, CatalogError> {
-        fs::create_dir_all(dir)?;
+        make_dirs(dir, None)?;
         // Symlinks into it must not depend on the cwd.
         let dir = fs::canonicalize(dir)?;
         let conn = Connection::open(dir.join("catalog.db"))?;
@@ -206,8 +237,8 @@ impl Catalog {
     }
 
     /// Compile a validated report into a bundle, install it, and record it.
-    /// Step prose comes from the report; every recorded command from the
-    /// store, so a hand-edited report cannot put commands in a skill.
+    /// Step prose comes from the report, checked for what agents rewrite or
+    /// run; every recorded command comes from the store, never the report.
     pub fn compile(&self, store: &Store, report: &[u8], name: &str, description: &str) -> Result<Bundle, CatalogError> {
         let (report, digest) = read_report(report)?;
         let (validation_id, confirmed_at) = self.confirmed(&digest)?.ok_or(CatalogError::Unconfirmed)?;
@@ -246,12 +277,19 @@ impl Catalog {
         let md = compile::render(name, description, confirmed_at, &steps).map_err(CatalogError::Compile)?;
         let bundle = self.install(name, description, &md)?;
         let cites = serde_json::to_string(&cites).map_err(|e| CatalogError::Report(e.to_string()))?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO bundle (hash, name, description, validation_id, cites, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![bundle.hash, name, description, validation_id, cites, now_ms()],
-        )?;
+        self.record(&bundle, validation_id, &cites)?;
         Ok(bundle)
+    }
+
+    /// Record a compile of `bundle`, making it the one its name means.
+    fn record(&self, bundle: &Bundle, validation_id: i64, cites: &str) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "INSERT INTO bundle (hash, name, description, validation_id, cites, created_at_ms, compiled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT COALESCE(MAX(compiled), 0) + 1 FROM bundle))
+             ON CONFLICT (hash) DO UPDATE SET validation_id = excluded.validation_id, compiled = excluded.compiled",
+            params![bundle.hash, bundle.name, bundle.description, validation_id, cites, now_ms()],
+        )?;
+        Ok(())
     }
 
     /// Write `<hash>/<name>/SKILL.md` once: a temp directory, each file and
@@ -286,7 +324,7 @@ impl Catalog {
         let row = self
             .conn
             .query_row(
-                "SELECT hash, description FROM bundle WHERE name = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+                "SELECT hash, description FROM bundle WHERE name = ?1 ORDER BY compiled DESC LIMIT 1",
                 [name],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
@@ -313,48 +351,64 @@ impl Catalog {
         }
     }
 
-    /// Point `link` at `bundle`, or remove it, by an atomic rename.
+    /// Point `link` at `bundle`, or remove it, by an atomic rename. A link
+    /// already gone is already removed.
     fn point(&self, link: &Path, bundle: Option<&str>) -> Result<(), CatalogError> {
         let parent = link.parent().ok_or_else(|| CatalogError::NotOurs(link.into()))?;
         match bundle {
             Some(hash) => {
                 let name = link.file_name().ok_or_else(|| CatalogError::NotOurs(link.into()))?;
-                fs::create_dir_all(parent)?;
-                // Dot-named and not `.md`: no harness takes it for a skill.
+                // Outside Relic's directories: the user's own umask, not 077.
+                let mode = crate::validation::original_umask().map(|mask| 0o777 & !u32::from(mask));
+                make_dirs(parent, mode)?;
+                // Dot-named, so no harness takes a leftover for a skill, and
+                // random, so no other activation or file shares it.
+                let mut nonce = [0u8; 8];
+                getrandom::fill(&mut nonce).map_err(io::Error::other)?;
                 let mut tmp = std::ffi::OsString::from(".");
                 tmp.push(name);
-                tmp.push(".relic-swap");
+                tmp.push(format!(".relic-swap-{}", &blake3::hash(&nonce).to_hex()[..16]));
                 let tmp = parent.join(tmp);
-                let _ = fs::remove_file(&tmp);
                 std::os::unix::fs::symlink(self.dir.join(hash).join(name), &tmp)?;
-                fs::rename(&tmp, link)?;
+                if let Err(e) = fs::rename(&tmp, link) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
             }
-            None => fs::remove_file(link)?,
+            None => match fs::remove_file(link) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                r => r?,
+            },
         }
         Ok(sync_dir(parent)?)
     }
 
+    /// Put `swapped` links back where they were after a failure part-way;
+    /// the error then also names any that could not be.
+    fn put_back(&self, swapped: &[(&PathBuf, Option<String>)], error: CatalogError) -> CatalogError {
+        let stranded: Vec<PathBuf> =
+            swapped.iter().filter(|(link, was)| self.point(link, was.as_deref()).is_err()).map(|(link, _)| (*link).clone()).collect();
+        if stranded.is_empty() { error } else { CatalogError::Stranded(Box::new(error), stranded) }
+    }
+
     /// Point every link at `bundle`, or none of them: links are checked first,
-    /// and a failed swap puts back those already made.
+    /// and a failed swap or commit puts back those already made.
     pub fn activate(&self, bundle: &Bundle, links: &[PathBuf]) -> Result<(), CatalogError> {
-        let previous: Vec<Option<String>> = links.iter().map(|l| self.current(l)).collect::<Result<_, _>>()?;
+        let previous: Vec<(&PathBuf, Option<String>)> =
+            links.iter().map(|l| Ok((l, self.current(l)?))).collect::<Result<_, CatalogError>>()?;
         let tx = self.conn.unchecked_transaction()?;
-        for (link, previous) in links.iter().zip(&previous) {
+        for (link, previous) in &previous {
             tx.execute(
                 "INSERT INTO activation (link, bundle, previous, at_ms) VALUES (?1, ?2, ?3, ?4)",
                 params![link.as_os_str().as_bytes(), bundle.hash, previous, now_ms()],
             )?;
         }
-        for (i, link) in links.iter().enumerate() {
+        for (i, (link, _)) in previous.iter().enumerate() {
             if let Err(e) = self.point(link, Some(&bundle.hash)) {
-                for (link, previous) in links.iter().zip(&previous).take(i) {
-                    let _ = self.point(link, previous.as_deref());
-                }
-                return Err(e);
+                return Err(self.put_back(&previous[..i], e));
             }
         }
-        tx.commit()?;
-        Ok(())
+        tx.commit().map_err(|e| self.put_back(&previous, e.into()))
     }
 
     /// Undo each link's newest activation not yet undone: point it back at
@@ -385,22 +439,52 @@ impl Catalog {
                 params![link.as_os_str().as_bytes(), previous, now, undoes, now_ms()],
             )?;
         }
-        for (link, _, _, previous) in &back {
-            self.point(link, previous.as_deref())?;
+        let was: Vec<(&PathBuf, Option<String>)> = back.iter().map(|(link, _, now, _)| (*link, now.clone())).collect();
+        for (i, (link, _, _, previous)) in back.iter().enumerate() {
+            if let Err(e) = self.point(link, previous.as_deref()) {
+                return Err(self.put_back(&was[..i], e));
+            }
         }
-        tx.commit()?;
+        tx.commit().map_err(|e| self.put_back(&was, e.into()))?;
         Ok(back.into_iter().map(|(_, _, _, previous)| previous).collect())
     }
 
-    /// Every bundle a link points at now, once each.
+    /// Each link Relic made that still points where Relic last put it: the
+    /// filesystem, not the log, says what an agent can load.
     pub fn active(&self) -> Result<Vec<ActiveSkill>, CatalogError> {
+        use std::os::unix::ffi::OsStrExt as _;
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT b.name, b.description, b.hash FROM activation a JOIN bundle b ON b.hash = a.bundle
-             WHERE a.id IN (SELECT MAX(id) FROM activation GROUP BY link) ORDER BY b.name",
+            "SELECT b.name, b.description, b.hash, a.link FROM activation a JOIN bundle b ON b.hash = a.bundle
+             WHERE a.id IN (SELECT MAX(id) FROM activation GROUP BY link) ORDER BY b.name, a.link",
         )?;
-        let rows = stmt.query_map([], |r| Ok(ActiveSkill { name: r.get(0)?, description: r.get(1)?, bundle: r.get(2)? }))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let rows = stmt.query_map([], |r| {
+            let link: Vec<u8> = r.get(3)?;
+            Ok(ActiveSkill {
+                name: r.get(0)?,
+                description: r.get(1)?,
+                bundle: r.get(2)?,
+                link: PathBuf::from(std::ffi::OsStr::from_bytes(&link)),
+            })
+        })?;
+        let all: Vec<ActiveSkill> = rows.collect::<Result<_, _>>()?;
+        Ok(all.into_iter().filter(|s| self.current(&s.link).ok().flatten().as_deref() == Some(s.bundle.as_str())).collect())
     }
+}
+
+/// The active skills an agent started in `here` would load: those linked
+/// under `home`, or under `here` or a directory above it. Of two with one
+/// name, the project's shadows the user's and the nearer project's the
+/// farther, as harnesses do.
+pub fn visible(mut skills: Vec<ActiveSkill>, home: Option<&Path>, here: &Path) -> Vec<ActiveSkill> {
+    let base = |s: &ActiveSkill| s.link.ancestors().nth(3).map(Path::to_path_buf);
+    skills.retain(|s| base(s).is_some_and(|b| Some(b.as_path()) == home || here.starts_with(&b)));
+    skills.sort_by_key(|s| {
+        let b = base(s);
+        std::cmp::Reverse((b.as_deref() != home, b.map_or(0, |b| b.components().count())))
+    });
+    let mut seen = std::collections::HashSet::new();
+    skills.retain(|s| seen.insert(s.name.clone()));
+    skills
 }
 
 /// Words that say nothing about which skill a question needs.
@@ -439,7 +523,7 @@ mod tests {
     use super::*;
 
     fn skill(name: &str, description: &str) -> ActiveSkill {
-        ActiveSkill { name: name.into(), description: description.into(), bundle: name.into() }
+        ActiveSkill { name: name.into(), description: description.into(), bundle: name.into(), link: PathBuf::new() }
     }
 
     #[test]
@@ -471,13 +555,15 @@ mod tests {
         let vid = catalog.add_validation("d", &v).unwrap();
         let bundle = |md: &str| {
             let b = catalog.install("git-reflog-recovery", "d", md).unwrap();
-            catalog
-                .conn
-                .execute("INSERT OR IGNORE INTO bundle VALUES (?1, ?2, 'd', ?3, '[]', ?4)", params![b.hash, b.name, vid, now_ms()])
-                .unwrap();
+            catalog.record(&b, vid, "[]").unwrap();
             b
         };
         let (one, two) = (bundle("one"), bundle("two"));
+        let named = || catalog.bundle("git-reflog-recovery").unwrap().hash;
+        assert_eq!(named(), two.hash);
+        // Compiling content again makes it what the name means again.
+        bundle("one");
+        assert_eq!(named(), one.hash);
         let skills = dir.path().join("home/.agents/skills");
         let link = skills.join("git-reflog-recovery");
         let read = |link: &Path| fs::read_to_string(link.join("SKILL.md")).unwrap();
@@ -492,10 +578,12 @@ mod tests {
 
         assert_eq!(catalog.rollback(std::slice::from_ref(&link)).unwrap(), [Some(one.hash.clone())]);
         assert_eq!(read(&link), "one");
-        // Back past the first activation: no link at all.
+        // Removed by hand: no agent can load it, and rolling back past the
+        // first activation, to no link at all, still works.
+        fs::remove_file(&link).unwrap();
+        assert!(catalog.active().unwrap().is_empty());
         assert_eq!(catalog.rollback(std::slice::from_ref(&link)).unwrap(), [None]);
         assert!(fs::symlink_metadata(&link).is_err(), "rolled back to before the first activation");
-        assert!(catalog.active().unwrap().is_empty());
         assert!(matches!(catalog.rollback(std::slice::from_ref(&link)), Err(CatalogError::NothingToRollBack(_))));
 
         // A skill the user made themselves is never replaced, and an all-or-
@@ -507,14 +595,33 @@ mod tests {
         assert!(matches!(err, CatalogError::NotOurs(p) if p == theirs));
         assert!(fs::symlink_metadata(&mine).is_err());
 
-        // A swap that fails part-way puts back the links already swapped.
-        use std::os::unix::fs::PermissionsExt;
+        // A swap that fails part-way puts back the links already swapped:
+        // here a skills directory that is a link to nowhere.
         catalog.activate(&one, std::slice::from_ref(&link)).unwrap();
-        let locked = dir.path().join("locked/.agents/skills");
-        fs::create_dir_all(&locked).unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
-        assert!(catalog.activate(&two, &[link.clone(), locked.join("git-reflog-recovery")]).is_err());
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        assert!(catalog.activate(&two, &[link.clone(), dangling.join("git-reflog-recovery")]).is_err());
         assert_eq!(read(&link), "one");
         assert_eq!(catalog.active().unwrap().iter().map(|s| s.bundle.as_str()).collect::<Vec<_>>(), [one.hash.as_str()]);
+    }
+
+    #[test]
+    fn an_agent_sees_its_users_skills_and_its_projects_with_the_nearer_one_shadowing() {
+        let at = |name: &str, base: &str| ActiveSkill { link: PathBuf::from(format!("{base}/.agents/skills/{name}")), ..skill(name, base) };
+        let skills = vec![
+            at("git-x", "/home/u"),
+            at("git-x", "/work"),
+            at("git-x", "/work/app"),
+            at("certs", "/home/u"),
+            at("deploy", "/elsewhere"),
+            at("lint", "/work/app/sub"),
+        ];
+        let seen = visible(skills.clone(), Some(Path::new("/home/u")), Path::new("/work/app"));
+        let seen: Vec<(&str, &str)> = seen.iter().map(|s| (s.name.as_str(), s.description.as_str())).collect();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen.contains(&("git-x", "/work/app")) && seen.contains(&("certs", "/home/u")), "{seen:?}");
+        // Outside every project, only the user's own.
+        let seen = visible(skills, Some(Path::new("/home/u")), Path::new("/home/u/notes"));
+        assert!(seen.iter().all(|s| s.description == "/home/u") && seen.len() == 2, "{seen:?}");
     }
 }
