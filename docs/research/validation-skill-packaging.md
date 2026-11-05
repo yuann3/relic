@@ -230,9 +230,23 @@ Pointer transaction = one `INSERT OR REPLACE` plus one history `INSERT`. CAS ins
 - Activation, about 18 ms on macOS, is a rare explicit user action, so these costs do not matter for any gate.
 - A Linux run on bare ext4 is still owed to the release slice.
 
-## Open for V2
+## V2 findings
 
-- What `forget` does to skills that cite a forgotten record.
-- How often fixture steps are shown by reference rather than inline, and whether `relic show` lands with the compiler or before it.
+[V2](https://github.com/yuann3/relic/issues/33) built the path in `src/validation.rs` and `src/catalog/`, and `a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question` in `tests/recall_cli.rs` runs it end to end on a lost-commit fixture: a scripted recall, `relic validate`, `relic skill compile`, `relic skill activate --user --yes`, a sibling question, a distractor, and `relic skill rollback`.
+
+- **The V1 decisions held.** The bundle is spec-only, links go into `.agents/skills`, nothing is escaped, and citations are `[id, keyed hash]` pairs stored with each bundle in `catalog.db`.
+- **The verifier** runs as section 8 describes and is labelled `unisolated`. Its argv and cwd are stored redacted: the test puts a canary in the verifier's argv and finds none in the catalog. A record confirms only when the verifier exits 0, and compile needs one confirmed for the blake3 digest of the exact report file, so an edited report has to be validated again.
+- **Commands come from the store, not the report.** Compile reads each cited record's `safe_text` from the store, so a hand-edited step cannot put a command into a skill, and a forgotten record stops compilation.
+- **On the fixture, one recovery step of three was shown by reference.** `git reflog | awk '{print $1}'` holds `$1`. `relic show` landed before the compiler.
+- **`FinishV1.procedure` keeps `{ text, supports }`.** The compiler needed nothing more.
+- **The catalog lives beside the store** in `<db>.catalog/`, so a `--db` store keeps its own skills, and a recall never creates one. SQLite deletes the WAL when the last connection closes, so after a command only `catalog.db` and the bundles remain.
+- **Activation** refuses a path holding a real directory or a link Relic did not make, checks every link before swapping any, and puts back the links already swapped if a later swap fails. Rollback undoes the newest activation not yet undone, so repeating it walks back through history.
+- **The host step** (`catalog::select`) takes words of 3 or more characters, minus stop words, from the question and from each active skill's name and description. It picks the skill sharing the most words, if it shares at least 2 and no other skill shares as many. It runs before the first request, and the recall log records a `skill` line between `start` and the first `send`. The report's `skill` field gives the name and bundle hash. "I dropped a stash by mistake, how do I recover it with git?" picks `git-reflog-recovery`, and a certbot question picks nothing.
+- **Deferred to S5:** the pick is logged and reported, but the investigation does not use it yet. Seeding the root state with the skill belongs with the seeded cases. The TUI passes no skills.
+
+## Still open
+
+- What `forget` does to skills that cite a forgotten record. The catalog now stores each bundle's cited ids, so naming those skills is one query ([S13](https://github.com/yuann3/relic/issues/38) covers forget for Git records).
 - Whether the opt-in `.claude/skills` link is still needed once claude-code#16345 lands.
 - Symlink loading in one or two of the closed harnesses that read `~/.agents/skills` (Cursor, Copilot CLI).
+- A Linux run of the durability costs on bare ext4.
