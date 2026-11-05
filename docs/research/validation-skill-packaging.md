@@ -1,90 +1,161 @@
 # Validation, skill packaging and activation for Relic v0.1
 
 **Status:** research findings for [[V1] Research validation, skill packaging and activation](https://github.com/yuann3/relic/issues/32)  
-**Decision scope:** how a cited procedure becomes an Agent Skill, how verifiers run, the CAS layout, activation, durable citations and catalog durability. These findings work inside [0012](../adr/0012-validation-boundary.md), [0013](../adr/0013-skill-catalog-direction.md) and [0016](../adr/0016-acceptance-fixture-and-reuse-gate.md); [[V2] Prototype validate, compile, activate and rollback on the Git-recovery fixture](https://github.com/yuann3/relic/issues/33) confirms or replaces them.  
-**Research date:** 2026-11-05
+**Decision scope:** how a cited procedure becomes an Agent Skill, how verifiers run, the bundle layout, activation, durable citations and catalog durability. These findings work inside [0012](../adr/0012-validation-boundary.md), [0013](../adr/0013-skill-catalog-direction.md) and [0016](../adr/0016-acceptance-fixture-and-reuse-gate.md); [[V2] Prototype validate, compile, activate and rollback on the Git-recovery fixture](https://github.com/yuann3/relic/issues/33) confirms or replaces them.  
+**Research date:** 2026-11-05  
+**Target:** the [Agent Skills](https://agentskills.io) open standard and the harnesses that implement it, not one vendor.
 
 ## Decision
 
-- **A compiled skill is one `SKILL.md`: no `scripts/`, no `references/`, no `allowed-tools`, no `hooks`.**
-- **Recovered step text is not safe in `SKILL.md` as it stands.** Claude Code runs `` !`cmd` `` and ` ```! ` blocks when a skill is invoked, even inside a code fence. It also rewrites `$0`–`$N`, `$ARGUMENTS` and `${CLAUDE_*}`. The compiler escapes what can be escaped and refuses a step that cannot be.
-- **A model-invocable skill does not make Relic execute anything.** Invoking the skill only loads text. Every command an agent then runs goes through the agent's own permission flow. The skill body tells the agent to show the steps and ask before running any.
-- **The `<hash>/<name>/` CAS layout works.** Symlinked skill directories load in both Claude Code (tested on 2.1.318) and Prime Agent (in its code), under the link's name.
-- **Durable citations should be observation id plus a keyed content hash**, not revision + ordinal + hash. Rescrub, `--shell` correction and a rebuild all give rows new revisions.
-- **On macOS only `F_FULLFSYNC` is durable**, at about 4 ms per sync. `catalog.db` needs WAL, `synchronous=FULL` and `fullfsync=ON`. One activation costs about 18 ms on macOS, which is irrelevant to any gate.
-- **The Claude Code transcript records a Skill invocation in a parseable way**, but Anthropic documents the format as internal and unstable. It stays release evidence, as ADR 0016 already has it.
-- **Prime Agent discovers skills, but only v0.7.0 documented where.** Its current Rust releases do not. Prime activation stays deferred.
+- **Relic emits portable Agent Skills.** A bundle is one `SKILL.md` holding only spec frontmatter (`name`, `description`, `metadata`), with no `scripts/`, `references/`, `allowed-tools` or vendor fields. It passes the reference validator, `skills-ref validate`.
+- **Activation links into the cross-client `.agents/skills/` directories:** `~/.agents/skills/<name>` for the user, or `<project>/.agents/skills/<name>` for one project. Twelve harnesses read the user path, and Antigravity and Letta read the project one. Claude Code reads neither, so `.claude/skills/<name>` is an opt-in second link.
+- **A symlinked `<hash>/<name>/` bundle works** in every harness checked with symlink evidence, except Kiro's IDE, which doesn't follow skill symlinks.
+- **Step text goes into `SKILL.md` only when no harness would change or run it.** The standard defines no body preprocessing ("There are no format restrictions"), but Claude Code, Goose and Letta each rewrite or execute parts of the body, and no single escape works in all of them. A step that would trip one is shown by record id, and the agent reads its exact text with `relic show <id>`. Nothing is escaped.
+- **Invoking a compiled skill makes nothing run.** The skill tells the agent to show the steps and ask before running any. Commands then go through the agent's own permission flow. This settles "silently executing recovered procedures".
+- **Also:**
+  - Durable citations are an observation id plus a keyed content hash.
+  - `catalog.db` needs `fullfsync=ON` on macOS.
+  - Claude Code's transcript records Skill use parseably but under an unstable format.
+  - Prime discovers skills, including `~/.agents/skills`, but its current release documents no skills directory.
 
-## 1. Recovered text inside a skill
+## 1. What the standard fixes and what it leaves open
 
-### What Claude Code does to `SKILL.md`
+Sources: the [specification](https://agentskills.io/specification), the [client implementation guide](https://agentskills.io/client-implementation/adding-skills-support), and the [agentskills/agentskills](https://github.com/agentskills/agentskills/tree/83021e2be457a9b6679148719c1f6074f0ad975e) repository at `83021e2`, all fetched 2026-11-05.
 
-Claude Code renders a skill's body before the model sees it ([skills docs](https://code.claude.com/docs/en/skills), fetched 2026-11-05):
+- **Authority.** The repository's `AGENTS.md`: "`docs/specification.mdx` is authoritative for format requirements. Explanatory documentation, examples, tests, and implementations do not add requirements to the format."
+- **The spec covers what goes inside a skill directory.**
+  - Frontmatter fields: `name`, `description`, `license`, `compatibility`, `metadata`, `allowed-tools` ("Experimental").
+  - The name: 1–64 characters of `a-z0-9-`, not starting or ending with a hyphen, no `--`, and it "Must match the parent directory name".
+  - The body: "There are no format restrictions… the agent will load this entire file once it's decided to activate a skill."
+  - File references: "use relative paths from the skill root… one level deep".
+- **The spec does not define:** a location, installation, update, version field, package format, symlink policy or any body preprocessing. No spec version is tagged yet. GOVERNANCE.md (adopted 2026-11-04 with the move to the Agentic AI Foundation) promises tagged releases with a changelog.
+- **Locations come from the client guide, as a recommendation.** Scan a client-specific directory and "the **`.agents/skills/` convention**… for cross-client skill sharing". "Project-level skills override user-level skills." Gate project skills on folder trust. "Name doesn't match the parent directory name → warn, load anyway." The convention came from issue [#15](https://github.com/agentskills/agentskills/issues/15) and entered the guide through PR [#200](https://github.com/agentskills/agentskills/pull/200). Issue #15 is still open, and lists Claude Code as "Pending" ([claude-code#16345](https://github.com/anthropics/claude-code/issues/16345)).
+- **Versioning, per the maintainers:** keep it out of `SKILL.md`. Use "a `metadata.version` field (which some people are already using)" (Discussion [#420](https://github.com/agentskills/agentskills/discussions/420#discussioncomment-17486815)), and treat versioning as "part of the distribution mechanism" (issue [#46](https://github.com/agentskills/agentskills/issues/46)).
+- **Distribution, proposed only:** a `.well-known/agent-skills/index.json` index with `sha256:{hex}` digests and `.tar.gz`/`.zip` archives that "Reject… symlinks or hard links that resolve outside the skill directory" (PR [#254](https://github.com/agentskills/agentskills/pull/254), open).
+- **The skills-ref validator:**
+  - It compares the unresolved `Path.name` of the given directory with `name`.
+  - It rejects any top-level field outside the six: "Unexpected fields in frontmatter".
+  - It calls itself "a demonstration artifact".
+- **The most widely used installer is Vercel's `skills` CLI** (`npx skills add`, [vercel-labs/skills](https://github.com/vercel-labs/skills/tree/a0a1bb93d342061ce4ddf3e8d88fe8314d9f1f9c) v1.7.6). It is not part of the standard.
+  - Its default mode is the same model as Relic's: "copy into the canonical dir, symlink agent dirs to it". The canonical directory is `.agents/skills/<name>`.
+  - It skips the per-agent link for agents that already read `~/.agents/skills`.
 
-- "The `` !`<command>` `` syntax runs shell commands before the skill content is sent to Claude. The command output replaces the placeholder". "The inline form is only recognized when `!` appears at the start of a line or immediately after whitespace." Multi-line: "a fenced code block opened with ` ```! `".
-- "Injected commands never prompt for permission while the skill renders. Claude Code checks each one against your permission rules first… Outside auto mode, when a command's permission check returns anything other than allow, Claude Code aborts the invocation."
-- Substitution: "`$ARGUMENTS` | All arguments passed", "`$ARGUMENTS[N]`", "`$N` | Shorthand for `$ARGUMENTS[N]`", "`$name` | Named argument", and `${CLAUDE_SESSION_ID}`, `${CLAUDE_SKILL_DIR}` and others. "To include a literal `$` before a digit, `ARGUMENTS`, or a declared argument name… escape it with a backslash". "A doubled backslash such as `\\$1` leaves both backslashes in place, and `$1` still expands". "A backslash doesn't prevent substitution of a `${CLAUDE_*}` variable".
-- A kill switch exists for users, `"disableSkillShellExecution": true` (CHANGELOG 2.1.91), but Relic cannot rely on it being set.
+## 2. Where harnesses look, and whether a symlinked bundle loads
 
-### Experiments (Claude Code 2.1.318, `claude -p --model haiku`, project skills symlinked into a CAS under `/tmp`)
+Read on 2026-11-05. Each open-source repository was read at its default-branch HEAD; closed-source harnesses from their official docs.
+
+| Harness | User dirs | Project dirs | Symlinked skill dir | Name vs directory |
+|---|---|---|---|---|
+| Codex CLI (`ed8eac4`) | `~/.agents/skills` | `.agents/skills`, cwd up to repo root | followed (`DirectorySymlinkPolicy::Follow`); a symlinked *file* is skipped | name optional, no check |
+| Gemini CLI (`1fe22af`) | `~/.gemini/skills`, `~/.agents/skills` | `.gemini/skills`, `.agents/skills` (trusted folders) | followed (glob `*/SKILL.md`; `/skills link` itself symlinks) | no check |
+| OpenCode (`af5d3b5`) | `~/.config/opencode/skills`, `~/.claude/skills`, `~/.agents/skills` | `.opencode`, `.claude`, `.agents` `/skills`, in ancestors | followed (re-`stat` of `SymbolicLink`) | the directory is the id |
+| Amp (closed) | `~/.config/agents/skills`, `~/.agents/skills`, `~/.config/amp/skills`, `~/.claude/skills` | `.agents/skills`, `.claude/skills`, in parents | followed (tested with `amp skills list`) | not enforced locally |
+| VS Code Copilot (`8bf7aa0`) | `~/.agents/skills`, `~/.copilot/skills`, `~/.claude/skills` | `.agents/skills`, `.github/skills`, `.claude/skills` | followed (`readdir` resolves links) | folder name wins |
+| Copilot CLI (closed) | `~/.copilot/skills`, `~/.agents/skills` | `.github`, `.claude`, `.agents` `/skills` | not documented | "Typically matches" |
+| Cursor (closed) | `~/.agents`, `~/.cursor`, `~/.claude`, `~/.codex` `/skills` | the same under the project, nested | fixed in 2.5 (staff, forum; not in docs) | "Must match the parent folder name" |
+| Devin Local / Windsurf (closed) | `~/.config/devin/skills`, `~/.agents/skills` | `.devin`, `.agents`, `.windsurf` `/skills` | not documented | spec charset |
+| Junie CLI (closed) | `~/.junie/skills`, `~/.agents/skills` | `.junie/skills`, `.agents/skills` (trusted) | not documented | no rule |
+| Factory Droid (closed) | `~/.factory/skills`, `~/.agents/skills` | `.factory/skills`, `.agents/skills` | not documented | invalid name shown as "Invalid" |
+| Antigravity (closed) | `~/.gemini/config/skills` | `.agents/skills`, parents to repo root | not documented | defaults to folder |
+| Goose (`bfe8ccd`) | `~/.agents/skills`, config dir, `~/.claude/skills`, `~/.config/agents/skills` | `.agents/skills`, `.goose/skills`, `.claude/skills` (cwd) | followed ("follows file and directory symlinks, including targets outside a root") | no check |
+| Letta Code (`ee6e2c5`) | `~/.letta/skills` | `.agents/skills` | followed (`stat` of a symlink) | not enforced |
+| Prime Agent (`74591cd`) | `~/.prime/agent/skills`, `~/.agents/skills` | `.prime/agent/skills`, `.agents/skills`, to git root | followed (`std::fs::metadata`) | warning only |
+| Claude Code 2.1.318 | `~/.claude/skills` | `.claude/skills` | followed (documented, and tested) | listed as `link (frontmatter)` when they differ |
+| Kiro (closed) | `~/.kiro/skills` | `.kiro/skills` | **not followed** in the IDE ([Kiro#6401](https://github.com/kirodotdev/Kiro/issues/6401), open) | "Must match folder name" |
+
+**Consequences for activation:**
+
+- **The activation targets are `~/.agents/skills/<name>` (user) and `<project>/.agents/skills/<name>` (project).** The user path reaches Codex, Gemini CLI, OpenCode, Amp, VS Code, Copilot CLI, Cursor, Devin, Junie, Factory, Goose and Prime. The project path also reaches Antigravity and Letta.
+- **Claude Code needs its own link, `.claude/skills/<name>`,** until claude-code#16345 lands. It is offered as an opt-in second link, swapped and rolled back together with the first, with the target named in the confirmation. Each link is one discovery path for the same skill, not a second consumer to govern.
+- **Kiro is not supported in v0.1.** It would need a copied directory, which loses the atomic swap and the single source of truth.
+- **Layout rules every harness accepts:**
+  - The link name, the bundle directory's name and frontmatter `name` are identical, and spec-valid.
+  - `SKILL.md` is a regular file inside the bundle, never a symlink: Codex skips symlinked files.
+  - Relic writes nothing else into a skills directory. OpenCode loads stray root-level `*.md` files as skills.
+- **Project scope:** several harnesses load project skills only in trusted folders (Gemini CLI, Junie, VS Code). User scope is the default; project scope needs the explicit target flag.
+- **Reload.** The working assumption for V2 is that any harness notices a repointed link. The sources split:
+  - Watched (the swap is seen mid-session): Codex (10 s throttle), OpenCode, VS Code, Letta and Claude Code.
+  - Re-read on every load: Goose.
+  - Reload by command: Gemini CLI (`/skills reload`), Amp (`reload_skills`), Copilot CLI (`/skills reload`), Cursor (at start).
+
+  So the activation message should say that a running session may need its reload command.
+
+## 3. What harnesses do to the body
+
+The standard defines no preprocessing. Implementations add their own; issue [#124](https://github.com/agentskills/agentskills/issues/124), on dynamic context injection, is an open proposal.
+
+| Harness | What it changes in `SKILL.md` before the model sees it |
+|---|---|
+| Claude Code | Runs `` !`cmd` `` (at line start or after whitespace) and ` ```! ` blocks, **even inside code fences** (tested, below). Replaces `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_*}`. `\$` escapes all but `${CLAUDE_*}`, and "A doubled backslash such as `\\$1` leaves both backslashes in place, and `$1` still expands". |
+| Goose | When arguments are passed, replaces `\$ARGUMENTS\[(?P<idx>\d+)\]\|\$ARGUMENTS\b\|\$(?P<pos>\d+)\|\$(?P<name>…)` (declared names only) everywhere, fences included. It has **no escape**: `\$1` keeps its backslash and still expands ([arguments.rs](https://github.com/block/goose/blob/bfe8ccd23de1d2c47a4cb2970d522f093ae7f2ba/crates/goose-agent/src/skills/arguments.rs#L37-L83)). Frontmatter is split on `---`. |
+| Letta Code | Replaces `<SKILL_DIR>` and `${CLAUDE_SKILL_DIR}` across the whole file. |
+| Factory Droid | Expands `${DROID_PLUGIN_ROOT}`, for plugin skills only. |
+| VS Code Copilot | The model reads the raw file. The shared prompt parser recognises Markdown links, `#file:`, `#tool:` and `{{x}}` outside code spans and fences. Whether skills get them resolved was not confirmed. |
+| Codex, Gemini CLI, OpenCode, Prime | Pass the body unchanged. |
+| Amp, Copilot CLI, Cursor, Devin, Junie, Kiro, Antigravity | Not documented. |
+
+### Claude Code experiments (2.1.318, `claude -p --model haiku`, project skills symlinked into a CAS under `/tmp`)
 
 | Skill body | Allowlist | Result |
 |---|---|---|
-| ` ```! ` block running `touch` on a path outside the project | none | Invocation aborted by the permission check; nothing ran |
-| `` 1. Run !`touch INJECTED-INLINE` `` and a ` ```! ` block | `Bash(touch:*)` | **Both files created.** The model saw "(Bash completed with no output)" |
-| The same lines inside a ` ````text ` fence, and in an indented code block | `Bash(touch:*)` | **All three ran.** Markdown structure is not considered |
-| The same line in `references/procedure.md` | `Bash(touch:*)` | Not run: only `SKILL.md` is rendered |
-| `$0 $1 $ARGUMENTS $ARGUMENTS[0] ${CLAUDE_SKILL_DIR} ${CLAUDE_SESSION_ID} \$ARGUMENTS $$ARGUMENTS $HOME ${HOME}`, args `AAA BBB` | — | Rendered `AAA BBB [AAA BBB] AAA <link path> <session id> $ARGUMENTS $AAA BBB $HOME ${HOME}` |
-| `` ! `touch SPACED` ``, ``!\`touch BACKSLASHED\` ``, `` ```! `` mid-line | `Bash(touch:*)` | Left as text |
-| `$1` with a single argument passed | — | Left as text (no second argument) |
+| ` ```! ` block running `touch` outside the project | none | invocation aborted by the permission check; nothing ran |
+| `` 1. Run !`touch INJECTED-INLINE` `` and a ` ```! ` block | `Bash(touch:*)` | **both files created** |
+| the same lines inside a ` ````text ` fence, and indented | `Bash(touch:*)` | **all three ran** |
+| the same line in `references/procedure.md` | `Bash(touch:*)` | not run |
+| `$0 $1 $ARGUMENTS $ARGUMENTS[0] ${CLAUDE_SKILL_DIR} \$ARGUMENTS $$ARGUMENTS $HOME`, args `AAA BBB` | — | `AAA BBB [AAA BBB] AAA <link path> $ARGUMENTS $AAA BBB $HOME` |
+| `` ! `touch SPACED` ``, ``!\`touch BACKSLASHED\` ``, `` ```! `` mid-line | `Bash(touch:*)` | left as text |
 
-**Consequence:** a recovered command such as `awk '{print $1}'` reaches the agent changed. A recovered `` x=1 !`cmd` `` would run under an allowlist the user wrote for other reasons. `${CLAUDE_SKILL_DIR}` resolves to the symlink path, not the CAS path.
+A project skill's `references/` file could not be read through the symlink: "outside the allowed working directories, so the read was denied".
 
-### Compile rule
+### Compile rule: shown or referenced, never escaped
 
-The compiler renders each step's redacted `safe_text`. For each step:
+No escape works everywhere: Claude Code's `\$` stays a literal backslash in Goose. So Relic does not escape. For each step, the compiler checks the redacted `safe_text` against the union of the hazards above:
 
-- Each `$` directly followed by a digit, `ARGUMENTS` or `{CLAUDE_` is a hazard. A `$` before a digit or `ARGUMENTS` is escaped as `\$`; Claude Code removes the backslash, so the agent sees the text as recorded.
-- A step is **refused**, with a message naming the step, if it holds anything that cannot be escaped:
-  - `${CLAUDE_`;
-  - a backslash already before `$<digit>` or `$ARGUMENTS`;
-  - `!` followed by a backtick at the start of a line or after whitespace;
-  - a line starting ` ```! `.
+- `$` followed by a digit; `$ARGUMENTS`; `${CLAUDE_`; `${DROID_`; `<SKILL_DIR>`;
+- `!` immediately followed by a backtick, at the start of a line or after whitespace;
+- a line starting ` ```! `;
+- `#file:`, `#tool:` or `{{`, for VS Code. Steps sit in code fences, which VS Code skips, but checking costs nothing.
 
-  Such sequences are rare in shell history. A refused step is never silently dropped.
-- Relic declares no `arguments`, so no `$name` placeholder exists.
-- Steps stay in `SKILL.md` rather than moving to `references/`. With a project skill, the model's `Read` of a file in the bundle was denied, because the symlink resolves outside the working directories: "`references/word.md`, is a symlink to `/private/tmp/relic-v1/cas/…`, which is outside the allowed working directories, so the read was denied". `SKILL.md` itself is loaded by Claude Code and needs no `Read`.
+A step with none of these is shown in a fenced block. The fence is longer than any backtick run in the text, per CommonMark, so the text cannot close it. A step with any of them is **shown by reference**: the body names its record id, says the exact text is withheld because agents rewrite it, and tells the agent to read it with `relic show <id>`.
+
+`relic show` is a read-only command that prints one record's redacted text and does not exist yet. `$1` inside `awk '{print $1}'` is common in shell history, so referencing will happen. It is a read-only Relic command, not a recovered procedure. It also reports a forgotten record as gone, which embedded text cannot.
+
+Frontmatter is generated by Relic and never contains `---`, `$`, `!` or backticks.
 
 ### Redacted spans
 
-A `[REDACTED:<kind>]` marker stays in the step as written. The skill body says each marker is a value the user must supply, and that the agent asks for it rather than guessing it. Nothing redacted is ever recovered into the bundle. A step that is only a marker still carries its citations. Typed markers ([0003](../adr/0003-redaction-policy.md)) tell the agent what kind of value is needed.
+A `[REDACTED:<kind>]` marker stays in the step as written. None of the harnesses checked treats it specially; VS Code would read a link only if `(` followed it directly. The body says each marker is a value the user must supply and the agent asks for it rather than guessing it. Nothing redacted is recovered into the bundle.
 
 ### Evidence for the open `FinishV1.procedure` field set
 
-Nothing here needs a new field. The compiler needs each step's text and its cited record ids, which `{ text, supports }` already gives. Parameter slots fall out of the markers. Keep the shape and settle it in V2, as [0012](../adr/0012-validation-boundary.md) says.
+Nothing here needs a new field. The compiler needs each step's text and its cited record ids, which `{ text, supports }` gives. Keep the shape and settle it in V2, as [0012](../adr/0012-validation-boundary.md) says.
 
-## 2. `scripts/`, model invocation and "silently executing recovered procedures"
+## 4. `scripts/`, model invocation and "silently executing recovered procedures"
 
-- The spec allows `scripts/`, which "Contains executable code that agents can run" ([specification](https://agentskills.io/specification), fetched 2026-11-05). A script built from recovered steps would be Relic writing an executable from recalled commands, which [0012](../adr/0012-validation-boundary.md) forbids. **No `scripts/`.**
-- `allowed-tools` lists "Tools Claude can use without asking permission during the turn that invokes this skill". "Workspace trust doesn't gate this field. Claude Code applies a project skill's `allowed-tools` even in a `-p` run in a folder you've never trusted" ([skills docs](https://code.claude.com/docs/en/skills)). Paired with any command, it would turn invocation into execution. **Relic never emits `allowed-tools`**, and never emits `hooks` either.
-- With those removed and the hazards above escaped, invoking a compiled skill injects text and nothing else. Bash keeps "Permission required: Yes" ([tools reference](https://code.claude.com/docs/en/tools-reference)). Whether a command then runs without a prompt depends on the user's own agent settings (allow rules, auto or bypass mode), not on anything Relic wrote. That is not Relic silently executing a procedure. The skill body still states "show these steps and ask before running any of them", so the release session shows a confirmation.
-- `disable-model-invocation: true` stays off: the reuse gate's release session needs the model to pick the skill ([0016](../adr/0016-acceptance-fixture-and-reuse-gate.md)).
+- The spec allows `scripts/`, "executable code that agents can run". A script built from recovered steps would be Relic writing an executable from recalled commands, which [0012](../adr/0012-validation-boundary.md) forbids. **No `scripts/`.**
+- `allowed-tools` pre-approves tools. In Claude Code, "Workspace trust doesn't gate this field", even for a `-p` run in an untrusted folder. **Relic never emits it**, nor any vendor field (hooks, `context`, `model`), which skills-ref rejects anyway.
+- With those out, and hazardous steps referenced rather than embedded, invoking a compiled skill injects text and nothing else. Whether a command then runs without a prompt depends on the user's own agent settings, not on anything Relic wrote. The body says "show these steps and ask before running any of them".
+- `disable-model-invocation` stays unset. The reuse gate's release session needs the model to pick the skill ([0016](../adr/0016-acceptance-fixture-and-reuse-gate.md)), and some harnesses (Prime, Gemini CLI) don't read the field anyway.
 
-## 3. CAS layout and activation
+## 5. Bundle layout and frontmatter
 
-Layout: `<data dir>/catalog/<hash>/<name>/SKILL.md`. The activation link is `~/.claude/skills/<name>` or `<project>/.claude/skills/<name>`.
+- **Layout:** `<data dir>/catalog/<hash>/<name>/SKILL.md`. The link is `<skills dir>/<name>` → `<data dir>/catalog/<hash>/<name>`.
+  - skills-ref checks the unresolved directory name, and `to-prompt` resolves the link. Both see `<name>`.
+  - Prime and Codex both drop duplicates by real path, so two links to one bundle load once.
+- **Frontmatter:**
+  ```yaml
+  name: <name>
+  description: <what it recovers and when to use it, ≤1024 characters>
+  metadata:
+    relic-bundle: blake3:<hex>
+    relic-version: <x.y.z>
+  ```
+  The spec says to make metadata keys "reasonably unique". `version` is left out of the top level, per the maintainers. The bundle hash names the content as the digest in PR #254 would: the content-addressed directory is already the version.
+- **Not verified:** whether Copilot CLI, Devin, Junie, Factory and Antigravity follow a symlinked skill directory. All of them read `~/.agents/skills`, so V2 should test one or two of them before promising them.
 
-- **Claude Code:** "a `<skill-name>` entry in the enterprise, personal, or project location can be a symlink to a directory elsewhere on disk. Claude Code reads `SKILL.md` from the target" ([skills docs](https://code.claude.com/docs/en/skills)). Tested:
-  - Two project symlinks into a CAS loaded, and the model invoked `relic-probe` and returned its word.
-  - A link named `relic-alias` pointing at a bundle whose frontmatter says `relic-other` was listed as `relic-alias (relic-other)`, and both names invoke it (CHANGELOG 2.1.290).
-  - Relic keeps link name, directory name and frontmatter `name` identical, so this case never arises.
-- **Spec and validator:** "name … Must match the parent directory name". The reference validator compares `skill_dir.name` of the path it is given, unresolved ([validator.py L60-65](https://github.com/agentskills/agentskills/blob/83021e2be457a9b6679148719c1f6074f0ad975e/skills-ref/src/skills_ref/validator.py#L60-L65)). `<hash>/<name>/` satisfies it both through the link and at the target.
-- **Prime Agent:** follows symlinks via `std::fs::metadata` ([discovery.rs L45-52](https://github.com/PrimeIntellect-ai/prime-agent/blob/74591cddef28d11249c3171112114fc4755375d7/crates/pa-core/src/packages/resolve/discovery.rs#L45-L52)). It keeps the link's name, and drops duplicates by realpath.
-- **Reload:** Claude Code "watches skill directories for file changes… picks up the change within the current session" (CHANGELOG 2.1.0 added hot reload). No document covers a repointed symlink. Untested here; `/reload-skills` (2.1.152) is the fallback.
-- **Frontmatter Relic emits:** `name`, `description` (1–1024 characters, non-empty), `metadata` (relic version, bundle hash). These are all in the spec, so `skills-ref validate` passes. It rejects any field outside the spec's six, so Relic emits no Claude Code-only field.
-- **Unverified:** the personal location `~/.claude/skills` through a symlink. The docs say it works; I didn't touch the user's global skills directory.
+## 6. Agent traces that record skill use
 
-## 4. Claude Code transcripts
+### Claude Code
 
 - Official position: "The entry format is internal to Claude Code and changes between versions, so scripts that parse these files directly can break on any release" ([sessions docs](https://code.claude.com/docs/en/sessions), fetched 2026-11-05).
 - Observed shape, from counting records in this machine's `~/.claude/projects` without reading payloads (1428 files, versions 2.1.288–2.1.318):
@@ -96,7 +167,7 @@ Layout: `<data dir>/catalog/<hash>/<name>/SKILL.md`. The activation link is `~/.
 - The rendered skill body, with substitutions applied, is stored as an `isMeta` user message. So the transcript holds the skill text too: an imported trace re-imports a compiled skill's step text as agent evidence.
 - **Conclusion:** parseable, and seen unchanged across Claude Code 2.1.288–2.1.318 here, but the format is explicitly unstable. The S10 adapter pins a tested version range with fixtures and treats anything else as an unknown variant ([source contracts](source-evidence-contracts.md)). ADR 0016 already keeps it as release evidence, not a gate.
 
-## 5. Prime Agent
+### Prime Agent
 
 Read from source; no Prime binary is installed here. Versions read: v0.7.0 (`be9e2fa`, TypeScript) and `main` at `74591cd` (v0.10.2+36, Rust).
 
@@ -113,9 +184,9 @@ Read from source; no Prime binary is installed here. Versions read: v0.7.0 (`be9
 - **Fields and rules:** it reads only `name`, `description` and `disable-model-invocation`. Name rules are warnings; only an empty description is rejected. Skills reach the model as an `<available_skills>` block in the system prompt. There is no skill tool.
 - **Documentation:** v0.7.0 documented the directories in `packages/coding-agent/docs/skills.md`. The Rust port (`39bc99a9`, 2026-09-29) deleted that file. Current releases state the directories only inside the bundled `skill-creator` skill, which omits `.agents/skills`.
 - **Session JSONL** (version 3): no typed skill event. `/skill:<name>` becomes a user message starting `<skill name="X" location="…">`. A model-chosen use is an ordinary `python_repl` call.
-- **Conclusion:** symlink activation into `~/.prime/agent/skills` would work mechanically. Today's release has no documented directory, so 0013's deferral holds. `~/.agents/skills` is a cross-agent location worth revisiting with S11.
+- **Conclusion:** activation into `~/.agents/skills` reaches Prime with no Prime-specific step. Its skill use is not a typed transcript event, so Prime is not usable as reuse-gate evidence.
 
-## 6. Durable citations
+## 7. Durable citations
 
 [0013](../adr/0013-skill-catalog-direction.md) proposes revision + ordinal + content hash. What the store does to those fields:
 
@@ -134,13 +205,13 @@ Read from source; no Prime binary is installed here. Versions read: v0.7.0 (`be9
   - V2 must decide what `forget` does about a cited record: at minimum, name the skills that cite it, which needs the catalog to index cited ids.
   - The keyed hash lets someone holding the key confirm a guessed text. The boundary guard has the same property ([0002](../adr/0002-source-identity-and-revisions.md)).
 
-## 7. Verifiers
+## 8. Verifiers
 
 - `source/git.rs`'s `bounded` runner already has what [0012](../adr/0012-validation-boundary.md) needs: fixed argv, no shell, its own process group killed at the timeout, output capped, and stderr drained. The verifier generalizes it, setting a cwd the user chose.
 - `main` sets `umask(0o077)` and drops the old value (src/main.rs:17-18). A verifier must run under the user's original umask, so `main` keeps the returned mask and the verifier's `pre_exec` restores it.
 - The Git fixture's verifier, `git rev-parse --verify <ref>`, runs in well under the 10 s bound.
 
-## 8. Durability costs
+## 9. Durability costs
 
 Pointer transaction = one `INSERT OR REPLACE` plus one history `INSERT`. CAS install = write 4 KiB, sync the file, sync its directory, rename, sync the parent. Swap = `symlink` + `rename` + sync the directory. 40 samples each, script kept outside the repo.
 
@@ -161,7 +232,7 @@ Pointer transaction = one `INSERT OR REPLACE` plus one history `INSERT`. CAS ins
 
 ## Open for V2
 
-- Whether repointing an active symlink is seen mid-session, in both Claude Code and Prime.
 - What `forget` does to skills that cite a forgotten record.
-- Whether the compile refusals ever trigger on the fixture's steps.
-- The personal `~/.claude/skills` symlink, tested in a throwaway `HOME`.
+- How often fixture steps are shown by reference rather than inline, and whether `relic show` lands with the compiler or before it.
+- Whether the opt-in `.claude/skills` link is still needed once claude-code#16345 lands.
+- Symlink loading in one or two of the closed harnesses that read `~/.agents/skills` (Cursor, Copilot CLI).

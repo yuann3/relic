@@ -58,7 +58,7 @@ Provisional, like the items above. Both change the storage research behind [Choo
 
 ## Open facts
 
-- Answered by [V1](https://github.com/yuann3/relic/issues/32) in [docs/research/validation-skill-packaging.md](../research/validation-skill-packaging.md), for V2 to confirm: one `SKILL.md` with no `scripts/` or `allowed-tools`, recovered text escaped against Claude Code's load-time `!` execution and `$` substitution; `<hash>/<name>/` loads through a symlink in Claude Code and Prime; citations as observation id plus keyed hash; `catalog.db` needs `fullfsync=ON` on macOS. Prime's current release documents no skills directory, so its deferral stands.
+- Answered by [V1](https://github.com/yuann3/relic/issues/32) in [docs/research/validation-skill-packaging.md](../research/validation-skill-packaging.md), for V2 to confirm. A bundle is a portable Agent Skill: one `SKILL.md` with spec frontmatter only, and no `scripts/` or `allowed-tools`. Activation targets the cross-client `~/.agents/skills/<name>` (or the project `.agents/skills/<name>`), which most harnesses read. `.claude/skills/<name>` is an opt-in second link, because Claude Code does not read `.agents/skills` yet. A step that some harness would rewrite or execute (`$1`, `` !` ``, `${CLAUDE_*}`, …) is shown by record id rather than embedded. Citations are an observation id plus a keyed hash. `catalog.db` needs `fullfsync=ON` on macOS. Prime is reached through `~/.agents/skills`, and Kiro (no symlinks) is not supported.
 - The validation/skill research ticket must answer:
   - How a cited procedure that contains `[REDACTED:*]` spans becomes a reusable skill.
   - Whether skills may ship `scripts/`.
