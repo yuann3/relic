@@ -492,6 +492,9 @@ const STOPWORDS: &[&str] = &[
     "the", "and", "for", "with", "from", "that", "this", "how", "did", "does", "what", "when", "where", "can", "could",
     "would", "should", "get", "got", "use", "using", "into", "out", "was", "were", "are", "you", "your", "our", "its",
     "has", "have", "had", "not", "but", "all", "any", "some", "one", "back", "again", "after", "before", "then", "now",
+    // What is left of a contraction, and words any question could hold.
+    "won", "don", "didn", "doesn", "isn", "wasn", "aren", "why", "work", "works", "worked", "working", "thing",
+    "things", "stuff", "way", "need", "want", "make", "just", "like", "mistake", "something", "anything", "help",
 ];
 
 fn terms(text: &str) -> std::collections::BTreeSet<String> {
@@ -535,6 +538,7 @@ mod tests {
         assert_eq!(select("how did I renew the nginx certificate?", &skills), Some(&certs));
         // One shared word is not enough, and a tie names no skill.
         assert_eq!(select("what is git?", &skills), None);
+        assert_eq!(select("why won't git work in my repo?", &skills), None);
         let twin = skill("git-lost-work", "Recover lost Git work from the reflog");
         assert_eq!(select("recover lost git work", &[reflog, twin]), None);
     }
