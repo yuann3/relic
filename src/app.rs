@@ -480,6 +480,36 @@ impl CitedRecord {
     }
 }
 
+pub const RECORDS_SCHEMA: &str = "relic.records/v1";
+
+/// Records by id, as `relic show` prints them: the exact redacted text a
+/// skill points an agent to, rather than copy where agents rewrite it.
+#[derive(Debug, Serialize)]
+pub struct RecordsPage {
+    pub schema: &'static str,
+    pub records: Vec<CitedRecord>,
+    /// Ids that name no stored record: forgotten, or never stored.
+    pub missing: Vec<i64>,
+}
+
+pub fn show(store: &Store, ids: &[i64]) -> Result<RecordsPage, rusqlite::Error> {
+    let mut page = RecordsPage { schema: RECORDS_SCHEMA, records: Vec::new(), missing: Vec::new() };
+    for &id in ids {
+        match store.get_observation(id)? {
+            Some(o) => page.records.push(CitedRecord {
+                id: o.id,
+                revision: o.revision_id,
+                ordinal: o.ordinal,
+                source: source_label(o.kind),
+                observed_at_ms: o.observed_at_ms,
+                text: o.safe_text,
+            }),
+            None => page.missing.push(id),
+        }
+    }
+    Ok(page)
+}
+
 pub const RECALL_LOG_SCHEMA: &str = "relic.recall-log/v1";
 
 /// Where recalls against the store at `db` are logged: beside it, as its

@@ -20,6 +20,7 @@ USAGE:
 ",
             $ui,
             "    relic import <HISTORY_FILE | GIT_REPO> [--shell zsh|bash] [--db PATH]
+    relic show <ID>... [--db PATH] [--json]
     relic forget <ID>... [--db PATH]
     relic model check
     relic --help | --version
@@ -40,6 +41,9 @@ OPTIONS:
                   Let recall use a remote model with no prices set, whose
                   cost it then cannot cap. Calls, bytes, tokens and time
                   stay capped
+    show          Print records by id, exactly as stored (redacted). --json
+                  prints one relic.records/v1 document. Exit 1 if an id
+                  names no record
     forget        Delete records for good, by the id search --json and the TUI
                   show. Remove the line from your history file too, or a later
                   import of a rewritten file can store it again. A Git record
@@ -103,6 +107,7 @@ pub enum Command {
     Ui { db: Option<PathBuf> },
     Import { path: PathBuf, shell: Option<SourceKind>, db: Option<PathBuf> },
     Forget { ids: Vec<i64>, db: Option<PathBuf> },
+    Show { ids: Vec<i64>, db: Option<PathBuf>, json: bool },
     ModelCheck,
 }
 
@@ -194,12 +199,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             (Some(sub), _) => Err(format!("unknown model command: {sub}; try model check")),
             (None, _) => Err("model needs a command: model check".into()),
         },
-        "forget" => {
-            let (mut ids, mut db) = (Vec::new(), None);
+        sub @ ("forget" | "show") => {
+            let (mut ids, mut db, mut json) = (Vec::new(), None, false);
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
                     "-h" | "--help" => return Ok(Command::Help),
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
+                    "--json" if sub == "show" => json = true,
                     f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
                     // As the TUI shows it (`#42`) or bare.
                     id => ids.push(
@@ -210,9 +216,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 }
             }
             if ids.is_empty() {
-                return Err("forget needs at least one record id".into());
+                return Err(format!("{sub} needs at least one record id"));
             }
-            Ok(Command::Forget { ids, db })
+            Ok(if sub == "show" { Command::Show { ids, db, json } } else { Command::Forget { ids, db } })
         }
         other => Err(format!("unknown command: {other}")),
     }

@@ -69,6 +69,26 @@ fn run(cmd: Command) -> Result<ExitCode> {
             writeln!(out)?;
             verdict.map_err(|e| format!("model check failed: {e}"))?;
         }
+        Command::Show { ids, db, json } => {
+            let page = app::show(&Store::open_read_only(&existing_db(db)?)?, &ids)?;
+            let mut out = std::io::stdout().lock();
+            if json {
+                page.serialize(&mut serde_json::Serializer::with_formatter(&mut out, TerminalSafe))?;
+                writeln!(out)?;
+            } else {
+                for r in &page.records {
+                    writeln!(out, "#{} {} {}", r.id, r.source, r.when().label())?;
+                    for line in r.text.split('\n') {
+                        writeln!(out, "    {}", app::display_line(line))?;
+                    }
+                }
+            }
+            if !page.missing.is_empty() {
+                let ids: Vec<String> = page.missing.iter().map(|id| format!("#{id}")).collect();
+                eprintln!("relic: no such record: {} (forgotten, or never stored)", ids.join(" "));
+                return Ok(ExitCode::FAILURE);
+            }
+        }
         Command::Forget { ids, db } => {
             let owns_dir = cli::owns_data_dir(&db);
             let db = existing_db(db)?;

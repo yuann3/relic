@@ -192,9 +192,20 @@ fn forget_deletes_a_record_for_good_and_says_so() {
         .query_row("SELECT id FROM observation WHERE safe_text LIKE '%LEAKEDCANARY9'", [], |r| r.get(0))
         .unwrap();
 
+    // Shown exactly as stored, which is what a skill sends an agent to read.
+    let show = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_relic")).current_dir(dir.path()).args(args).args(["--db", "data/relic.db"]).output().unwrap();
+        (out.status.code(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+    };
+    let (code, stdout, _) = show(&["show", &format!("#{id}"), "--json"]);
+    let page: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!((code, &page["schema"], &page["records"][0]["text"]), (Some(0), &"relic.records/v1".into(), &"curl LEAKEDCANARY9".into()));
+
     let (code, stderr) = relic(dir.path(), &["forget", &format!("#{id}"), "--db", "data/relic.db"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(stderr.contains(&format!("relic: forgot record #{id}")), "{stderr}");
+    let (code, stdout, stderr) = show(&["show", &id.to_string()]);
+    assert!(code == Some(1) && stdout.is_empty() && stderr.contains(&format!("no such record: #{id}")), "{stderr}");
     assert!(!on_disk(&dir.path().join("data"), "LEAKEDCANARY9"));
 
     // Forgetting it again is an error that names it; so is an id never seen.
