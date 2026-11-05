@@ -58,6 +58,7 @@ Provisional, like the items above. Both change the storage research behind [Choo
 
 ## Open facts
 
+- Answered by [V1](https://github.com/yuann3/relic/issues/32) in [docs/research/validation-skill-packaging.md](../research/validation-skill-packaging.md), for V2 to confirm: one `SKILL.md` with no `scripts/` or `allowed-tools`, recovered text escaped against Claude Code's load-time `!` execution and `$` substitution; `<hash>/<name>/` loads through a symlink in Claude Code and Prime; citations as observation id plus keyed hash; `catalog.db` needs `fullfsync=ON` on macOS. Prime's current release documents no skills directory, so its deferral stands.
 - The validation/skill research ticket must answer:
   - How a cited procedure that contains `[REDACTED:*]` spans becomes a reusable skill.
   - Whether skills may ship `scripts/`.

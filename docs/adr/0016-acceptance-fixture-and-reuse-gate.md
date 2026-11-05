@@ -65,6 +65,6 @@ Release evidence (not gating):
 
 ## Open facts
 
-- Whether imported Claude Code transcripts record a Skill invocation in a way that is parseable and stable across versions. The release evidence depends on it (S5).
+- Whether imported Claude Code transcripts record a Skill invocation in a way that is parseable and stable across versions. The release evidence depends on it (S5). [V1](https://github.com/yuann3/relic/issues/32) found it parseable (a `Skill` tool use with `{skill, args}`, unchanged across 2.1.288–2.1.318) but documented as internal and unstable ([docs/research/validation-skill-packaging.md](../research/validation-skill-packaging.md)).
 - Whether the answerable seeded cases' conditional traversal across two source or relation kinds is reachable with five operators now that Relate is cut ([0009](0009-rlm-kernel.md)) (S5).
 - Whether the bounded RLM beats FTS-only, top 20 plus one model call, and the fixed pipeline on the 12 seeded investigations. This decides the RLM label (S5).

@@ -56,4 +56,5 @@ Internals stay open: how the verifier argv is entered, the output and time bound
 
 ## Open facts
 
+- Answered by [V1](https://github.com/yuann3/relic/issues/32) in [docs/research/validation-skill-packaging.md](../research/validation-skill-packaging.md): the three questions below, and that a verifier needs the umask `main` currently discards.
 - The validation/skill research ticket answers the three questions listed in [0013](0013-skill-catalog-direction.md) Open facts: redacted spans in a reusable skill, `scripts/`, and whether a model-invocable skill that tells an agent to run recovered steps is "silently executing recovered procedures".
