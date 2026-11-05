@@ -586,6 +586,43 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
     }
 }
 
+/// Ctrl-C to `relic validate` does not reach the verifier, which runs in
+/// its own process group; Relic takes it down before it dies.
+#[test]
+fn a_verifier_dies_with_relic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store_with(dir.path(), &["git reflog"]);
+    let report = dir.path().join("report.json");
+    let procedure = json!({"schema": "relic.recall/v1", "outcome": "answered", "procedure": [{"text": "Read it", "supports": [1]}]});
+    std::fs::write(&report, procedure.to_string()).unwrap();
+    let pidfile = dir.path().join("pid");
+    let mut relic = Command::new(env!("CARGO_BIN_EXE_relic"))
+        .args(["validate", report.to_str().unwrap(), "--db", db.to_str().unwrap(), "--"])
+        .args(["sh", "-c", "echo $$ > \"$0\"; exec sleep 30", pidfile.to_str().unwrap()])
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let t = std::time::Instant::now();
+    let verifier: libc::pid_t = loop {
+        if let Some(pid) = std::fs::read_to_string(&pidfile).ok().and_then(|p| p.trim().parse().ok()) {
+            break pid;
+        }
+        assert!(t.elapsed().as_secs() < 10, "the verifier never started");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let relic_pid = libc::pid_t::try_from(relic.id()).unwrap();
+    // SAFETY: kill(2) of the child this test spawned and has not reaped.
+    unsafe { libc::kill(relic_pid, libc::SIGINT) };
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(relic.wait().unwrap().signal(), Some(libc::SIGINT));
+    let t = std::time::Instant::now();
+    // SAFETY: signal 0 only checks that the process exists.
+    while unsafe { libc::kill(verifier, 0) } == 0 {
+        assert!(t.elapsed().as_secs() < 5, "the verifier outlived relic");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// The id of the one evidence record in `report` whose text holds `needle`.
 fn record_of(report: &Value, needle: &str) -> i64 {
     let hits: Vec<&Value> = report["evidence"].as_array().unwrap().iter().filter(|e| e["text"].as_str().unwrap().contains(needle)).collect();

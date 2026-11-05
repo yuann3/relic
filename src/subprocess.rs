@@ -18,19 +18,28 @@ pub enum Run {
 
 /// Run `cmd` with no stdin, stopping it once `timeout` passes or its stdout
 /// passes `max` bytes. The timeout covers its output too: a process it
-/// started can hold the pipes open after it exits.
+/// started can hold the pipes open after it exits. Nothing it started
+/// outlives the run, or Relic: a fatal signal takes its group down too.
 pub fn bounded(mut cmd: Command, timeout: Duration, max: usize) -> std::io::Result<Run> {
     use std::os::unix::process::CommandExt;
     let deadline = Instant::now() + timeout;
-    // Its own group, so a timeout stops what it started as well.
+    // Its own group, so a timeout stops what it started as well. That keeps
+    // it out of the terminal's foreground group, so Ctrl-C reaches only
+    // Relic, which passes it on.
     let mut child = cmd.process_group(0).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let stdout = capped(child.stdout.take(), max, false);
-    let stderr = capped(child.stderr.take(), STDERR_MAX, true);
-    let stop = |child: &mut std::process::Child| {
-        let group = libc::pid_t::try_from(child.id()).map_err(std::io::Error::other)?;
-        // SAFETY: kill(2) of the group this child leads; at worst ESRCH.
+    let group = libc::pid_t::try_from(child.id()).map_err(std::io::Error::other)?;
+    crate::signal::set_child_group(group);
+    // Before the leader is reaped, while the group id is still its own.
+    let end = |child: &mut std::process::Child| {
+        // SAFETY: kill(2) of the group this unreaped child leads; at worst ESRCH.
         unsafe { libc::kill(-group, libc::SIGKILL) };
-        child.wait()?;
+        crate::signal::set_child_group(0);
+        child.wait()
+    };
+    let stdout = capped(child.stdout.take(), max, false)?;
+    let stderr = capped(child.stderr.take(), STDERR_MAX, true)?;
+    let stop = |child: &mut std::process::Child| {
+        end(child)?;
         Ok(Run::TimedOut)
     };
     let read = |rx: &mpsc::Receiver<_>| match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -41,15 +50,23 @@ pub fn bounded(mut cmd: Command, timeout: Duration, max: usize) -> std::io::Resu
     let (Some(out), Some(err)) = (read(&stdout)?, read(&stderr)?) else {
         return stop(&mut child);
     };
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+    loop {
+        // SAFETY: siginfo_t is plain data, valid all zero.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid fills `info`; WNOWAIT leaves the child unreaped.
+        if unsafe { libc::waitid(libc::P_PID, group as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: waitid set si_pid, or left it zeroed if the child still runs.
+        if unsafe { info.si_pid() } != 0 {
+            break;
         }
         if Instant::now() >= deadline {
             return stop(&mut child);
         }
         std::thread::sleep(Duration::from_millis(2));
-    };
+    }
+    let status = end(&mut child)?;
     let stdout = out?;
     if stdout.len() > max {
         return Ok(Run::TooLarge);
@@ -61,9 +78,10 @@ pub fn bounded(mut cmd: Command, timeout: Duration, max: usize) -> std::io::Resu
 /// on a thread. Stdout is dropped at the cap, so a writer past it dies of
 /// EPIPE; stderr is read to its end, so a run that only warns a lot still
 /// succeeds.
-fn capped<R: Read + Send + 'static>(pipe: Option<R>, keep: usize, drain: bool) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+/// Signals stay with the main thread, which owns the child.
+fn capped<R: Read + Send + 'static>(pipe: Option<R>, keep: usize, drain: bool) -> std::io::Result<mpsc::Receiver<std::io::Result<Vec<u8>>>> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    crate::signal::spawn(std::thread::Builder::new(), move || {
         let mut out = Vec::new();
         let read = pipe.map_or(Ok(()), |mut p| {
             let limit = if drain { keep } else { keep + 1 };
@@ -74,8 +92,8 @@ fn capped<R: Read + Send + 'static>(pipe: Option<R>, keep: usize, drain: bool) -
             Ok(())
         });
         let _ = tx.send(read.map(|()| out));
-    });
-    rx
+    })?;
+    Ok(rx)
 }
 
 #[cfg(test)]
@@ -112,5 +130,17 @@ mod tests {
         let warns = "i=0; while [ $i -lt 2000 ]; do echo warning >&2; i=$((i+1)); done; printf done";
         let Run::Done { status, stdout, stderr } = bounded(sh(warns), Duration::from_secs(5), 64).unwrap() else { panic!() };
         assert_eq!((status.code(), stdout.as_slice(), stderr.len()), (Some(0), &b"done"[..], STDERR_MAX));
+
+        // What a passing run left in the background does not outlive it.
+        let Run::Done { stdout, .. } = bounded(sh("sleep 30 >/dev/null 2>&1 & echo $!"), Duration::from_secs(5), 64).unwrap() else {
+            panic!()
+        };
+        let left: libc::pid_t = String::from_utf8(stdout).unwrap().trim().parse().unwrap();
+        let t = Instant::now();
+        // SAFETY: kill(2) with signal 0 only checks that the process exists.
+        while unsafe { libc::kill(left, 0) } == 0 {
+            assert!(t.elapsed() < Duration::from_secs(5), "the background sleep is still running");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

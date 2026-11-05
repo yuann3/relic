@@ -98,6 +98,8 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 None => std::env::current_dir()?,
             };
             let catalog = relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
+            // Ctrl-C or a kill stops the verifier too, then Relic.
+            relic::signal::install();
             let (record, said) = relic::validation::run(&argv, &cwd)?;
             let id = catalog.add_validation(&digest, &record)?;
             let ran = app::display_line(&record.command);

@@ -17,6 +17,10 @@ const GRACE_MS: u32 = 200;
 /// The running fzf's pid, or 0.
 static CHILD: AtomicI32 = AtomicI32::new(0);
 
+/// The process group of a bounded subprocess, or 0. It is not in the
+/// terminal's foreground group, so a Ctrl-C meant for it reaches Relic.
+static GROUP: AtomicI32 = AtomicI32::new(0);
+
 /// `/dev/tty` and its termios before Relic or fzf changed it. fzf may die
 /// by SIGKILL in raw mode, so the TUI's own restore is not enough.
 static TTY: OnceLock<(libc::c_int, libc::termios)> = OnceLock::new();
@@ -130,6 +134,11 @@ pub fn set_child(pid: libc::pid_t) {
     CHILD.store(pid, Ordering::SeqCst);
 }
 
+/// The group a fatal signal must kill first; 0 before its leader is reaped.
+pub fn set_child_group(pgid: libc::pid_t) {
+    GROUP.store(pgid, Ordering::SeqCst);
+}
+
 fn save_tty() {
     if TTY.get().is_some() {
         return;
@@ -149,6 +158,12 @@ fn save_tty() {
 }
 
 extern "C" fn on_fatal(sig: libc::c_int) {
+    let group = GROUP.swap(0, Ordering::SeqCst);
+    if group > 0 {
+        // SAFETY: kill(2) is async-signal-safe; the group's leader is
+        // unreaped until GROUP is cleared, so the id is still its own.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
     stop_child();
     #[cfg(feature = "tui")]
     crate::ui::emergency_restore();
