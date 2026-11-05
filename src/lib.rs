@@ -11,5 +11,6 @@ pub mod signal;
 pub mod source;
 pub mod store;
 pub mod subprocess;
+pub mod validation;
 #[cfg(feature = "tui")]
 pub mod ui;

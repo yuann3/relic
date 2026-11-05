@@ -15,7 +15,9 @@ fn main() -> ExitCode {
     // Before anything is created: the database, its WAL, the key and any file
     // a later command writes must never be readable by another user.
     // SAFETY: umask only swaps the process's file mode mask; no thread exists yet.
-    unsafe { libc::umask(0o077) };
+    let users = unsafe { libc::umask(0o077) };
+    // A verifier the user wrote runs under the user's own mask.
+    relic::validation::set_original_umask(users);
     let cmd = match cli::parse(std::env::args_os().skip(1)) {
         Ok(cmd) => cmd,
         Err(e) => {
