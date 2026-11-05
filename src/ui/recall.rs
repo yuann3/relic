@@ -71,7 +71,7 @@ fn run(
         // requests go.
         Progress::Egress(_) => {}
     };
-    let report = app::recall(question, store, model, log, cancel, &mut progress);
+    let report = app::recall(question, store, &[], model, log, cancel, &mut progress);
     send(RecallEvent::Finished(Box::new(report)));
 }
 

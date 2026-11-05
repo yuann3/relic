@@ -808,6 +808,7 @@ pub(crate) fn answered(cites: &[i64]) -> RecallReport {
         child_calls: 3,
         cost_microusd: Some(1200),
         models: vec!["m-1".into()],
+        skill: None,
     }
 }
 

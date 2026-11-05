@@ -453,6 +453,17 @@ pub struct RecallReport {
     /// What the provider says answered, in the order first seen: an alias
     /// may stand for any of them.
     pub models: Vec<String>,
+    /// The active skill the host step picked for this question, before the
+    /// investigation began (ADR 0016).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill: Option<SkillUsed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkillUsed {
+    pub name: String,
+    /// The bundle's content hash: which version of the skill.
+    pub bundle: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -600,13 +611,15 @@ impl RecallLog {
 }
 
 /// Answer `question` from the evidence in `store` through a bounded
-/// investigation, logging it to `log`. Setting `cancel` from any thread or
+/// investigation, logging it to `log`. Of the active `skills`, the one the
+/// question names is picked first and logged. Setting `cancel` from any thread or
 /// a signal handler ends it with [`RecallOutcome::Cancelled`]. A log that
 /// cannot be opened or written fails the recall, setting `cancel` to stop
 /// it mid-way: nothing leaves unaudited.
 pub fn recall(
     question: &str,
     store: &Store,
+    skills: &[crate::catalog::ActiveSkill],
     model: Arc<dyn ModelBoundary>,
     log: &Path,
     cancel: &Arc<AtomicBool>,
@@ -632,6 +645,12 @@ pub fn recall(
     };
     let target = model.target();
     log.line("start", serde_json::json!({"relic_version": env!("CARGO_PKG_VERSION"), "profile": target.profile, "origin": target.origin}));
+    // Before any request leaves, so the log shows the pick preceding them.
+    let skill = crate::catalog::select(&question, skills)
+        .map(|s| SkillUsed { name: s.name.clone(), bundle: s.bundle.clone() });
+    if let Some(s) = &skill {
+        log.line("skill", serde_json::json!({"name": s.name, "bundle": s.bundle}));
+    }
     if let Some(e) = log.failed.take() {
         return unlogged(question, e);
     }
@@ -652,6 +671,7 @@ pub fn recall(
     };
     let r = run_investigation(&question, store, model, BudgetV1::prototype_default(), cancel, &mut progress);
     let mut report = report(question, r, models);
+    report.skill = skill;
     if let Some(e) = log.finish(&report) {
         report.outcome = RecallOutcome::Failed;
         report.error = Some(log_error(e));
@@ -722,6 +742,7 @@ fn report(question: String, r: InvestigationResult, models: Vec<String>) -> Reca
         child_calls: r.child_calls,
         cost_microusd: r.cost_microusd,
         models,
+        skill: None,
     }
 }
 
@@ -1050,7 +1071,7 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
         let mut reader = Some(std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&log).unwrap());
         let model = Arc::new(crate::rlm::model::FakeModel::new());
-        let r = recall("q", &store_with(&["ls"]), model.clone(), &log, &Arc::default(), &mut |p| {
+        let r = recall("q", &store_with(&["ls"]), &[], model.clone(), &log, &Arc::default(), &mut |p| {
             if matches!(p, Progress::RootCall { .. }) {
                 drop(reader.take());
             }

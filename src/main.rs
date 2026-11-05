@@ -331,10 +331,15 @@ fn recall(question: &str, db: Option<PathBuf>, json: bool, allow_unknown_cost: b
                     and RELIC_MODEL_PRICE_OUT, or pass --allow-unknown-cost"
             .into());
     }
+    // A recall never creates a catalog; it reads the one skills came from.
+    let skills = match relic::catalog::Catalog::open_existing(&relic::catalog::dir_for(&db))? {
+        Some(catalog) => catalog.active()?,
+        None => Vec::new(),
+    };
     let cancel = Arc::new(AtomicBool::new(false));
     relic::signal::interrupt_cancels(Arc::clone(&cancel));
     // Every request's size and destination is the payload audit (ADR 0004).
-    let report = app::recall(question, &store, model, &app::recall_log_path(&db), &cancel, &mut |p| {
+    let report = app::recall(question, &store, &skills, model, &app::recall_log_path(&db), &cancel, &mut |p| {
         eprintln!("relic: {}", app::display_line(&p.to_string()))
     });
     let mut out = std::io::stdout().lock();
@@ -376,6 +381,9 @@ fn print_recall(out: &mut impl Write, r: &app::RecallReport) -> Result<()> {
         app::RecallOutcome::Cancelled => "cancelled",
         app::RecallOutcome::Failed => "failed",
     };
+    if let Some(s) = &r.skill {
+        writeln!(out, "skill: {} ({})", s.name, &s.bundle[..12])?;
+    }
     writeln!(out, "{outcome}: {}", app::display_line(&r.answer))?;
     if !r.claims.is_empty() {
         writeln!(out, "claims:")?;
