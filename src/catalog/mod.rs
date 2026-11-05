@@ -170,6 +170,29 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
+#[cfg(target_vendor = "apple")]
+const SWAP: libc::c_uint = libc::RENAME_SWAP;
+#[cfg(target_vendor = "apple")]
+const EXCL: libc::c_uint = libc::RENAME_EXCL;
+#[cfg(not(target_vendor = "apple"))]
+const SWAP: libc::c_uint = libc::RENAME_EXCHANGE;
+#[cfg(not(target_vendor = "apple"))]
+const EXCL: libc::c_uint = libc::RENAME_NOREPLACE;
+
+/// rename(2) that swaps `from` and `to` (SWAP), or fails if `to` exists
+/// (EXCL), in one step.
+fn rename_with(from: &Path, to: &Path, flags: libc::c_uint) -> io::Result<()> {
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other);
+    let (from, to) = (c(from)?, c(to)?);
+    // SAFETY: two NUL-terminated paths that outlive the call.
+    #[cfg(target_vendor = "apple")]
+    let done = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), flags) };
+    // SAFETY: as above; AT_FDCWD resolves them like rename(2).
+    #[cfg(not(target_vendor = "apple"))]
+    let done = unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), flags) };
+    if done == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
 /// Create `dir` and its missing parents, each synced into its parent: a
 /// link synced into a directory a power loss then drops is lost too. `mode`
 /// is set on each one created.
@@ -351,60 +374,90 @@ impl Catalog {
         }
     }
 
-    /// Point `link` at `bundle`, or remove it, by an atomic rename. A link
-    /// already gone is already removed.
-    fn point(&self, link: &Path, bundle: Option<&str>) -> Result<(), CatalogError> {
+    /// Point `link` at `bundle`, or remove it, if it still points at
+    /// `expected` (None: nothing there). The swap is atomic and the check
+    /// comes after it: what came back is put back unless it was `expected`,
+    /// so nothing put there since Relic looked is ever replaced.
+    fn point(&self, link: &Path, bundle: Option<&str>, expected: Option<&str>) -> Result<(), CatalogError> {
         let parent = link.parent().ok_or_else(|| CatalogError::NotOurs(link.into()))?;
+        let name = link.file_name().ok_or_else(|| CatalogError::NotOurs(link.into()))?;
+        // Dot-named, so no harness takes a leftover for a skill, and random,
+        // so no other activation or file shares it.
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+        let mut tmp = std::ffi::OsString::from(".");
+        tmp.push(name);
+        tmp.push(format!(".relic-swap-{}", &blake3::hash(&nonce).to_hex()[..16]));
+        let tmp = parent.join(tmp);
+        let was_expected = |p: &Path| self.current(p).ok().flatten().as_deref() == expected;
+        let not_ours = |e: io::Error| match e.kind() {
+            io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound => CatalogError::NotOurs(link.into()),
+            _ => e.into(),
+        };
         match bundle {
             Some(hash) => {
-                let name = link.file_name().ok_or_else(|| CatalogError::NotOurs(link.into()))?;
                 // Outside Relic's directories: the user's own umask, not 077.
                 let mode = crate::validation::original_umask().map(|mask| 0o777 & !u32::from(mask));
                 make_dirs(parent, mode)?;
-                // Dot-named, so no harness takes a leftover for a skill, and
-                // random, so no other activation or file shares it.
-                let mut nonce = [0u8; 8];
-                getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-                let mut tmp = std::ffi::OsString::from(".");
-                tmp.push(name);
-                tmp.push(format!(".relic-swap-{}", &blake3::hash(&nonce).to_hex()[..16]));
-                let tmp = parent.join(tmp);
                 std::os::unix::fs::symlink(self.dir.join(hash).join(name), &tmp)?;
-                if let Err(e) = fs::rename(&tmp, link) {
+                let swapped = if expected.is_some() { rename_with(&tmp, link, SWAP) } else { rename_with(&tmp, link, EXCL) };
+                if let Err(e) = swapped {
                     let _ = fs::remove_file(&tmp);
-                    return Err(e.into());
+                    return Err(not_ours(e));
+                }
+                if expected.is_some() {
+                    if !was_expected(&tmp) {
+                        rename_with(&tmp, link, SWAP)?;
+                        let _ = fs::remove_file(&tmp);
+                        return Err(CatalogError::NotOurs(link.into()));
+                    }
+                    fs::remove_file(&tmp)?;
                 }
             }
-            None => match fs::remove_file(link) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                r => r?,
-            },
+            None => {
+                match fs::rename(link, &tmp) {
+                    // Already gone is already removed.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    r => r?,
+                }
+                if !was_expected(&tmp) {
+                    rename_with(&tmp, link, EXCL)?;
+                    return Err(CatalogError::NotOurs(link.into()));
+                }
+                fs::remove_file(&tmp)?;
+            }
         }
         Ok(sync_dir(parent)?)
     }
 
-    /// Put `swapped` links back where they were after a failure part-way;
-    /// the error then also names any that could not be.
-    fn put_back(&self, swapped: &[(&PathBuf, Option<String>)], error: CatalogError) -> CatalogError {
-        let stranded: Vec<PathBuf> =
-            swapped.iter().filter(|(link, was)| self.point(link, was.as_deref()).is_err()).map(|(link, _)| (*link).clone()).collect();
+    /// Put links back where they were after a failure part-way: each
+    /// `(link, was, is)` from `is` to `was`. The error then also names any
+    /// that could not be.
+    fn put_back(&self, swapped: &[(&PathBuf, Option<String>, Option<String>)], error: CatalogError) -> CatalogError {
+        let stranded: Vec<PathBuf> = swapped
+            .iter()
+            .filter(|(link, was, is)| self.point(link, was.as_deref(), is.as_deref()).is_err())
+            .map(|(link, _, _)| (*link).clone())
+            .collect();
         if stranded.is_empty() { error } else { CatalogError::Stranded(Box::new(error), stranded) }
     }
 
     /// Point every link at `bundle`, or none of them: links are checked first,
     /// and a failed swap or commit puts back those already made.
     pub fn activate(&self, bundle: &Bundle, links: &[PathBuf]) -> Result<(), CatalogError> {
-        let previous: Vec<(&PathBuf, Option<String>)> =
-            links.iter().map(|l| Ok((l, self.current(l)?))).collect::<Result<_, CatalogError>>()?;
+        let previous: Vec<(&PathBuf, Option<String>, Option<String>)> = links
+            .iter()
+            .map(|l| Ok((l, self.current(l)?, Some(bundle.hash.clone()))))
+            .collect::<Result<_, CatalogError>>()?;
         let tx = self.conn.unchecked_transaction()?;
-        for (link, previous) in &previous {
+        for (link, previous, _) in &previous {
             tx.execute(
                 "INSERT INTO activation (link, bundle, previous, at_ms) VALUES (?1, ?2, ?3, ?4)",
                 params![link.as_os_str().as_bytes(), bundle.hash, previous, now_ms()],
             )?;
         }
-        for (i, (link, _)) in previous.iter().enumerate() {
-            if let Err(e) = self.point(link, Some(&bundle.hash)) {
+        for (i, (link, was, _)) in previous.iter().enumerate() {
+            if let Err(e) = self.point(link, Some(&bundle.hash), was.as_deref()) {
                 return Err(self.put_back(&previous[..i], e));
             }
         }
@@ -439,9 +492,10 @@ impl Catalog {
                 params![link.as_os_str().as_bytes(), previous, now, undoes, now_ms()],
             )?;
         }
-        let was: Vec<(&PathBuf, Option<String>)> = back.iter().map(|(link, _, now, _)| (*link, now.clone())).collect();
-        for (i, (link, _, _, previous)) in back.iter().enumerate() {
-            if let Err(e) = self.point(link, previous.as_deref()) {
+        let was: Vec<(&PathBuf, Option<String>, Option<String>)> =
+            back.iter().map(|(link, _, now, previous)| (*link, now.clone(), previous.clone())).collect();
+        for (i, (link, _, now, previous)) in back.iter().enumerate() {
+            if let Err(e) = self.point(link, previous.as_deref(), now.as_deref()) {
                 return Err(self.put_back(&was[..i], e));
             }
         }
@@ -607,6 +661,21 @@ mod tests {
         assert!(catalog.activate(&two, &[link.clone(), dangling.join("git-reflog-recovery")]).is_err());
         assert_eq!(read(&link), "one");
         assert_eq!(catalog.active().unwrap().iter().map(|s| s.bundle.as_str()).collect::<Vec<_>>(), [one.hash.as_str()]);
+
+        // Whatever replaced a link after Relic looked survives the swap,
+        // which checks what it took out and puts it back.
+        catalog.point(&link, Some(&two.hash), Some(&one.hash)).unwrap();
+        assert!(matches!(catalog.point(&link, Some(&one.hash), Some(&one.hash)), Err(CatalogError::NotOurs(_))));
+        assert_eq!(read(&link), "two");
+        fs::remove_file(&link).unwrap();
+        fs::create_dir(&link).unwrap();
+        fs::write(link.join("SKILL.md"), "theirs").unwrap();
+        for (bundle, expected) in [(Some(&one.hash), Some(&two.hash)), (Some(&one.hash), None), (None, Some(&two.hash))] {
+            let err = catalog.point(&link, bundle.map(String::as_str), expected.map(String::as_str)).unwrap_err();
+            assert!(matches!(err, CatalogError::NotOurs(_)), "{err}");
+            assert_eq!(read(&link), "theirs");
+        }
+        assert_eq!(fs::read_dir(&skills).unwrap().count(), 2, "only the link and `theirs`: no swap file left");
     }
 
     #[test]

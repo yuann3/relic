@@ -255,17 +255,28 @@ fn run(cmd: Command) -> Result<ExitCode> {
 }
 
 /// Where a skill's links go: `.agents/skills`, which most agents read, and
-/// `.claude/skills`, for Claude Code, on request.
+/// `.claude/skills`, for Claude Code, on request. Each through its real
+/// directory, once: `~/.claude/skills` is often a link to `~/.agents/skills`,
+/// and a second swap of the same link would find Relic's first.
 fn skill_links(name: &str, scope: &cli::Scope, claude: bool) -> Result<Vec<PathBuf>> {
     let base = match scope {
         cli::Scope::User => home().ok_or("HOME is not set")?,
         cli::Scope::Project(dir) => std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", shown(dir)))?,
     };
     let dirs: &[&str] = if claude { &[".agents", ".claude"] } else { &[".agents"] };
-    Ok(dirs.iter().map(|d| base.join(d).join("skills").join(name)).collect())
+    let mut links = Vec::new();
+    for d in dirs {
+        let skills = base.join(d).join("skills");
+        let link = std::fs::canonicalize(&skills).unwrap_or(skills).join(name);
+        if !links.contains(&link) {
+            links.push(link);
+        }
+    }
+    Ok(links)
 }
 
-/// `$HOME`, resolved like the cwd recall matches project links against.
+/// `$HOME`, resolved: links are stored by real path, and recall matches
+/// them against the resolved cwd.
 fn home() -> Option<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty())?);
     Some(std::fs::canonicalize(&home).unwrap_or(home))
