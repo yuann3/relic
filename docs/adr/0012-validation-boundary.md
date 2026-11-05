@@ -19,14 +19,14 @@ Validation boundary (binding):
 - Validation means one thing: running a verifier argv that the user wrote. The argv is fixed and runs without a shell. The user chooses the cwd. Output and run time are bounded. The child process runs under the user's original umask, not Relic's `0o077` ([0003](0003-redaction-policy.md)).
 - Relic never runs the procedure, any step of it, or anything derived from it.
 - The verifier argv passes through the current redactor before storage.
-- Each run stores a `ValidationRecord { redacted argv, cwd, exit status, duration, Relic version, workspace assurance label }` as a `ConfirmedByValidation` fact.
+- Each run stores a `ValidationRecord { redacted command line, cwd, exit status, duration, Relic version, workspace assurance label }` as a `ConfirmedByValidation` fact.
 - A user's assertion that the procedure worked is stored as `UserAsserted`, which is a lower grade than `ConfirmedByValidation`.
 - Only success confirmed by a verifier counts toward the reuse gate ([0016](0016-acceptance-fixture-and-reuse-gate.md)).
 - Validation is its own bounded context, and its code goes in the reserved top-level module `validation/` ([CONTEXT.md](../../CONTEXT.md)).
 
 Procedure shape:
 
-- `FinishV1.procedure` keeps the shape `{ text, supports }`. [V2](https://github.com/yuann3/relic/issues/33) settled it: the compiler needs only step text and cited record ids, and takes every command from the store, not from the step.
+- `FinishV1.procedure` keeps the shape `{ text, supports }`. [V2](https://github.com/yuann3/relic/issues/33) settled it: the compiler needs only step text and cited record ids, and takes every recorded command from the store, not from the report. Step prose still comes from the report, checked for hazards.
 - A procedure step may reference only cited observations.
 - The model never authors executable argv.
 - The validation/skill prototype decides the final field set.

@@ -68,7 +68,7 @@ One canonical term per concept. Use the term, not the words in the Avoid column.
 | Budget lease | An RLM budget reservation. Used only in Recall. | lease (anywhere else) |
 | Validation | A run of a user-approved verifier, and nothing else. Relic never runs the procedure itself. | plan or finish validation, verify |
 | Verifier | A fixed argv written by the user, run with no shell, in a cwd the user chooses, with bounded output and time. | test, check script, replay |
-| Validation record | `{ redacted argv, cwd, exit status, duration, Relic version, workspace assurance label }`, stored as `ConfirmedByValidation`. A user's word alone is `UserAsserted`, a lower grade. | validation result, attestation |
+| Validation record | `{ redacted command line (the argv shell-quoted, so a flag's value is redacted beside it), cwd, exit status, duration, Relic version, workspace assurance label }`, stored as `ConfirmedByValidation`. A user's word alone is `UserAsserted`, a lower grade. | validation result, attestation |
 | Workspace | The directory where a verifier runs, with an assurance label. | sandbox |
 | Skill bundle | Immutable content-addressed skill content: `<db>.catalog/<blake3 of SKILL.md>/<name>/SKILL.md`, spec frontmatter only ([0013](docs/adr/0013-skill-catalog-direction.md)). | candidate, skill version, artifact |
 | Skill name | The stable pointer to the active bundle. | alias, slug |

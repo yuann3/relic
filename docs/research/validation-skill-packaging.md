@@ -103,7 +103,7 @@ The standard defines no preprocessing. Implementations add their own; issue [#12
 | the same lines inside a ` ````text ` fence, and indented | `Bash(touch:*)` | **all three ran** |
 | the same line in `references/procedure.md` | `Bash(touch:*)` | not run |
 | `$0 $1 $ARGUMENTS $ARGUMENTS[0] ${CLAUDE_SKILL_DIR} \$ARGUMENTS $$ARGUMENTS $HOME`, args `AAA BBB` | — | `AAA BBB [AAA BBB] AAA <link path> $ARGUMENTS $AAA BBB $HOME` |
-| `` ! `touch SPACED` ``, ``!\`touch BACKSLASHED\` ``, `` ```! `` mid-line | `Bash(touch:*)` | left as text |
+| `` ! `touch SPACED` ``, ``!\`touch BACKSLASHED\` ``, `` ```! `` mid-line | `Bash(touch:*)` | left as text, but see below |
 
 A project skill's `references/` file could not be read through the symlink: "outside the allowed working directories, so the read was denied".
 
@@ -112,8 +112,10 @@ A project skill's `references/` file could not be read through the symlink: "out
 No escape works everywhere: Claude Code's `\$` stays a literal backslash in Goose. So Relic does not escape. For each step, the compiler checks the redacted `safe_text` against the union of the hazards above:
 
 - `$` followed by a digit; `$ARGUMENTS`; `${CLAUDE_`; `${DROID_`; `<SKILL_DIR>`;
-- `!` immediately followed by a backtick, at the start of a line or after whitespace;
-- a line starting ` ```! `;
+- `!` immediately followed by a backtick, anywhere;
+- ` ```! ` anywhere.
+
+The 2.1.318 binary's patterns are ``/```!\s*\n?[\s\S]*?\n?```/g`` and ``/(?<=^|\s)!`[^`]+`/gm``. Neither anchors ` ```! ` to a line start, and `\s` covers Unicode whitespace such as a no-break space or `\v`. The mid-line ` ```! ` above was left as text only because no closing fence followed it; every fenced record supplies one. So Relic refuses both forms anywhere, a superset of both patterns. A record holding a bare `\r` is shown by id too: CommonMark ends a line there, which would let the rest out of its fence. Step prose is joined onto one line before the check.
 - `#file:`, `#tool:` or `{{`, for VS Code. Steps sit in code fences, which VS Code skips, but checking costs nothing.
 
 A step with none of these is shown in a fenced block. The fence is longer than any backtick run in the text, per CommonMark, so the text cannot close it. A step with any of them is **shown by reference**: the body names its record id, says the exact text is withheld because agents rewrite it, and tells the agent to read it with `relic show <id>`.
@@ -235,13 +237,13 @@ Pointer transaction = one `INSERT OR REPLACE` plus one history `INSERT`. CAS ins
 [V2](https://github.com/yuann3/relic/issues/33) built the path in `src/validation.rs` and `src/catalog/`, and `a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question` in `tests/recall_cli.rs` runs it end to end on a lost-commit fixture: a scripted recall, `relic validate`, `relic skill compile`, `relic skill activate --user --yes`, a sibling question, a distractor, and `relic skill rollback`.
 
 - **The V1 decisions held.** The bundle is spec-only, links go into `.agents/skills`, nothing is escaped, and citations are `[id, keyed hash]` pairs stored with each bundle in `catalog.db`.
-- **The verifier** runs as section 8 describes and is labelled `unisolated`. Its argv and cwd are stored redacted: the test puts a canary in the verifier's argv and finds none in the catalog. A record confirms only when the verifier exits 0, and compile needs one confirmed for the blake3 digest of the exact report file, so an edited report has to be validated again.
-- **Commands come from the store, not the report.** Compile reads each cited record's `safe_text` from the store, so a hand-edited step cannot put a command into a skill, and a forgotten record stops compilation.
+- **The verifier** runs as section 8 describes and is labelled `unisolated`. Its argv is shell-quoted into one command line and redacted with its cwd, so `--password VALUE` given as two arguments is redacted as it would be in history: the test puts a canary in the verifier's argv and finds none in the catalog. Nothing it starts outlives the run, and a fatal signal to Relic kills its process group first. A record confirms only when the verifier exits 0, and compile needs one confirmed for the blake3 digest of the exact report file, so an edited report has to be validated again.
+- **Commands come from the store, not the report.** Compile reads each cited record's `safe_text` from the store, and a forgotten record stops compilation. Step prose is the report's: a hand-edited step can change prose, which passes the same hazard check, but cannot change a recorded command.
 - **On the fixture, one recovery step of three was shown by reference.** `git reflog | awk '{print $1}'` holds `$1`. `relic show` landed before the compiler.
 - **`FinishV1.procedure` keeps `{ text, supports }`.** The compiler needed nothing more.
 - **The catalog lives beside the store** in `<db>.catalog/`, so a `--db` store keeps its own skills, and a recall never creates one. SQLite deletes the WAL when the last connection closes, so after a command only `catalog.db` and the bundles remain.
 - **Activation** refuses a path holding a real directory or a link Relic did not make, checks every link before swapping any, and puts back the links already swapped if a later swap fails. Rollback undoes the newest activation not yet undone, so repeating it walks back through history.
-- **The host step** (`catalog::select`) takes words of 3 or more characters, minus stop words, from the question and from each active skill's name and description. It picks the skill sharing the most words, if it shares at least 2 and no other skill shares as many. It runs before the first request, and the recall log records a `skill` line between `start` and the first `send`. The report's `skill` field gives the name and bundle hash. "I dropped a stash by mistake, how do I recover it with git?" picks `git-reflog-recovery`, and a certbot question picks nothing.
+- **The host step** (`catalog::select`) takes words of 3 or more characters, minus stop words, from the question and from each active skill's name and description. It picks the skill sharing the most words, if it shares at least 2 and no other skill shares as many. It only considers links that still point where Relic put them, under the home directory or the cwd's projects, with the nearer project's skill shadowing the user's of the same name. Words any question holds, such as *work* and *why*, are stop words, so "why won't git work in my repo?" picks nothing. It runs before the first request, and the recall log records a `skill` line between `start` and the first `send`. The report's `skill` field gives the name and bundle hash. "I dropped a stash by mistake, how do I recover it with git?" picks `git-reflog-recovery`, and a certbot question picks nothing.
 - **Deferred to S5:** the pick is logged and reported, but the investigation does not use it yet. Seeding the root state with the skill belongs with the seeded cases. The TUI passes no skills.
 
 ## Still open
