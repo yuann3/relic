@@ -225,6 +225,18 @@ Zsh pre/post frames may derive duration from monotonic timestamps when paired. U
 
 Git HEAD capture is optional and should remain off until its added prompt latency is measured. A later background enrichment can often resolve current repository facts without putting `git` in the hook path.
 
+### The hook as built ([S8](https://github.com/yuann3/relic/issues/30))
+
+`relic hook zsh|bash` prints the hook (`src/source/hook.zsh`, `src/source/hook.bash`); `src/source/hook.rs` reads it, contract `hook-v1`, as observation kind `HookFrame` (source label `hook`). It departs from Hook frame V1 above in three ways:
+
+- **No helper process.** The hook writes its frame itself with shell builtins, so nothing is forked at a prompt; one subshell runs at shell start to make the directory `0700` and the session file `0600`. A frame is seven NUL-terminated fields and a newline: `rh1`, shell, start, end, status, cwd, command. A line ending in the seventh NUL ends a frame, so commands and directories with newlines need no escaping, and a frame still being written is withheld. There is no length prefix, checksum, sequence number or installation id: one shell writes each file, appends whole frames, and a broken frame is counted (`unreadable`) and skipped.
+- **One frame per command, not pre and post.** zsh's `preexec` keeps the command, `$EPOCHREALTIME` and `$PWD`, and `precmd` writes them with the end time and `$?` as its first statement. A prompt with no command since (Enter on an empty line, Ctrl-C at the prompt) writes nothing; `exit` runs no `precmd`, so the last command is not recorded.
+- **Bash is read by history number.** `PROMPT_COMMAND` (prepended, as an array from 5.1) writes, at every prompt, the time, `$?`, `$PWD` and `history 1`. Bash 3.2 gives no other fork-free way to read the command just run: `HISTCMD` stays 1 in the hook and `fc -ln -1` lags by one command. The importer keeps a frame only when its history number differs from the frame before; the first frame is the prompt before any command, naming the history file's last line, and is never kept. A command left out of history (`HISTCONTROL`, `set +o history`) is therefore not recorded either. The DEBUG trap and `PS0` were rejected: both belong to other tools (bash-preexec, starship), and `PS0` needs 4.4.
+
+What each record says, as text so redaction, rescrub, forget and the recall model see it without a schema change: the command, then one line of what the hook saw. zsh: `exit 1 · took 2.3 s · cwd: /srv` and the start as observed-at; bash: `exit 1 · cwd after: /srv` and the time the prompt came back as observed-at. Nothing missing is filled in, and a compiled skill shows that line beside the command, outside its fence. A command line starting with a space is never written by the zsh hook and never kept from a bash one. Hook records that repeat a zsh or bash history record stay separate observations (see "Do not set-deduplicate").
+
+`relic import --hooks [DIR]` imports every `*.frames` file under `$XDG_STATE_HOME/relic/hooks`, each its own source; a single file is detected by its first bytes. A bash frame depends on the one before it, so like a Claude Code session a hook file is always read from its first byte, yielding only the frames past the stored boundary. Tested in a real zsh 5.9 and bash 3.2 on a terminal, beside a `precmd` and `PROMPT_COMMAND` of the user's own, which still see the command's status; bash 5's array form is tested on Linux.
+
 ## Redaction boundary
 
 The only component allowed to see an ephemeral raw parsed record is the importer/redactor pipeline. Before SQLite, FTS, diagnostic logs, caches, event JSON, model calls, or compiled assets:

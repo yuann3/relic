@@ -74,7 +74,8 @@ One canonical term per concept. Use the term, not the words in the Avoid column.
 | Skill name | The stable pointer to the active bundle. | alias, slug |
 | Activation | An explicit, confirmed atomic symlink swap of `.agents/skills/<name>` under the home directory (`--user`) or a project (`--project`), plus `.claude/skills/<name>` with `--claude`, to a bundle ([0013](docs/adr/0013-skill-catalog-direction.md)). | install, promote, deploy |
 | Rollback | Undoing a link's newest activation not yet undone: back to the bundle it pointed to before, or no link. Repeated, it steps further back. | uninstall, revert |
-| Shell hook | A metadata-only zsh or Bash hook that records command frames, including exit status. | hook (alone) |
+| Shell hook | The zsh or Bash hook `relic hook` prints. It writes one frame per command to a file per shell session: the command line, exit status, directory and time, and for zsh the duration. Never output, input or environment. | hook (alone) |
+| Hook record | A `HookFrame` observation: the command, then one line of what the hook saw, such as `exit 1 · took 2.3 s · cwd: /srv` (zsh) or `exit 1 · cwd after: /srv` (Bash, which sees no start). | hook event |
 | Agent hook | A hook in an agent tool such as Claude Code. | hook (alone) |
 | Agent record | What Relic keeps of a Claude Code session: a Bash call's command (`AgentCommand`), what it printed (`AgentOutput`), or another tool call's name and argument (`AgentTool`). Never prompts, replies or thinking. | agent message, transcript entry |
 | SQLite progress handler | The rusqlite `hooks`-feature callback that enforces the query deadline and cancellation. | hook (alone) |

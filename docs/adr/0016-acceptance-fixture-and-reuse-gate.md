@@ -14,7 +14,7 @@ Status: Accepted · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture]
 - `BudgetLedger` counts calls, ops, rows, handles, materialised bytes and egress bytes (src/rlm/budget.rs:4-60). Bytes are the hard limit. Tokens are "additional accounting"; when a provider omits usage, the reservation stays consumed (docs/research/rlm-model-boundary.md:238, :279).
 - Adding an operator requires evidence from a held-out fixture (docs/research/rlm-model-boundary.md:513). The kernel executes five operators ([0009](0009-rlm-kernel.md)).
 - CI runs against mock servers. Release evidence comes from real endpoints, with exact versions (docs/research/rlm-model-boundary.md:549).
-- Fixture style: seeded, deterministic corpora (src/fixture.rs). Shell hooks and Git land in S3. The Claude Code adapter lands after the validation/skill tracer, so until then the fixture's Claude-trace leg is synthetic.
+- Fixture style: seeded, deterministic corpora (src/fixture.rs). Git landed in S3 and shell hooks in [S8](https://github.com/yuann3/relic/issues/30): a hook record's exit status is a line of its text, such as `exit 1 · took 2.3 s · cwd: /srv`. The Claude Code adapter lands after the validation/skill tracer, so until then the fixture's Claude-trace leg is synthetic.
 
 ## Decision
 
