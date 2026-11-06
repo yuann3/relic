@@ -350,3 +350,60 @@ fn a_directory_git_cannot_read_leaves_no_database_and_is_named() {
     assert!(out.status.code() == Some(2) && stderr.contains("not a git repository"), "{stderr}");
     assert!(!db.exists(), "a database was left behind");
 }
+
+/// One Claude Code record of `version`, with `content` as its message
+/// content.
+fn claude_line(kind: &str, version: &str, content: &str) -> String {
+    format!(r#"{{"type":"{kind}","version":"{version}","timestamp":"2026-11-06T04:11:29.660Z","message":{{"content":{content}}}}}"#) + "\n"
+}
+
+#[test]
+fn claude_code_sessions_import_by_directory_and_grow_without_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("config/projects/-work-app");
+    let subagents = project.join("s1/subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    std::fs::copy("tests/fixtures/claude-code/2.1.318.jsonl", project.join("s1.jsonl")).unwrap();
+    let call = claude_line("assistant", "2.1.300", r#"[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git reflog"}}]"#);
+    let agent = subagents.join("agent-1.jsonl");
+    std::fs::write(&agent, &call).unwrap();
+    let import = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+            .current_dir(dir.path())
+            .args(["import", "--claude", "--db", "data/relic.db"])
+            .env("CLAUDE_CONFIG_DIR", dir.path().join("config"))
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let kinds = || -> Vec<(i64, i64)> {
+        let conn = rusqlite::Connection::open(dir.path().join("data/relic.db")).unwrap();
+        let mut stmt = conn.prepare("SELECT kind, COUNT(*) FROM observation GROUP BY kind ORDER BY kind").unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+    };
+
+    let (code, stderr) = import();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.ends_with("added 7 records from 2 of 2 sessions; 0 unchanged since last import\n"), "{stderr}");
+    // Commands, outputs and tool calls: the fixture's 2, 2 and 2, and the
+    // subagent's call.
+    assert_eq!(kinds(), [(7, 3), (8, 2), (9, 2)]);
+    assert!(import().1.ends_with("added 0 records from 0 of 2 sessions; 2 unchanged since last import\n"));
+
+    // The call's result arrives after the import that stored the call, then
+    // a version this relic does not know, and a call after that.
+    let result = claude_line("user", "2.1.300", r#"[{"type":"tool_result","tool_use_id":"t1","content":"abc123 HEAD@{0}"}]"#);
+    let newer = claude_line("assistant", "2.1.400", r#"[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls"}}]"#);
+    let after = claude_line("assistant", "2.1.300", r#"[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"pwd"}}]"#);
+    std::fs::write(&agent, [call.as_str(), &result, &newer, &after].concat()).unwrap();
+    let (code, stderr) = import();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("relic: warning: 1 sessions reach Claude Code 2.1.400, which this relic was not checked against (2.1.288 to 2.1.318)"), "{stderr}");
+    assert!(stderr.ends_with("added 1 records from 1 of 2 sessions; 1 unchanged since last import\n"), "{stderr}");
+    assert_eq!(kinds(), [(7, 3), (8, 3), (9, 2)], "the output once, and nothing from 2.1.400 on");
+
+    // One session alone is known by its content.
+    let out = Command::new(env!("CARGO_BIN_EXE_relic")).arg("import").arg(project.join("s1.jsonl")).args(["--db"]).arg(dir.path().join("one.db")).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && stderr.contains("s1.jsonl: stored 6 claude records in "), "{stderr}");
+}

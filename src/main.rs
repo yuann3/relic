@@ -238,18 +238,21 @@ fn run(cmd: Command) -> Result<ExitCode> {
             if let Some(warning) = &r.key_warning {
                 eprintln!("relic: note: {}", app::display_line(warning));
             }
+            claude_notes(r.unreadable, r.unsupported.iter().map(|v| (v.as_str(), 1)));
+            let what = if r.kind == SourceKind::Claude { "records" } else { "commands" };
             match r.outcome {
                 Outcome::Unchanged => eprintln!("{name}: unchanged since last import"),
-                Outcome::First => eprintln!("{name}: stored {n} {} commands in {}", r.kind, shown(&db)),
-                Outcome::Appended => eprintln!("{name}: added {n} new commands"),
+                Outcome::First => eprintln!("{name}: stored {n} {} {what} in {}", r.kind, shown(&db)),
+                Outcome::Appended => eprintln!("{name}: added {n} new {what}"),
                 Outcome::Aligned => {
-                    eprintln!("{name}: the file was rewritten; added {n} new commands and kept the earlier ones")
+                    eprintln!("{name}: the file was rewritten; added {n} new {what} and kept the earlier ones")
                 }
                 Outcome::Superseded => eprintln!(
-                    "{name}: the file was rewritten beyond what relic could align; stored it whole ({n} commands) as a new revision and kept the earlier ones"
+                    "{name}: the file was rewritten beyond what relic could align; stored it whole ({n} {what}) as a new revision and kept the earlier ones"
                 ),
             }
         }
+        Command::ImportClaude { path, db } => return import_claude(path, db),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -292,6 +295,128 @@ fn confirm(question: &str) -> Result<bool> {
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
+/// Import every Claude Code session under `path`, or the one session it
+/// names, each its own source, and say what they added in total. A session
+/// that fails is named and the rest still import.
+fn import_claude(path: Option<PathBuf>, db: Option<PathBuf>) -> Result<ExitCode> {
+    use std::collections::BTreeMap;
+    let owns_dir = cli::owns_data_dir(&db);
+    let db = cli::resolve_db(db)?;
+    let root = match path {
+        Some(path) => path,
+        None => {
+            let config = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()).map(PathBuf::from);
+            config.or_else(|| home().map(|h| h.join(".claude"))).ok_or("HOME is not set")?.join("projects")
+        }
+    };
+    let sessions = claude_sessions(&root).map_err(|e| format!("{}: {e}", shown(&root)))?;
+    if sessions.is_empty() {
+        return Err(format!("no Claude Code sessions (*.jsonl) in {}", shown(&root)).into());
+    }
+    if let Some(dir) = db.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    tighten(&db, owns_dir);
+    let mut store = Store::open(&db)?;
+    let redactor = relic::redact::Redactor::new();
+    let (mut stored, mut grew, mut unchanged, mut unreadable, mut lossy, mut writing) = (0, 0, 0, 0, 0, 0);
+    let (mut rescrubbed, mut scrub_blocked, mut checkpoint_blocked) = (0, false, false);
+    let mut unsupported: BTreeMap<String, usize> = BTreeMap::new();
+    let mut failed = Vec::new();
+    for session in &sessions {
+        let r = History::open(session).and_then(|h| relic::import::import(&mut store, &h, Some(SourceKind::Claude), &redactor));
+        let r = match r {
+            Ok(r) => r,
+            Err(ImportError::Busy) => {
+                eprintln!("relic: busy: another import is writing {}; try again", shown(&db));
+                return Ok(ExitCode::from(2));
+            }
+            // Claude Code deletes old sessions, and this one went meanwhile.
+            Err(ImportError::Io(e)) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                failed.push(format!("{}: {e}", shown(session)));
+                continue;
+            }
+        };
+        stored += r.records_stored;
+        grew += usize::from(r.records_stored > 0);
+        unchanged += usize::from(r.outcome == Outcome::Unchanged);
+        (unreadable, lossy, writing) = (unreadable + r.unreadable, lossy + r.lossy_records, writing + usize::from(r.incomplete_tail));
+        rescrubbed += r.rescrubbed;
+        scrub_blocked |= r.scrub_blocked;
+        checkpoint_blocked |= r.checkpoint_blocked;
+        if let Some(version) = r.unsupported {
+            *unsupported.entry(version).or_default() += 1;
+        }
+        if let Some(warning) = &r.key_warning {
+            eprintln!("relic: note: {}", app::display_line(warning));
+        }
+    }
+    store_notes(rescrubbed, scrub_blocked, checkpoint_blocked);
+    claude_notes(unreadable, unsupported.iter().map(|(v, n)| (v.as_str(), *n)));
+    if lossy > 0 {
+        eprintln!("relic: note: {lossy} records were stored cut: long outputs keep their start and end");
+    }
+    if writing > 0 {
+        eprintln!("relic: note: {writing} sessions were being written; their last line waits for the next import");
+    }
+    eprintln!(
+        "{}: added {stored} records from {grew} of {} sessions; {unchanged} unchanged since last import",
+        shown(&root),
+        sessions.len()
+    );
+    for (i, why) in failed.iter().enumerate() {
+        if i == 5 {
+            eprintln!("relic: and {} more sessions failed", failed.len() - 5);
+            break;
+        }
+        eprintln!("relic: {}", app::display_line(why));
+    }
+    Ok(if failed.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(2) })
+}
+
+/// `path` if it is a file, else every `*.jsonl` file below it, in path
+/// order. Links are not followed: a session is a file Claude Code wrote.
+fn claude_sessions(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    // Sessions sit two levels down, subagents four or six: room to spare.
+    const DEPTH: usize = 8;
+    if std::fs::symlink_metadata(path)?.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let (mut found, mut dirs) = (Vec::new(), vec![(path.to_path_buf(), 0)]);
+    while let Some((dir, depth)) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let p = entry.path();
+            if kind.is_dir() && depth < DEPTH {
+                dirs.push((p, depth + 1));
+            } else if kind.is_file() && p.extension().is_some_and(|e| e == "jsonl") {
+                found.push(p);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// What a Claude Code import left unread.
+fn claude_notes<'a>(unreadable: usize, unsupported: impl Iterator<Item = (&'a str, usize)>) {
+    use relic::source::claude::{NEWEST, OLDEST};
+    if unreadable > 0 {
+        eprintln!(
+            "relic: warning: {unreadable} Claude Code records were skipped: over 1 MiB, or not the JSON this relic knows"
+        );
+    }
+    for (version, sessions) in unsupported {
+        eprintln!(
+            "relic: warning: {sessions} sessions reach Claude Code {}, which this relic was not checked against \
+             ({OLDEST} to {NEWEST}); their records from it on were not read",
+            app::display_line(version)
+        );
+    }
 }
 
 /// What an import of either kind of source did to the store as a whole.

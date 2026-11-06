@@ -19,7 +19,8 @@ USAGE:
     relic recall <QUESTION>... [--db PATH] [--json] [--allow-unknown-cost]
 ",
             $ui,
-            "    relic import <HISTORY_FILE | GIT_REPO> [--shell zsh|bash] [--db PATH]
+            "    relic import <HISTORY_FILE | GIT_REPO | SESSION.jsonl> [--shell zsh|bash] [--db PATH]
+    relic import --claude [DIR | SESSION.jsonl] [--db PATH]
     relic show <ID>... [--db PATH] [--json]
     relic forget <ID>... [--db PATH]
     relic validate <REPORT.json> [--cwd DIR] [--db PATH] -- <VERIFIER>...
@@ -56,6 +57,14 @@ OPTIONS:
                   its reflogs (HEAD, branches, stash) and refs, never its
                   files or diffs. Re-import to add what moved since; what
                   Git deletes or expires stays in relic
+    --claude      Import Claude Code sessions: every *.jsonl under DIR,
+                  default $CLAUDE_CONFIG_DIR/projects, else
+                  ~/.claude/projects. Relic keeps the commands its Bash tool
+                  ran, the start and end of what each printed, and which
+                  skill, file or search other tool calls named; never
+                  prompts, replies or thinking. Read for Claude Code
+                  2.1.288 to 2.1.318; a session's records from any other
+                  version wait for a relic that knows it
     validate      Run a verifier you wrote for a recall --json report, to
                   confirm its procedure worked: its argv as given, no shell,
                   in --cwd (default: here), unsandboxed, for at most 60 s.
@@ -120,6 +129,8 @@ pub enum Command {
     Recall { question: String, db: Option<PathBuf>, json: bool, allow_unknown_cost: bool },
     Ui { db: Option<PathBuf> },
     Import { path: PathBuf, shell: Option<SourceKind>, db: Option<PathBuf> },
+    /// Every Claude Code session under `path`, or one session file.
+    ImportClaude { path: Option<PathBuf>, db: Option<PathBuf> },
     Forget { ids: Vec<i64>, db: Option<PathBuf> },
     Show { ids: Vec<i64>, db: Option<PathBuf>, json: bool },
     Validate { report: PathBuf, cwd: Option<PathBuf>, db: Option<PathBuf>, argv: Vec<String> },
@@ -197,11 +208,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             Ok(Command::Ui { db })
         }
         "import" => {
-            let (mut path, mut shell, mut db) = (None, None, None);
+            let (mut path, mut shell, mut db, mut claude) = (None, None, None, false);
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
                     "-h" | "--help" => return Ok(Command::Help),
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
+                    "--claude" => claude = true,
                     "--shell" => {
                         shell = Some(match value(&mut args, "--shell")?.as_str() {
                             "zsh" => SourceKind::Zsh,
@@ -213,6 +225,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     _ if path.is_none() => path = Some(PathBuf::from(a)),
                     _ => return Err(format!("unexpected argument for import: {a}")),
                 }
+            }
+            if claude {
+                if shell.is_some() {
+                    return Err("--claude and --shell cannot be combined".into());
+                }
+                return Ok(Command::ImportClaude { path, db });
             }
             let path = path.ok_or("import needs a history file")?;
             Ok(Command::Import { path, shell, db })
@@ -476,6 +494,9 @@ mod tests {
         assert!(matches!(p(&["import", "h"]).unwrap(), Command::Import { shell: None, .. }));
         assert!(p(&["import"]).is_err());
         assert!(p(&["import", "h", "--shell", "fish"]).is_err());
+        assert_eq!(p(&["import", "--claude"]).unwrap(), Command::ImportClaude { path: None, db: None });
+        assert_eq!(p(&["import", "d", "--claude"]).unwrap(), Command::ImportClaude { path: Some("d".into()), db: None });
+        assert!(p(&["import", "--claude", "--shell", "zsh"]).is_err());
         assert_eq!(p(&["forget", "#42", "7"]).unwrap(), Command::Forget { ids: vec![42, 7], db: None });
         assert!(p(&["forget"]).is_err());
         assert_eq!(p(&["model", "check"]).unwrap(), Command::ModelCheck);

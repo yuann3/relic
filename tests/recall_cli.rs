@@ -374,6 +374,27 @@ fn privacy_canary_gate() {
     git(&["stash", "-q", "-m", "certbot wip token=Zq9CanaryStash15"]);
     let out = relic(&["import", repo.to_str().unwrap()], &db, "");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // A Claude Code session: secrets in what Relic keeps (a command, its
+    // output, a skill's args), and in every field it must not keep at all.
+    let envelope = r#""version":"2.1.318","timestamp":"2026-11-06T04:11:29.660Z","cwd":"/Zq9CanaryCwd16","gitBranch":"Zq9CanaryBranch17""#;
+    let session = [
+        format!(r#"{{"type":"user",{envelope},"message":{{"content":"renew certbot; Zq9CanaryPrompt18"}}}}"#),
+        format!(r#"{{"type":"assistant",{envelope},"message":{{"content":[{{"type":"thinking","thinking":"certbot Zq9CanaryThink19"}}]}}}}"#),
+        format!(r#"{{"type":"assistant",{envelope},"message":{{"content":[{{"type":"text","text":"certbot Zq9CanaryReply20"}}]}}}}"#),
+        format!(r#"{{"type":"assistant",{envelope},"message":{{"content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"certbot renew --password Zq9CanaryCcCmd21","description":"Zq9CanaryDesc22"}}}}]}}}}"#),
+        format!(r#"{{"type":"user",{envelope},"message":{{"content":[{{"type":"tool_result","tool_use_id":"t1","content":"certbot: renewed; token=Zq9CanaryCcOut23abcdefgh"}}]}},"toolUseResult":{{"stdout":"Zq9CanaryStdout24"}}}}"#),
+        format!(r#"{{"type":"assistant",{envelope},"message":{{"content":[{{"type":"tool_use","id":"t2","name":"Skill","input":{{"skill":"certbot-renewal","args":"--password=Zq9CanaryCcArg25"}}}}]}}}}"#),
+        format!(r#"{{"type":"user",{envelope},"isMeta":true,"message":{{"content":[{{"type":"text","text":"certbot skill body Zq9CanarySkill26"}}]}}}}"#),
+        r#"{"type":"attachment","attachment":{"type":"skill_listing","content":"certbot Zq9CanaryAttach27"}}"#.to_string(),
+        r#"{"type":"api-request-blob","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"certbot Zq9CanaryBlob28"}}]}}"#.to_string(),
+    ]
+    .map(|l| l + "\n")
+    .concat();
+    let session_path = histories.join("session.jsonl");
+    std::fs::write(&session_path, session).unwrap();
+    let out = relic(&["import", session_path.to_str().unwrap()], &db, "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && stderr.contains("stored 3 claude records"), "{stderr}");
 
     let redactor = relic::redact::Redactor::new();
     for raw in zsh_commands.iter().chain(&bash_commands) {
@@ -419,6 +440,9 @@ fn privacy_canary_gate() {
     let hits = serde_json::from_slice::<Value>(&search.stdout).unwrap()["hits"].as_array().unwrap().len();
     let git_rows = report["evidence"].as_array().unwrap().iter().filter(|e| e["source"] == "git").count();
     assert!(git_rows >= 6, "the commit, branch and stash went out: {report}");
+    for source in ["claude", "claude-out", "claude-tool"] {
+        assert!(report["evidence"].as_array().unwrap().iter().any(|e| e["source"] == source), "no {source} record went out: {report}");
+    }
     assert_eq!(report["evidence"].as_array().unwrap().len(), hits, "{report}");
     assert!(report["answer"].as_str().unwrap().ends_with("--password=[REDACTED:password]"), "{report}");
 
