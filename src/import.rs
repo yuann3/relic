@@ -21,6 +21,8 @@ pub enum SourceKind {
     Git,
     /// One Claude Code session's transcript.
     Claude,
+    /// One shell session's frames from `relic hook`.
+    Hook,
 }
 
 impl std::fmt::Display for SourceKind {
@@ -30,6 +32,7 @@ impl std::fmt::Display for SourceKind {
             Self::Bash => "bash",
             Self::Git => "git",
             Self::Claude => "claude",
+            Self::Hook => "hook",
         })
     }
 }
@@ -84,7 +87,8 @@ pub struct ImportResult {
     pub dangling_meta: u32,
     /// The file ended in a partial record, which was not stored.
     pub incomplete_tail: bool,
-    /// Claude Code lines that were not the JSON the parser knows. Skipped.
+    /// Claude Code lines that were not the JSON the parser knows, or hook
+    /// frames that were not what `relic hook` writes. Skipped.
     pub unreadable: usize,
     /// The Claude Code version parsing stopped at, unread with everything
     /// after it until a Relic that knows it imports the file.
@@ -173,7 +177,9 @@ impl History {
     pub fn detected(&self) -> io::Result<Option<SourceKind>> {
         let first = first_line(&self.file)?;
         let name = self.resolved.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-        Ok(if name.ends_with(".jsonl") && source::claude::looks_like(&first) {
+        Ok(if source::hook::looks_like(&first) {
+            Some(SourceKind::Hook)
+        } else if name.ends_with(".jsonl") && source::claude::looks_like(&first) {
             Some(SourceKind::Claude)
         } else if source::zsh::is_extended(&first) {
             Some(SourceKind::Zsh)
@@ -420,9 +426,10 @@ fn scan<T>(
     kind: SourceKind,
     run: impl FnOnce(&mut dyn Iterator<Item = io::Result<RawRecord>>) -> Result<T, ImportError>,
 ) -> Result<(T, Scan), ImportError> {
-    // A Claude Code result names only the call it answers, which may sit
-    // before `from`: its parser reads from the start and skips to `from`.
-    let read_from = if kind == SourceKind::Claude { 0 } else { from };
+    // A Claude Code result names only the call it answers, and a bash hook
+    // frame is new only against the frame before it, either of which may
+    // sit before `from`: their parsers read from the start and skip to it.
+    let read_from = if matches!(kind, SourceKind::Claude | SourceKind::Hook) { 0 } else { from };
     file.seek(SeekFrom::Start(read_from)).map_err(ImportError::Io)?;
     let reader = BufReader::new(file);
     let absolute = |raw: io::Result<RawRecord>| {
@@ -449,6 +456,12 @@ fn scan<T>(
             let mut parser = source::claude::Parser::resume(reader, from);
             let out = run(&mut parser.by_ref().map(absolute))?;
             (unreadable, unsupported) = (parser.unreadable(), parser.unsupported().map(str::to_string));
+            (out, parser.stable_len(), 0, parser.incomplete_tail())
+        }
+        SourceKind::Hook => {
+            let mut parser = source::hook::Parser::resume(reader, from);
+            let out = run(&mut parser.by_ref().map(absolute))?;
+            unreadable = parser.unreadable();
             (out, parser.stable_len(), 0, parser.incomplete_tail())
         }
         SourceKind::Git => return Err(ImportError::GitAsHistory),
@@ -1588,6 +1601,25 @@ mod tests {
         assert!(matches!(import_as("history", late, None), Err(ImportError::UnknownShell(_))));
         assert_eq!(import_as(".zsh_history", late, None).unwrap().kind, SourceKind::Zsh);
         assert_eq!(import_as("history", plain, Some(SourceKind::Bash)).unwrap().kind, SourceKind::Bash);
+    }
+
+    /// A bash frame is a new command only against the frame before it, which
+    /// an appended import has already stored.
+    #[test]
+    fn a_hook_session_is_known_by_its_frames_and_grows_frame_by_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bash-1.frames");
+        let frame = |n: u32, cmd: &str| format!("rh1\0bash\0\0{}\0{n}\0/srv\0    {n}  {cmd}\n\0\n", 1_700_000_000 + n);
+        fs::write(&path, [frame(1, "old"), frame(2, "make")].concat()).unwrap();
+        let mut store = Store::open(&dir.path().join("relic.db")).unwrap();
+        let redactor = Redactor::new();
+        let r = import_file(&mut store, &path, None, &redactor).unwrap();
+        assert_eq!((r.kind, r.records_stored), (SourceKind::Hook, 1));
+        // Enter on an empty line, then a command.
+        append(&path, &[frame(2, "make"), frame(3, "make test")].concat());
+        let r = import_file(&mut store, &path, None, &redactor).unwrap();
+        assert_eq!((r.outcome, r.records_stored), (Outcome::Appended, 1));
+        assert_eq!(texts(&store), ["make\nexit 2 · cwd after: /srv", "make test\nexit 3 · cwd after: /srv"]);
     }
 
     #[test]
