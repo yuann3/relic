@@ -277,7 +277,7 @@ pub fn import(
     };
 
     let (stored, scan) =
-        scan(file, from, kind, |records| store_records(&mut revision, kind, records, redactor))?;
+        scan(file, from, kind, |records| store_records(&mut revision, records, redactor))?;
     // The hint was taken before reading. If the file changed under the read,
     // the offsets this import decided on may have pointed into other bytes
     // by the time it parsed from them. Dropping the revision stores nothing.
@@ -488,14 +488,13 @@ fn align(
         return Ok((Some(0), 0));
     }
     let width = anchor.len().min(ALIGN_WINDOW);
-    let obs_kind = observation_kind(kind)?;
     let mut window = VecDeque::with_capacity(width);
     let (mut records, mut runs, mut in_run, mut boundary) = (0, 0usize, false, 0);
     scan(file, 0, kind, |parsed| {
         for raw in parsed {
             let raw = raw.map_err(ImportError::Io)?;
             // Redacted first: the anchor's keys were taken over safe text.
-            let observation = raw_to_observation(&raw, obs_kind, redactor);
+            let observation = raw_to_observation(&raw, redactor);
             if window.len() == width {
                 window.pop_front();
             }
@@ -512,14 +511,6 @@ fn align(
         Ok(())
     })?;
     Ok(((runs == 1).then_some(boundary), records))
-}
-
-fn observation_kind(kind: SourceKind) -> Result<ObservationKind, ImportError> {
-    match kind {
-        SourceKind::Zsh => Ok(ObservationKind::ZshCommand),
-        SourceKind::Bash => Ok(ObservationKind::BashCommand),
-        SourceKind::Git => Err(ImportError::GitAsHistory),
-    }
 }
 
 /// The path a source is known by: its directory with every symlink and `..`
@@ -570,14 +561,12 @@ struct Stored {
 /// visible and a retry starts clean.
 fn store_records(
     revision: &mut RevisionTx<'_>,
-    kind: SourceKind,
     records: impl Iterator<Item = io::Result<RawRecord>>,
     redactor: &Redactor,
 ) -> Result<Stored, ImportError> {
-    let obs_kind = observation_kind(kind)?;
     let mut stored = Stored { count: 0, lossy: 0, provenance: Provenance::COMMAND };
     for raw in records {
-        let observation = raw_to_observation(&raw.map_err(ImportError::Io)?, obs_kind, redactor);
+        let observation = raw_to_observation(&raw.map_err(ImportError::Io)?, redactor);
         if observation.observed_at_ms.is_some() {
             stored.provenance = stored.provenance.with(Provenance::OBSERVED_AT);
         }
@@ -597,9 +586,9 @@ fn checkpoint_blocked(store: &Store, stored: usize) -> Result<bool, ImportError>
         && !store.checkpoint().map_err(|e| ImportError::Store(StoreError::Sqlite(e)))?)
 }
 
-fn raw_to_observation(raw: &RawRecord, kind: ObservationKind, redactor: &Redactor) -> Observation {
+fn raw_to_observation(raw: &RawRecord, redactor: &Redactor) -> Observation {
     Observation {
-        kind,
+        kind: raw.kind,
         // A time whose milliseconds overflow is absent, not wrapped.
         observed_at_ms: raw.timestamp.and_then(|t| t.checked_mul(1000)),
         safe_text: redactor.import(&raw.command),
@@ -1157,7 +1146,7 @@ mod tests {
         records: impl Iterator<Item = io::Result<RawRecord>>,
     ) -> Result<ImportResult, ImportError> {
         let mut revision = store.lock_source(locator)?.new_revision(SourceKind::Zsh)?;
-        let stored = store_records(&mut revision, SourceKind::Zsh, records, &Redactor::new())?;
+        let stored = store_records(&mut revision, records, &Redactor::new())?;
         revision.commit(&Cursor::default(), stored.provenance)?;
         Ok(ImportResult {
             records_stored: stored.count,
@@ -1172,6 +1161,7 @@ mod tests {
                 return Err(io::Error::other("source went away"));
             }
             Ok(RawRecord {
+                kind: ObservationKind::ZshCommand,
                 timestamp: Some(1_700_000_000 + i as i64),
                 duration: None,
                 command: format!("echo needle {i}"),
@@ -1252,8 +1242,8 @@ mod tests {
         let locator = resolved.as_os_str().as_bytes();
 
         let mut writing = first.lock_source(locator).unwrap().new_revision(SourceKind::Zsh).unwrap();
-        let raw = RawRecord { timestamp: Some(1_700_000_000), duration: None, command: "echo needle".into(), start: 0, end: 27, lossy: false };
-        writing.insert(&raw_to_observation(&raw, ObservationKind::ZshCommand, &Redactor::new())).unwrap();
+        let raw = RawRecord { kind: ObservationKind::ZshCommand, timestamp: Some(1_700_000_000), duration: None, command: "echo needle".into(), start: 0, end: 27, lossy: false };
+        writing.insert(&raw_to_observation(&raw, &Redactor::new())).unwrap();
         let stat = stat_hint(&fs::metadata(&history_path).unwrap());
 
         let waiter = std::thread::scope(|s| {

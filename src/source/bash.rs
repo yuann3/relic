@@ -1,6 +1,7 @@
 use std::io::{self, BufRead};
 
 use super::{Line, Lines, RECORD_CAP, RawRecord, decode};
+use crate::domain::ObservationKind;
 
 /// v2: markers detected per record, CRLF-tolerant, capped per record,
 /// whitespace-only commands dropped, whitespace-only lines trimmed from both
@@ -75,7 +76,7 @@ impl<R: BufRead> Parser<R> {
             let mut lossy = line.lossy();
             let command = decode(std::mem::take(&mut self.line), &mut lossy);
             let record =
-                RawRecord { timestamp: None, duration: None, command, start, end: self.lines.offset, lossy };
+                RawRecord { kind: ObservationKind::BashCommand, timestamp: None, duration: None, command, start, end: self.lines.offset, lossy };
             if !line.terminated {
                 self.incomplete_tail = Some(record);
                 return Ok(None);
@@ -130,7 +131,7 @@ impl<R: BufRead> Parser<R> {
             let command = decode(bytes, &mut lossy);
             let blank = command.trim().is_empty();
             let record =
-                RawRecord { timestamp: marker.timestamp, duration: None, command, start: marker.start, end, lossy };
+                RawRecord { kind: ObservationKind::BashCommand, timestamp: marker.timestamp, duration: None, command, start: marker.start, end, lossy };
             // At end of input a marker with no command is still waiting for one.
             if self.marker.is_none() && (blank || !terminated) {
                 self.incomplete_tail = Some(record);

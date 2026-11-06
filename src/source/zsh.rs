@@ -1,6 +1,7 @@
 use std::io::{self, BufRead};
 
 use super::{Lines, RECORD_CAP, RawRecord, decode};
+use crate::domain::ObservationKind;
 
 /// v2: unmetafied, CRLF-tolerant, capped per record, whitespace-only
 /// commands dropped, trailing partial record withheld, the space zsh pads a
@@ -101,9 +102,9 @@ fn record(bytes: Vec<u8>, start: u64, end: u64, mut lossy: bool) -> RawRecord {
     let line = decode(bytes, &mut lossy);
     match split_extended(&line) {
         Some((timestamp, duration, command)) => {
-            RawRecord { timestamp, duration, command: command.to_string(), start, end, lossy }
+            RawRecord { kind: ObservationKind::ZshCommand, timestamp, duration, command: command.to_string(), start, end, lossy }
         }
-        None => RawRecord { timestamp: None, duration: None, command: line, start, end, lossy },
+        None => RawRecord { kind: ObservationKind::ZshCommand, timestamp: None, duration: None, command: line, start, end, lossy },
     }
 }
 

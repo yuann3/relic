@@ -4,6 +4,8 @@ pub mod zsh;
 
 use std::io::{self, BufRead};
 
+use crate::domain::ObservationKind;
+
 /// Hard cap on one record's command bytes. A longer record is cut here and
 /// flagged lossy; the rest of it is read past without being buffered.
 pub const RECORD_CAP: usize = 1 << 20;
@@ -15,6 +17,8 @@ const META: u8 = 0x83;
 /// complete records: one whose terminating newline has been read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawRecord {
+    /// What the parser read: one source can hold several kinds.
+    pub kind: ObservationKind,
     /// Seconds since epoch, if the file gives one that fits.
     pub timestamp: Option<i64>,
     /// Duration in seconds, if available.
