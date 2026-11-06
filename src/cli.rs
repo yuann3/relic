@@ -71,11 +71,13 @@ OPTIONS:
                   under DIR, default $XDG_STATE_HOME/relic/hooks
                   (~/.local/state/relic/hooks)
     hook          Print the hook for zsh or bash. Add eval \"$(relic hook zsh)\"
-                  to ~/.zshrc, or the bash one to ~/.bashrc. It records each
-                  command line, its exit status and directory, and its time
-                  (zsh: start and duration; bash: when it ended), never its
-                  output, input or environment, into a 0600 file per shell
-                  session. A command line starting with a space is left out
+                  to ~/.zshrc, or the bash one at the end of ~/.bashrc so it
+                  runs first at each prompt. It records each command line,
+                  its exit status and directory, and its time (zsh: start
+                  and duration; bash: when it ended), never its output, input
+                  or environment, into a 0600 file per shell session. A
+                  command line starting with a space is not imported, and
+                  zsh never writes it down
     validate      Run a verifier you wrote for a recall --json report, to
                   confirm its procedure worked: its argv as given, no shell,
                   in --cwd (default: here), unsandboxed, for at most 60 s.

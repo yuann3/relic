@@ -366,7 +366,9 @@ fn import_sessions(kind: SourceKind, path: Option<PathBuf>, db: Option<PathBuf>)
     }
     store_notes(rescrubbed, scrub_blocked, checkpoint_blocked);
     unread_notes(kind, unreadable, unsupported.iter().map(|(v, n)| (v.as_str(), *n)));
-    if lossy > 0 {
+    if lossy > 0 && kind == SourceKind::Hook {
+        eprintln!("relic: note: {lossy} records were stored altered: a line break in a directory, or text that was not UTF-8");
+    } else if lossy > 0 {
         eprintln!("relic: note: {lossy} records were stored cut: long outputs keep their start and end");
     }
     if writing > 0 {

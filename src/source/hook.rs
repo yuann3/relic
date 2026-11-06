@@ -46,7 +46,10 @@ pub struct Parser<R> {
     from: u64,
     /// Bash only: the history entry of the last frame, once one was read.
     /// The first frame is the prompt before any command, naming the last
-    /// line of the history file the shell loaded.
+    /// line of the history file the shell loaded. So is the first frame of
+    /// a file the hook made again after it was deleted: without the frame
+    /// before, a command cannot be told from a prompt without one, and
+    /// dropping a command beats inventing one.
     last_history: Option<Option<(u64, Vec<u8>)>>,
 }
 
