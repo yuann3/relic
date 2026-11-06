@@ -396,6 +396,20 @@ fn privacy_canary_gate() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success() && stderr.contains("stored 3 claude records"), "{stderr}");
 
+    // A shell hook session: secrets in the command and in the directory.
+    let hooks = histories.join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let frames = [
+        "rh1\0zsh\x001700000200.5\x001700000201.25\x001\0/srv/token=Zq9CanaryHookCwd29abcdefgh\0certbot renew --password Zq9CanaryHook30\0\n",
+        "rh1\0bash\0\x001700000300\x000\0/srv\0    1  old\n\0\n",
+        "rh1\0bash\0\x001700000301\x000\0/home/u/api_key=Zq9CanaryHookCwd31\0    2  certbot renew --api-key=[REDACTED:api-key]\n\0\n",
+    ];
+    std::fs::write(hooks.join("zsh-1.frames"), frames[0]).unwrap();
+    std::fs::write(hooks.join("bash-1.frames"), [frames[1], frames[2]].concat()).unwrap();
+    let out = relic(&["import", "--hooks", hooks.to_str().unwrap()], &db, "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && stderr.contains("added 2 records from 2 of 2 sessions"), "{stderr}");
+
     let redactor = relic::redact::Redactor::new();
     for raw in zsh_commands.iter().chain(&bash_commands) {
         let safe = redactor.import(raw);
@@ -440,7 +454,7 @@ fn privacy_canary_gate() {
     let hits = serde_json::from_slice::<Value>(&search.stdout).unwrap()["hits"].as_array().unwrap().len();
     let git_rows = report["evidence"].as_array().unwrap().iter().filter(|e| e["source"] == "git").count();
     assert!(git_rows >= 6, "the commit, branch and stash went out: {report}");
-    for source in ["claude", "claude-out", "claude-tool"] {
+    for source in ["claude", "claude-out", "claude-tool", "hook"] {
         assert!(report["evidence"].as_array().unwrap().iter().any(|e| e["source"] == source), "no {source} record went out: {report}");
     }
     assert_eq!(report["evidence"].as_array().unwrap().len(), hits, "{report}");

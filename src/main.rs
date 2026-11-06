@@ -238,7 +238,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
             if let Some(warning) = &r.key_warning {
                 eprintln!("relic: note: {}", app::display_line(warning));
             }
-            claude_notes(r.unreadable, r.unsupported.iter().map(|v| (v.as_str(), 1)));
+            unread_notes(r.kind, r.unreadable, r.unsupported.iter().map(|v| (v.as_str(), 1)));
             let what = if r.kind == SourceKind::Claude { "records" } else { "commands" };
             match r.outcome {
                 Outcome::Unchanged => eprintln!("{name}: unchanged since last import"),
@@ -252,7 +252,11 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 ),
             }
         }
-        Command::ImportClaude { path, db } => return import_claude(path, db),
+        Command::ImportSessions { kind, path, db } => return import_sessions(kind, path, db),
+        Command::Hook { shell } => {
+            let hook = if shell == SourceKind::Zsh { relic::source::hook::ZSH } else { relic::source::hook::BASH };
+            std::io::stdout().lock().write_all(hook.as_bytes())?;
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -297,23 +301,29 @@ fn confirm(question: &str) -> Result<bool> {
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
-/// Import every Claude Code session under `path`, or the one session it
-/// names, each its own source, and say what they added in total. A session
-/// that fails is named and the rest still import.
-fn import_claude(path: Option<PathBuf>, db: Option<PathBuf>) -> Result<ExitCode> {
+/// Import every Claude Code or shell hook session under `path`, or the one
+/// session it names, each its own source, and say what they added in total.
+/// A session that fails is named and the rest still import.
+fn import_sessions(kind: SourceKind, path: Option<PathBuf>, db: Option<PathBuf>) -> Result<ExitCode> {
     use std::collections::BTreeMap;
     let owns_dir = cli::owns_data_dir(&db);
     let db = cli::resolve_db(db)?;
-    let root = match path {
-        Some(path) => path,
-        None => {
-            let config = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()).map(PathBuf::from);
-            config.or_else(|| home().map(|h| h.join(".claude"))).ok_or("HOME is not set")?.join("projects")
+    let env_dir = |var| std::env::var_os(var).filter(|d| !d.is_empty()).map(PathBuf::from);
+    let (root, extension, what) = match (path, kind) {
+        (Some(path), SourceKind::Hook) => (path, "frames", "shell hook"),
+        (Some(path), _) => (path, "jsonl", "Claude Code"),
+        (None, SourceKind::Hook) => {
+            let state = env_dir("XDG_STATE_HOME").or_else(|| home().map(|h| h.join(".local/state")));
+            (state.ok_or("HOME is not set")?.join("relic/hooks"), "frames", "shell hook")
+        }
+        (None, _) => {
+            let config = env_dir("CLAUDE_CONFIG_DIR").or_else(|| home().map(|h| h.join(".claude")));
+            (config.ok_or("HOME is not set")?.join("projects"), "jsonl", "Claude Code")
         }
     };
-    let sessions = claude_sessions(&root).map_err(|e| format!("{}: {e}", shown(&root)))?;
+    let sessions = session_files(&root, extension).map_err(|e| format!("{}: {e}", shown(&root)))?;
     if sessions.is_empty() {
-        return Err(format!("no Claude Code sessions (*.jsonl) in {}", shown(&root)).into());
+        return Err(format!("no {what} sessions (*.{extension}) in {}", shown(&root)).into());
     }
     if let Some(dir) = db.parent() {
         std::fs::create_dir_all(dir)?;
@@ -326,14 +336,14 @@ fn import_claude(path: Option<PathBuf>, db: Option<PathBuf>) -> Result<ExitCode>
     let mut unsupported: BTreeMap<String, usize> = BTreeMap::new();
     let mut failed = Vec::new();
     for session in &sessions {
-        let r = History::open(session).and_then(|h| relic::import::import(&mut store, &h, Some(SourceKind::Claude), &redactor));
+        let r = History::open(session).and_then(|h| relic::import::import(&mut store, &h, Some(kind), &redactor));
         let r = match r {
             Ok(r) => r,
             Err(ImportError::Busy) => {
                 eprintln!("relic: busy: another import is writing {}; try again", shown(&db));
                 return Ok(ExitCode::from(2));
             }
-            // Claude Code deletes old sessions, and this one went meanwhile.
+            // Claude Code deletes old sessions, and so may the user.
             Err(ImportError::Io(e)) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => {
                 failed.push(format!("{}: {e}", shown(session)));
@@ -355,7 +365,7 @@ fn import_claude(path: Option<PathBuf>, db: Option<PathBuf>) -> Result<ExitCode>
         }
     }
     store_notes(rescrubbed, scrub_blocked, checkpoint_blocked);
-    claude_notes(unreadable, unsupported.iter().map(|(v, n)| (v.as_str(), *n)));
+    unread_notes(kind, unreadable, unsupported.iter().map(|(v, n)| (v.as_str(), *n)));
     if lossy > 0 {
         eprintln!("relic: note: {lossy} records were stored cut: long outputs keep their start and end");
     }
@@ -377,9 +387,9 @@ fn import_claude(path: Option<PathBuf>, db: Option<PathBuf>) -> Result<ExitCode>
     Ok(if failed.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(2) })
 }
 
-/// `path` if it is a file, else every `*.jsonl` file below it, in path
-/// order. Links are not followed: a session is a file Claude Code wrote.
-fn claude_sessions(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// `path` if it is a file, else every `*.<extension>` file below it, in path
+/// order. Links are not followed: a session is a file its tool wrote.
+fn session_files(path: &Path, extension: &str) -> std::io::Result<Vec<PathBuf>> {
     // Sessions sit two levels down, subagents four or six: room to spare.
     const DEPTH: usize = 8;
     if std::fs::symlink_metadata(path)?.is_file() {
@@ -393,7 +403,7 @@ fn claude_sessions(path: &Path) -> std::io::Result<Vec<PathBuf>> {
             let p = entry.path();
             if kind.is_dir() && depth < DEPTH {
                 dirs.push((p, depth + 1));
-            } else if kind.is_file() && p.extension().is_some_and(|e| e == "jsonl") {
+            } else if kind.is_file() && p.extension().is_some_and(|e| e == extension) {
                 found.push(p);
             }
         }
@@ -402,10 +412,12 @@ fn claude_sessions(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// What a Claude Code import left unread.
-fn claude_notes<'a>(unreadable: usize, unsupported: impl Iterator<Item = (&'a str, usize)>) {
+/// What a Claude Code or shell hook import left unread.
+fn unread_notes<'a>(kind: SourceKind, unreadable: usize, unsupported: impl Iterator<Item = (&'a str, usize)>) {
     use relic::source::claude::{NEWEST, OLDEST};
-    if unreadable > 0 {
+    if kind == SourceKind::Hook && unreadable > 0 {
+        eprintln!("relic: warning: {unreadable} shell hook frames were skipped: over 1 MiB, or not what relic hook writes");
+    } else if unreadable > 0 {
         eprintln!(
             "relic: warning: {unreadable} Claude Code records were skipped: over 1 MiB, or not the JSON this relic knows"
         );

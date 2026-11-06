@@ -21,6 +21,8 @@ USAGE:
             $ui,
             "    relic import <HISTORY_FILE | GIT_REPO | SESSION.jsonl> [--shell zsh|bash] [--db PATH]
     relic import --claude [DIR | SESSION.jsonl] [--db PATH]
+    relic import --hooks [DIR | SESSION.frames] [--db PATH]
+    relic hook zsh|bash
     relic show <ID>... [--db PATH] [--json]
     relic forget <ID>... [--db PATH]
     relic validate <REPORT.json> [--cwd DIR] [--db PATH] -- <VERIFIER>...
@@ -65,6 +67,15 @@ OPTIONS:
                   prompts, replies or thinking. Read for Claude Code
                   2.1.288 to 2.1.318; a session's records from any other
                   version wait for a relic that knows it
+    --hooks       Import what relic's shell hooks recorded: every *.frames
+                  under DIR, default $XDG_STATE_HOME/relic/hooks
+                  (~/.local/state/relic/hooks)
+    hook          Print the hook for zsh or bash. Add eval \"$(relic hook zsh)\"
+                  to ~/.zshrc, or the bash one to ~/.bashrc. It records each
+                  command line, its exit status and directory, and its time
+                  (zsh: start and duration; bash: when it ended), never its
+                  output, input or environment, into a 0600 file per shell
+                  session. A command line starting with a space is left out
     validate      Run a verifier you wrote for a recall --json report, to
                   confirm its procedure worked: its argv as given, no shell,
                   in --cwd (default: here), unsandboxed, for at most 60 s.
@@ -129,8 +140,11 @@ pub enum Command {
     Recall { question: String, db: Option<PathBuf>, json: bool, allow_unknown_cost: bool },
     Ui { db: Option<PathBuf> },
     Import { path: PathBuf, shell: Option<SourceKind>, db: Option<PathBuf> },
-    /// Every Claude Code session under `path`, or one session file.
-    ImportClaude { path: Option<PathBuf>, db: Option<PathBuf> },
+    /// Every Claude Code (`kind` Claude) or shell hook (`kind` Hook) session
+    /// under `path`, or one session file.
+    ImportSessions { kind: SourceKind, path: Option<PathBuf>, db: Option<PathBuf> },
+    /// Print the hook for `shell`, zsh or bash.
+    Hook { shell: SourceKind },
     Forget { ids: Vec<i64>, db: Option<PathBuf> },
     Show { ids: Vec<i64>, db: Option<PathBuf>, json: bool },
     Validate { report: PathBuf, cwd: Option<PathBuf>, db: Option<PathBuf>, argv: Vec<String> },
@@ -208,12 +222,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             Ok(Command::Ui { db })
         }
         "import" => {
-            let (mut path, mut shell, mut db, mut claude) = (None, None, None, false);
+            let (mut path, mut shell, mut db, mut sessions) = (None, None, None, None);
             while let Some(a) = args.next().transpose()? {
                 match a.as_str() {
                     "-h" | "--help" => return Ok(Command::Help),
                     "--db" => db = Some(value(&mut args, "--db")?.into()),
-                    "--claude" => claude = true,
+                    "--claude" => sessions = Some(SourceKind::Claude),
+                    "--hooks" => sessions = Some(SourceKind::Hook),
                     "--shell" => {
                         shell = Some(match value(&mut args, "--shell")?.as_str() {
                             "zsh" => SourceKind::Zsh,
@@ -226,15 +241,21 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     _ => return Err(format!("unexpected argument for import: {a}")),
                 }
             }
-            if claude {
+            if let Some(kind) = sessions {
                 if shell.is_some() {
-                    return Err("--claude and --shell cannot be combined".into());
+                    return Err(format!("--{} and --shell cannot be combined", if kind == SourceKind::Hook { "hooks" } else { "claude" }));
                 }
-                return Ok(Command::ImportClaude { path, db });
+                return Ok(Command::ImportSessions { kind, path, db });
             }
             let path = path.ok_or("import needs a history file")?;
             Ok(Command::Import { path, shell, db })
         }
+        "hook" => match (args.next().transpose()?.as_deref(), args.next().transpose()?) {
+            (Some("zsh"), None) => Ok(Command::Hook { shell: SourceKind::Zsh }),
+            (Some("bash"), None) => Ok(Command::Hook { shell: SourceKind::Bash }),
+            (Some("-h" | "--help"), _) => Ok(Command::Help),
+            _ => Err("hook needs a shell: zsh or bash".into()),
+        },
         "model" => match (args.next().transpose()?.as_deref(), args.next().transpose()?.as_deref()) {
             (Some("-h" | "--help"), _) | (Some("check"), Some("-h" | "--help")) => Ok(Command::Help),
             (Some("check"), None) => Ok(Command::ModelCheck),
@@ -494,9 +515,14 @@ mod tests {
         assert!(matches!(p(&["import", "h"]).unwrap(), Command::Import { shell: None, .. }));
         assert!(p(&["import"]).is_err());
         assert!(p(&["import", "h", "--shell", "fish"]).is_err());
-        assert_eq!(p(&["import", "--claude"]).unwrap(), Command::ImportClaude { path: None, db: None });
-        assert_eq!(p(&["import", "d", "--claude"]).unwrap(), Command::ImportClaude { path: Some("d".into()), db: None });
+        let sessions = |kind, path: Option<&str>| Command::ImportSessions { kind, path: path.map(Into::into), db: None };
+        assert_eq!(p(&["import", "--claude"]).unwrap(), sessions(SourceKind::Claude, None));
+        assert_eq!(p(&["import", "d", "--claude"]).unwrap(), sessions(SourceKind::Claude, Some("d")));
+        assert_eq!(p(&["import", "--hooks", "d"]).unwrap(), sessions(SourceKind::Hook, Some("d")));
         assert!(p(&["import", "--claude", "--shell", "zsh"]).is_err());
+        assert!(p(&["import", "--hooks", "--shell", "zsh"]).is_err());
+        assert_eq!(p(&["hook", "bash"]).unwrap(), Command::Hook { shell: SourceKind::Bash });
+        assert!(p(&["hook"]).is_err() && p(&["hook", "fish"]).is_err() && p(&["hook", "zsh", "x"]).is_err());
         assert_eq!(p(&["forget", "#42", "7"]).unwrap(), Command::Forget { ids: vec![42, 7], db: None });
         assert!(p(&["forget"]).is_err());
         assert_eq!(p(&["model", "check"]).unwrap(), Command::ModelCheck);
