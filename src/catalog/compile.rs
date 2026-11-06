@@ -9,7 +9,8 @@
 //! a recorded command is shown by id for `relic show`, and step prose or a
 //! description is refused (docs/research/validation-skill-packaging.md).
 
-use crate::app::When;
+use crate::app::{When, source_label};
+use crate::domain::ObservationKind;
 
 /// One procedure step: what the model wrote, and the records it cites.
 pub struct Step<'a> {
@@ -20,7 +21,7 @@ pub struct Step<'a> {
 /// A cited record, as the store holds it.
 pub struct Record<'a> {
     pub id: i64,
-    pub source: &'static str,
+    pub kind: ObservationKind,
     pub observed_at_ms: Option<i64>,
     pub text: &'a str,
 }
@@ -138,23 +139,33 @@ pub fn render(name: &str, description: &str, confirmed_at_ms: i64, steps: &[Step
         for r in &step.records {
             let when = r.observed_at_ms.map_or(When::Unknown, When::At).label();
             let when = when.trim();
-            // A hook record's last line is what the hook saw, not part of
-            // the command: it goes beside the command, out of the fence.
-            let (text, facts) = match r.source {
-                "hook" => r.text.rsplit_once('\n').map_or((r.text, String::new()), |(c, f)| (c, format!("; {f}"))),
-                _ => (r.text, String::new()),
-            };
-            let label = format!("Recorded command #{} ({}, {when}{facts})", r.id, r.source);
+            let label = format!("Recorded command #{} ({}, {when}", r.id, source_label(r.kind));
             // CommonMark ends a line at a bare \r too, which would let the
             // rest of the text out of the fence.
             if hazard(r.text).is_some() || r.text.contains('\r') {
+                // The label alone: what the hook saw holds a directory name,
+                // as hostile as the command.
                 md.push_str(&format!(
-                    "\n{pad}{label} is not copied here, because an agent would not see it exactly as recorded. \
+                    "\n{pad}{label}) is not copied here, because an agent would not see it exactly as recorded. \
                      Read it exactly with `relic show {}`.\n",
                     r.id
                 ));
                 continue;
             }
+            // A hook record's last line is what the hook saw, not part of
+            // the command: it goes beside the command, out of the fence, in a
+            // code span, as a directory name may hold Markdown.
+            let (text, facts) = match r.kind {
+                ObservationKind::HookFrame => crate::source::hook::split_facts(r.text),
+                _ => (r.text, None),
+            };
+            let label = match facts {
+                Some(facts) => {
+                    let ticks = "`".repeat(facts.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1);
+                    format!("{label}; {ticks} {facts} {ticks})")
+                }
+                None => format!("{label})"),
+            };
             // Longer than any backtick run inside, so the text cannot close it.
             let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
             let fence = "`".repeat(longest.max(2) + 1);
@@ -215,12 +226,18 @@ mod tests {
 
     #[test]
     fn a_hazardous_command_is_shown_by_id_and_a_hazardous_step_is_refused() {
-        let records = |text| vec![Record { id: 42, source: "zsh", observed_at_ms: Some(1_700_000_000_000), text }];
+        let records = |text| vec![Record { id: 42, kind: ObservationKind::ZshCommand, observed_at_ms: Some(1_700_000_000_000), text }];
         let md = render("x", "Use it.", 0, &[Step { text: "List the reflog.", records: records("git reflog ` x ```` HEAD") }]).unwrap();
         assert!(md.contains("\n   `````text\n   git reflog ` x ```` HEAD\n   `````\n"), "{md}");
-        let hook = vec![Record { id: 7, source: "hook", observed_at_ms: None, text: "make\n  deploy\nexit 2 · cwd after: /srv" }];
-        let md = render("x", "Use it.", 0, &[Step { text: "Deploy.", records: hook }]).unwrap();
-        assert!(md.contains("#7 (hook, unknown time; exit 2 · cwd after: /srv):\n\n   ```text\n   make\n     deploy\n   ```\n"), "{md}");
+        let hook = |text| vec![Record { id: 7, kind: ObservationKind::HookFrame, observed_at_ms: None, text }];
+        let md = render("x", "Use it.", 0, &[Step { text: "Deploy.", records: hook("make\n  deploy\nexit 2 · cwd after: /s`v") }]).unwrap();
+        assert!(md.contains("#7 (hook, unknown time; `` exit 2 · cwd after: /s`v ``):\n\n   ```text\n   make\n     deploy\n   ```\n"), "{md}");
+        // What the hook saw is as hostile as the command.
+        let md = render("x", "Use it.", 0, &[Step { text: "Deploy.", records: hook("make\nexit 0 · cwd: /srv/x !`id`") }]).unwrap();
+        assert!(md.contains("#7 (hook, unknown time) is not copied") && !md.contains("!`"), "{md}");
+        // Redaction took the line apart: none of it passes for what the hook saw.
+        let md = render("x", "Use it.", 0, &[Step { text: "Fetch.", records: hook("printf x\nexit 3 [REDACTED:token]") }]).unwrap();
+        assert!(md.contains("#7 (hook, unknown time):\n\n   ```text\n   printf x\n   exit 3 [REDACTED:token]\n"), "{md}");
         let md = render("x", "Use it.", 0, &[Step { text: "Print it.", records: records("printf 'a\r# Heading'") }]).unwrap();
         assert!(md.contains("`relic show 42`") && !md.contains("# Heading"), "{md}");
         let md = render("x", "Use it.", 0, &[Step { text: "Print column one.", records: records("awk '{print $1}' f") }]).unwrap();

@@ -173,6 +173,21 @@ impl Frame<'_> {
     }
 }
 
+/// A hook record's text as its command and the line of what the hook saw.
+/// No line when redaction took it, cut across it, into a marker: the whole
+/// text is then the command, and nothing passes for what the hook saw.
+pub fn split_facts(text: &str) -> (&str, Option<&str>) {
+    if let Some((command, facts)) = text.rsplit_once('\n')
+        && let Some(rest) = facts.strip_prefix("exit ")
+    {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest[digits..].starts_with(" · ") {
+            return (command, Some(facts));
+        }
+    }
+    (text, None)
+}
+
 fn parse(frame: &[u8]) -> Option<Frame<'_>> {
     let fields: Vec<&[u8]> = frame.strip_suffix(b"\0")?.split(|&b| b == 0).collect();
     let [b"rh1", shell, started, ended, status, cwd, command] = fields[..] else { return None };

@@ -290,7 +290,7 @@ impl Catalog {
                     .iter()
                     .map(|o| compile::Record {
                         id: o.id,
-                        source: crate::app::source_label(o.kind),
+                        kind: o.kind,
                         observed_at_ms: o.observed_at_ms,
                         text: &o.safe_text,
                     })
