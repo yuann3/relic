@@ -14,7 +14,7 @@ Relic imports local experience artifacts: shell history, shell hooks, Git and ag
 
 | Context | Responsibility | Current modules | ADRs |
 |---|---|---|---|
-| Source Ingestion | Reads sources as byte streams. Owns source identity, change detection, revisions, anchor alignment, shell kind and atomic import. Source adapters are one of the two polymorphic seams. | `src/source/{mod,zsh,bash,git}.rs`, `src/import.rs` | [0002](docs/adr/0002-source-identity-and-revisions.md), [0005](docs/adr/0005-evidence-store-transactions-and-read-only-open.md) |
+| Source Ingestion | Reads sources as byte streams. Owns source identity, change detection, revisions, anchor alignment, shell kind and atomic import. Source adapters are one of the two polymorphic seams. | `src/source/{mod,zsh,bash,git,claude}.rs`, `src/import.rs` | [0002](docs/adr/0002-source-identity-and-revisions.md), [0005](docs/adr/0005-evidence-store-transactions-and-read-only-open.md) |
 | Redaction & Identity | Owns the redaction policy, typed markers, `redaction_revision`, rescrub, file permissions and the installation key. | `src/redact.rs`, `src/key.rs` | [0003](docs/adr/0003-redaction-policy.md), [0002](docs/adr/0002-source-identity-and-revisions.md), [0004](docs/adr/0004-egress-seam-and-privacy-canary.md) |
 | Evidence Store | Owns the SQLite schema, observations, the FTS5 index, revisions, transactions, read-only open, `user_version` and size. | `src/store/{mod,schema}.rs`, `src/domain.rs` | [0005](docs/adr/0005-evidence-store-transactions-and-read-only-open.md), [0008](docs/adr/0008-gate-change-database-size.md) |
 | Search | Owns query compilation, recently-imported-first ordering, opt-in `--rank`, the query budget, hot prefixes and the fzf picker. | query methods in `src/store/mod.rs`; `search` and `SearchPage` in `src/app.rs`; `src/picker.rs` | [0006](docs/adr/0006-search-ordering-and-query-budget.md), [0007](docs/adr/0007-gate-change-warm-fts-hot-prefixes.md) |
@@ -76,6 +76,7 @@ One canonical term per concept. Use the term, not the words in the Avoid column.
 | Rollback | Undoing a link's newest activation not yet undone: back to the bundle it pointed to before, or no link. Repeated, it steps further back. | uninstall, revert |
 | Shell hook | A metadata-only zsh or Bash hook that records command frames, including exit status. | hook (alone) |
 | Agent hook | A hook in an agent tool such as Claude Code. | hook (alone) |
+| Agent record | What Relic keeps of a Claude Code session: a Bash call's command (`AgentCommand`), what it printed (`AgentOutput`), or another tool call's name and argument (`AgentTool`). Never prompts, replies or thinking. | agent message, transcript entry |
 | SQLite progress handler | The rusqlite `hooks`-feature callback that enforces the query deadline and cancellation. | hook (alone) |
 
 Dropped terms: "candidate" belongs to out-of-scope governance vocabulary. Relate and Combine are mentioned only as operators that plan admission rejects in v0.1.
