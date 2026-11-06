@@ -2,9 +2,10 @@
 //! shell session, appended by that shell alone, one frame per command.
 //!
 //! A frame is seven fields, each ended by a NUL, then a newline:
-//! `rh1`, the shell, start, end, exit status, directory, command. Neither
-//! shell can put a NUL in a string, so a line ending in the seventh NUL
-//! ends a frame however many newlines the command or directory held.
+//! `rh1`, the shell, start, end, exit status, directory, command. No field
+//! holds a NUL (bash cannot store one, and the zsh hook strips them), so a
+//! line ending in the seventh NUL ends a frame however many newlines the
+//! command or directory held.
 //!
 //! The two shells see different things, and a record says only what its
 //! shell saw: zsh hooks run before and after a command, so a zsh frame has
@@ -43,10 +44,10 @@ pub struct Parser<R> {
     /// Frames starting before this offset are read for the history number
     /// they leave behind, but not yielded.
     from: u64,
-    /// Bash only: the history number of the last frame, once one was read.
+    /// Bash only: the history entry of the last frame, once one was read.
     /// The first frame is the prompt before any command, naming the last
     /// line of the history file the shell loaded.
-    last_history: Option<Option<u64>>,
+    last_history: Option<Option<(u64, Vec<u8>)>>,
 }
 
 impl<R: BufRead> Parser<R> {
@@ -85,8 +86,9 @@ impl<R: BufRead> Parser<R> {
         loop {
             let start = self.lines.offset;
             self.frame.clear();
-            let mut cut = false;
+            let (mut cut, mut nuls) = (false, 0);
             loop {
+                let before = self.frame.len();
                 let Some(line) = self.lines.read_into(&mut self.frame)? else {
                     self.incomplete_tail |= !self.frame.is_empty();
                     return Ok(None);
@@ -97,11 +99,13 @@ impl<R: BufRead> Parser<R> {
                 }
                 cut |= line.cut;
                 // Past the cap, NULs are dropped and cannot be counted.
-                let nuls = self.frame.iter().filter(|&&b| b == 0).count();
+                nuls += self.frame[before..].iter().filter(|&&b| b == 0).count();
                 if line.last == Some(0) && (cut || nuls >= FIELDS) {
                     break;
                 }
-                self.frame.push(b'\n');
+                if !cut {
+                    self.frame.push(b'\n');
+                }
             }
             self.stable_len = self.lines.offset;
             let end = self.lines.offset;
@@ -110,11 +114,14 @@ impl<R: BufRead> Parser<R> {
                 self.unreadable += 1;
                 continue;
             };
+            // The number and the text: under HISTCONTROL=erasedups a new
+            // command can take the number the last one had.
             let new = match frame.history {
                 None => true,
                 Some(number) => {
-                    let seen = self.last_history.replace(number);
-                    seen.is_some_and(|seen| seen != number)
+                    let entry = number.map(|n| (n, frame.command.to_vec()));
+                    let seen = self.last_history.replace(entry.clone());
+                    seen.is_some_and(|seen| seen != entry)
                 }
             };
             if !new || start < self.from || frame.command.is_empty() || frame.command.starts_with(b" ") {
@@ -275,6 +282,8 @@ mod tests {
             bash("1700000009", "2", "/srv", "  813  cd /srv && make\n"),
             bash("1700000012", "0", "/srv", "  814* git status\n"),
             bash("1700000013", "0", "/srv", "  815   export TOKEN=x\n"),
+            // erasedups: `make` moved to the end, so 815 again.
+            bash("1700000014", "127", "/srv", "  815  make\n"),
         ]
         .concat();
         let (records, _) = records(&input, 0);
@@ -284,6 +293,7 @@ mod tests {
             [
                 (Some(1_700_000_005), None, "cd /srv && make\nexit 2 · cwd after: /srv"),
                 (Some(1_700_000_012), None, "git status\nexit 0 · cwd after: /srv"),
+                (Some(1_700_000_014), None, "make\nexit 127 · cwd after: /srv"),
             ]
         );
     }
