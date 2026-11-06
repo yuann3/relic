@@ -11,13 +11,16 @@ use crate::redact::{REDACTION_REVISION, Redactor};
 use crate::source::{self, RawRecord};
 use crate::store::{Cursor, RevisionTx, StatHint, Store, StoreError};
 
-/// What a source is: a shell history, by its format, or a Git repository.
+/// What a source is: a shell history, by its format, a Claude Code session,
+/// or a Git repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     Zsh,
     Bash,
     /// A repository, imported through `git` rather than read as a file.
     Git,
+    /// One Claude Code session's transcript.
+    Claude,
 }
 
 impl std::fmt::Display for SourceKind {
@@ -26,6 +29,7 @@ impl std::fmt::Display for SourceKind {
             Self::Zsh => "zsh",
             Self::Bash => "bash",
             Self::Git => "git",
+            Self::Claude => "claude",
         })
     }
 }
@@ -80,6 +84,11 @@ pub struct ImportResult {
     pub dangling_meta: u32,
     /// The file ended in a partial record, which was not stored.
     pub incomplete_tail: bool,
+    /// Claude Code lines that were not the JSON the parser knows. Skipped.
+    pub unreadable: usize,
+    /// The Claude Code version parsing stopped at, unread with everything
+    /// after it until a Relic that knows it imports the file.
+    pub unsupported: Option<String>,
 }
 
 impl ImportResult {
@@ -98,6 +107,8 @@ impl ImportResult {
             lossy_records: 0,
             dangling_meta: 0,
             incomplete_tail: false,
+            unreadable: 0,
+            unsupported: None,
         }
     }
 }
@@ -154,14 +165,17 @@ impl History {
         Ok(Self { path: path.to_path_buf(), resolved, file, stat: stat_hint(&metadata) })
     }
 
-    /// The shell the file gives away: by its first line (zsh extended
+    /// The source the file gives away: a `.jsonl` file of JSON records is a
+    /// Claude Code session; a history by its first line (zsh extended
     /// history, or a bash `#<epoch>` marker), else by its name. Only the
     /// first line, because a `#123` comment or a pasted `: 1:0;x` further
     /// down an untimed history says nothing about who wrote the file.
     pub fn detected(&self) -> io::Result<Option<SourceKind>> {
         let first = first_line(&self.file)?;
         let name = self.resolved.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-        Ok(if source::zsh::is_extended(&first) {
+        Ok(if name.ends_with(".jsonl") && source::claude::looks_like(&first) {
+            Some(SourceKind::Claude)
+        } else if source::zsh::is_extended(&first) {
             Some(SourceKind::Zsh)
         } else if source::bash::is_marker(&first) {
             Some(SourceKind::Bash)
@@ -305,6 +319,8 @@ pub fn import(
         lossy_records: stored.lossy,
         dangling_meta: scan.dangling_meta,
         incomplete_tail: scan.incomplete_tail,
+        unreadable: scan.unreadable,
+        unsupported: scan.unsupported,
     })
 }
 
@@ -391,6 +407,8 @@ struct Scan {
     stable_len: u64,
     dangling_meta: u32,
     incomplete_tail: bool,
+    unreadable: usize,
+    unsupported: Option<String>,
 }
 
 /// Parse `file` from byte `from`, which must be where a record starts, and
@@ -402,15 +420,19 @@ fn scan<T>(
     kind: SourceKind,
     run: impl FnOnce(&mut dyn Iterator<Item = io::Result<RawRecord>>) -> Result<T, ImportError>,
 ) -> Result<(T, Scan), ImportError> {
-    file.seek(SeekFrom::Start(from)).map_err(ImportError::Io)?;
+    // A Claude Code result names only the call it answers, which may sit
+    // before `from`: its parser reads from the start and skips to `from`.
+    let read_from = if kind == SourceKind::Claude { 0 } else { from };
+    file.seek(SeekFrom::Start(read_from)).map_err(ImportError::Io)?;
     let reader = BufReader::new(file);
     let absolute = |raw: io::Result<RawRecord>| {
         raw.map(|mut raw| {
-            raw.start += from;
-            raw.end += from;
+            raw.start += read_from;
+            raw.end += read_from;
             raw
         })
     };
+    let (mut unreadable, mut unsupported) = (0, None);
     let (out, stable_len, dangling_meta, incomplete_tail) = match kind {
         SourceKind::Zsh => {
             let mut parser = source::zsh::Parser::new(reader);
@@ -423,9 +445,15 @@ fn scan<T>(
             let out = run(&mut parser.by_ref().map(absolute))?;
             (out, parser.stable_len(), 0, parser.incomplete_tail().is_some())
         }
+        SourceKind::Claude => {
+            let mut parser = source::claude::Parser::resume(reader, from);
+            let out = run(&mut parser.by_ref().map(absolute))?;
+            (unreadable, unsupported) = (parser.unreadable(), parser.unsupported().map(str::to_string));
+            (out, parser.stable_len(), 0, parser.incomplete_tail())
+        }
         SourceKind::Git => return Err(ImportError::GitAsHistory),
     };
-    Ok((out, Scan { stable_len: from + stable_len, dangling_meta, incomplete_tail }))
+    Ok((out, Scan { stable_len: read_from + stable_len, dangling_meta, incomplete_tail, unreadable, unsupported }))
 }
 
 /// Keyed hash of the bytes just before `stable_len`.

@@ -317,6 +317,9 @@ pub fn source_label(kind: ObservationKind) -> &'static str {
         ObservationKind::HookFrame => "hook",
         ObservationKind::AgentMessage => "agent",
         ObservationKind::GitReflog | ObservationKind::GitRef => "git",
+        ObservationKind::AgentCommand => "claude",
+        ObservationKind::AgentOutput => "claude-out",
+        ObservationKind::AgentTool => "claude-tool",
     }
 }
 

@@ -10,6 +10,13 @@ pub enum ObservationKind {
     GitReflog = 5,
     /// Where a Git ref pointed when Relic imported the repository.
     GitRef = 6,
+    /// A shell command an agent ran: Claude Code's Bash tool.
+    AgentCommand = 7,
+    /// What such a command printed, as the agent saw it, and whether it
+    /// failed.
+    AgentOutput = 8,
+    /// Another tool call an agent made: its name and what it named.
+    AgentTool = 9,
 }
 
 impl ObservationKind {
@@ -25,6 +32,9 @@ impl ObservationKind {
             4 => Some(Self::AgentMessage),
             5 => Some(Self::GitReflog),
             6 => Some(Self::GitRef),
+            7 => Some(Self::AgentCommand),
+            8 => Some(Self::AgentOutput),
+            9 => Some(Self::AgentTool),
             _ => None,
         }
     }

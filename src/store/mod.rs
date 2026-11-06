@@ -413,7 +413,7 @@ impl Store {
             })
             .optional()?
             .map(|kind| {
-                [SourceKind::Zsh, SourceKind::Bash, SourceKind::Git]
+                [SourceKind::Zsh, SourceKind::Bash, SourceKind::Git, SourceKind::Claude]
                     .into_iter()
                     .find(|k| kind_int(*k) == kind)
                     // Guessing a shell here could delete the source's records
@@ -791,6 +791,7 @@ fn kind_int(kind: SourceKind) -> i64 {
         SourceKind::Zsh => 1,
         SourceKind::Bash => 2,
         SourceKind::Git => 3,
+        SourceKind::Claude => 4,
     }
 }
 
@@ -799,6 +800,7 @@ fn parser_contract(kind: SourceKind) -> &'static str {
         SourceKind::Zsh => crate::source::zsh::PARSER_CONTRACT,
         SourceKind::Bash => crate::source::bash::PARSER_CONTRACT,
         SourceKind::Git => crate::source::git::PARSER_CONTRACT,
+        SourceKind::Claude => crate::source::claude::PARSER_CONTRACT,
     }
 }
 
