@@ -138,21 +138,28 @@ pub fn render(name: &str, description: &str, confirmed_at_ms: i64, steps: &[Step
         for r in &step.records {
             let when = r.observed_at_ms.map_or(When::Unknown, When::At).label();
             let when = when.trim();
+            // A hook record's last line is what the hook saw, not part of
+            // the command: it goes beside the command, out of the fence.
+            let (text, facts) = match r.source {
+                "hook" => r.text.rsplit_once('\n').map_or((r.text, String::new()), |(c, f)| (c, format!("; {f}"))),
+                _ => (r.text, String::new()),
+            };
+            let label = format!("Recorded command #{} ({}, {when}{facts})", r.id, r.source);
             // CommonMark ends a line at a bare \r too, which would let the
             // rest of the text out of the fence.
             if hazard(r.text).is_some() || r.text.contains('\r') {
                 md.push_str(&format!(
-                    "\n{pad}Recorded command #{} ({}, {when}) is not copied here, because an agent would not see it exactly as recorded. \
+                    "\n{pad}{label} is not copied here, because an agent would not see it exactly as recorded. \
                      Read it exactly with `relic show {}`.\n",
-                    r.id, r.source, r.id
+                    r.id
                 ));
                 continue;
             }
             // Longer than any backtick run inside, so the text cannot close it.
-            let longest = r.text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+            let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
             let fence = "`".repeat(longest.max(2) + 1);
-            md.push_str(&format!("\n{pad}Recorded command #{} ({}, {when}):\n\n{pad}{fence}text\n", r.id, r.source));
-            for line in r.text.split('\n') {
+            md.push_str(&format!("\n{pad}{label}:\n\n{pad}{fence}text\n"));
+            for line in text.split('\n') {
                 md.push_str(&format!("{pad}{line}\n"));
             }
             md.push_str(&format!("{pad}{fence}\n"));
@@ -211,6 +218,9 @@ mod tests {
         let records = |text| vec![Record { id: 42, source: "zsh", observed_at_ms: Some(1_700_000_000_000), text }];
         let md = render("x", "Use it.", 0, &[Step { text: "List the reflog.", records: records("git reflog ` x ```` HEAD") }]).unwrap();
         assert!(md.contains("\n   `````text\n   git reflog ` x ```` HEAD\n   `````\n"), "{md}");
+        let hook = vec![Record { id: 7, source: "hook", observed_at_ms: None, text: "make\n  deploy\nexit 2 · cwd after: /srv" }];
+        let md = render("x", "Use it.", 0, &[Step { text: "Deploy.", records: hook }]).unwrap();
+        assert!(md.contains("#7 (hook, unknown time; exit 2 · cwd after: /srv):\n\n   ```text\n   make\n     deploy\n   ```\n"), "{md}");
         let md = render("x", "Use it.", 0, &[Step { text: "Print it.", records: records("printf 'a\r# Heading'") }]).unwrap();
         assert!(md.contains("`relic show 42`") && !md.contains("# Heading"), "{md}");
         let md = render("x", "Use it.", 0, &[Step { text: "Print column one.", records: records("awk '{print $1}' f") }]).unwrap();
