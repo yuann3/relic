@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-#[allow(dead_code)]
+#[expect(dead_code, reason = "the relic ui helpers are unused here")]
 mod pty_support;
 
 use std::ffi::OsStr;
@@ -103,8 +103,12 @@ fn zsh_records_status_start_duration_and_starting_directory() {
     }
     let sh = Shell::new();
     std::fs::write(sh.path("hook.zsh"), hook("zsh")).unwrap();
-    // The user's own precmd runs after relic's and still sees the status.
-    let rc = format!("PS1='{PROMPT}' PS2='{PROMPT}'\nprecmd() {{ print -r -- \"mine:$?\" }}\nsource {}\n", sh.path("hook.zsh").display());
+    // The user's own precmd runs after relic's and still sees the status,
+    // and their TRAPZERR runs once per failing command.
+    let rc = format!(
+        "PS1='{PROMPT}' PS2='{PROMPT}'\nprecmd() {{ print -r -- \"mine:$?\" }}\nTRAPZERR() {{ print -r -- zerr }}\nsource {}\n",
+        sh.path("hook.zsh").display()
+    );
     std::fs::write(sh.path(".zshrc"), rc).unwrap();
     let w = sh.work.display().to_string();
     let before = now();
@@ -112,10 +116,25 @@ fn zsh_records_status_start_duration_and_starting_directory() {
         "/bin/zsh",
         &["-i".as_ref()],
         &[("ZDOTDIR", sh.path("").as_os_str())],
-        &[&format!("cd {w}"), "false", "", " echo hidden", "sleep 1.3; (exit 3)", "cd /", "print -r -- \"two", "lines\""],
+        &[
+            // Made again owner-only, not under the user's umask.
+            "rm $_relic_hook_file",
+            &format!("cd {w}"),
+            "false",
+            "",
+            " echo hidden",
+            "sleep 1.3; (exit 3)",
+            "cd /",
+            "print -r -- \"two",
+            "lines\"",
+            // zsh lets a NUL into a command line, which would end a field.
+            "print -z $'print -r -- a\\0b'",
+            "",
+        ],
     );
     let after = now();
     assert!(shown.contains("mine:1") && shown.contains("mine:3") && !shown.contains("rh1"), "{shown}");
+    assert_eq!(shown.matches("zerr").count(), 2, "{shown}");
     sh.assert_private();
     // Left out before it reaches the disk, not at import.
     let file = std::fs::read_dir(sh.hooks()).unwrap().next().unwrap().unwrap().path();
@@ -123,20 +142,32 @@ fn zsh_records_status_start_duration_and_starting_directory() {
     let records = sh.import();
     let shown: Vec<(&str, &str)> = records.iter().map(|(t, _)| t.rsplit_once('\n').unwrap()).collect();
     let commands: Vec<&str> = shown.iter().map(|(c, _)| *c).collect();
-    assert_eq!(commands, [&format!("cd {w}"), "false", "sleep 1.3; (exit 3)", "cd /", "print -r -- \"two\nlines\""]);
+    assert_eq!(
+        commands,
+        [
+            "rm $_relic_hook_file",
+            &format!("cd {w}"),
+            "false",
+            "sleep 1.3; (exit 3)",
+            "cd /",
+            "print -r -- \"two\nlines\"",
+            "print -z $'print -r -- a\\0b'",
+            "print -r -- ab",
+        ]
+    );
     let facts: Vec<&str> = shown.iter().map(|(_, f)| *f).collect();
     // A cd is recorded where it started, not where it left.
     let started = std::env::current_dir().unwrap().canonicalize().unwrap();
-    assert!(facts[0].starts_with("exit 0 · took 0.") && facts[0].ends_with(&format!(" · cwd: {}", started.display())), "{facts:?}");
-    assert!(facts[1].starts_with("exit 1 · took 0.") && facts[1].ends_with(&format!(" · cwd: {w}")), "{facts:?}");
-    let took: f64 = facts[2].strip_prefix("exit 3 · took ").unwrap().split(' ').next().unwrap().parse().unwrap();
+    assert!(facts[1].starts_with("exit 0 · took 0.") && facts[1].ends_with(&format!(" · cwd: {}", started.display())), "{facts:?}");
+    assert!(facts[2].starts_with("exit 1 · took 0.") && facts[2].ends_with(&format!(" · cwd: {w}")), "{facts:?}");
+    let took: f64 = facts[3].strip_prefix("exit 3 · took ").unwrap().split(' ').next().unwrap().parse().unwrap();
     // No upper bound: the wall clock can step forward meanwhile.
     assert!(took >= 1.3, "{facts:?}");
-    assert!(facts[3].ends_with(&format!(" · cwd: {w}")) && facts[4].ends_with(" · cwd: /"), "{facts:?}");
+    assert!(facts[4].ends_with(&format!(" · cwd: {w}")) && facts[5].ends_with(" · cwd: /"), "{facts:?}");
     let at: Vec<i64> = records.iter().map(|(_, t)| t.unwrap()).collect();
     // To the second: the start, so the sleep's record is a second before the next one's.
-    assert!(at.windows(2).all(|w| w[0] <= w[1]) && at[0] >= before / 1000 * 1000 && at[4] <= after, "{at:?}");
-    assert!(at[3] - at[2] >= 1000, "{at:?}");
+    assert!(at.windows(2).all(|w| w[0] <= w[1]) && at[0] >= before / 1000 * 1000 && at[7] <= after, "{at:?}");
+    assert!(at[4] - at[3] >= 1000, "{at:?}");
 }
 
 #[test]
@@ -149,9 +180,9 @@ fn bash_records_status_and_the_directory_a_command_left_once_each() {
     std::fs::write(sh.path("history"), "old one\nold two\n").unwrap();
     std::fs::write(sh.path("hook.bash"), hook("bash")).unwrap();
     // The user's own PROMPT_COMMAND still runs, after relic's, and still
-    // sees the status.
+    // sees the status, and their ERR trap runs once per failing command.
     let rc = format!(
-        "PS1='{PROMPT}' PS2='{PROMPT}'\nHISTFILE={}\nPROMPT_COMMAND='echo mine:$?'\neval \"$(cat {})\"\n",
+        "PS1='{PROMPT}' PS2='{PROMPT}'\nHISTFILE={}\nPROMPT_COMMAND='echo mine:$?'\ntrap 'echo trapped' ERR\neval \"$(cat {})\"\n",
         sh.path("history").display(),
         sh.path("hook.bash").display()
     );
@@ -162,15 +193,27 @@ fn bash_records_status_and_the_directory_a_command_left_once_each() {
         "/bin/bash",
         &["--noprofile".as_ref(), "--rcfile".as_ref(), sh.path("rc").as_os_str(), "-i".as_ref()],
         &[],
-        &[&format!("cd {w}"), "false", "", " echo hidden", "sh -c 'exit 3'", "for i in 1 2", "do :; done"],
+        &[
+            "rm $_relic_hook_file",
+            &format!("cd {w}"),
+            "false",
+            "",
+            " echo hidden",
+            "sh -c 'exit 3'",
+            "for i in 1 2",
+            "do :; done",
+        ],
     );
     let after = now();
     assert!(shown.contains("mine:1") && shown.contains("mine:3") && !shown.contains("rh1"), "{shown}");
+    assert_eq!(shown.matches("trapped").count(), 2, "{shown}");
     sh.assert_private();
     let records = sh.import();
     let texts: Vec<&str> = records.iter().map(|(t, _)| t.as_str()).collect();
     // Neither the history file's last line, read at the first prompt, nor
-    // the empty line, nor the line starting with a space.
+    // the empty line, nor the line starting with a space. Nor the rm, whose
+    // frame is the first in the file it made again: with no frame before
+    // it, it cannot be told from a prompt without a command.
     assert_eq!(
         texts,
         [

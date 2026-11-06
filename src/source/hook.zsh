@@ -2,7 +2,7 @@
 # Records what each command line was, when it started and ended, where it
 # started and its exit status, one frame per command into a file of this
 # shell's own. Never its output, input or environment. Builtins only: no
-# process is started at a prompt. A command line starting with a space is
+# process is started at a prompt, unless the file was deleted. A command line starting with a space is
 # not recorded, as HIST_IGNORE_SPACE would not.
 if [[ -o interactive && -z ${_relic_hook_file-} ]]; then
   zmodload zsh/datetime 2>/dev/null
@@ -12,7 +12,8 @@ if [[ -o interactive && -z ${_relic_hook_file-} ]]; then
   _relic_hook_preexec() {
     emulate -L zsh
     [[ $1 == ' '* ]] && return 0
-    typeset -g _relic_hook_cmd=$1 _relic_hook_start=$EPOCHREALTIME _relic_hook_cwd=$PWD
+    # A NUL would end a field early: zsh lets one into a line.
+    typeset -g _relic_hook_cmd=${1//$'\0'/} _relic_hook_start=$EPOCHREALTIME _relic_hook_cwd=$PWD
   }
   _relic_hook_precmd() {
     # First: anything else run here replaces $?.
@@ -20,11 +21,15 @@ if [[ -o interactive && -z ${_relic_hook_file-} ]]; then
     emulate -L zsh
     # Unset when the prompt was redrawn without a command running.
     if [[ -n ${_relic_hook_start-} ]]; then
+      # `>>` alone would make a deleted file again under the user's umask.
+      [[ -e $_relic_hook_file || ! -d ${_relic_hook_file:h} ]] || ( umask 077; : >> "$_relic_hook_file" ) 2>/dev/null
       { printf 'rh1\0zsh\0%s\0%s\0%s\0%s\0%s\0\n' "$_relic_hook_start" "$EPOCHREALTIME" "$s" \
           "$_relic_hook_cwd" "$_relic_hook_cmd" >> "$_relic_hook_file"; } 2>/dev/null
       unset _relic_hook_cmd _relic_hook_start _relic_hook_cwd
     fi
-    return $s
+    # Not $s: zsh keeps the command's status for the prompt and the hooks
+    # after this one, and a failing return would run TRAPZERR again.
+    return 0
   }
   autoload -Uz add-zsh-hook
   add-zsh-hook preexec _relic_hook_preexec
