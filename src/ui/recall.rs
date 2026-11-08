@@ -97,7 +97,7 @@ mod tests {
         crate::import::import_file(
             &mut store,
             &path,
-            crate::import::SourceKind::Zsh,
+            crate::domain::SourceKind::Zsh,
             &crate::redact::Redactor::new(),
         )
         .unwrap();

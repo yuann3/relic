@@ -431,8 +431,8 @@ pub fn resolve_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::SourceKind;
     use crate::domain::{Observation, ObservationKind, Provenance};
-    use crate::import::SourceKind;
     use crate::rlm::evidence::HandleRegistry;
     use crate::rlm::model::{FakeModel, ModelBoundary};
 

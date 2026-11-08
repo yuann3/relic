@@ -1,3 +1,29 @@
+/// What a source is: a shell history, by its format, a Claude Code session,
+/// or a Git repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Zsh,
+    Bash,
+    /// A repository, imported through `git` rather than read as a file.
+    Git,
+    /// One Claude Code session's transcript.
+    Claude,
+    /// One shell session's frames from `relic hook`.
+    Hook,
+}
+
+impl std::fmt::Display for SourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Zsh => "zsh",
+            Self::Bash => "bash",
+            Self::Git => "git",
+            Self::Claude => "claude",
+            Self::Hook => "hook",
+        })
+    }
+}
+
 /// Kind of observation source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]

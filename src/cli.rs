@@ -4,7 +4,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::import::SourceKind;
+use crate::domain::SourceKind;
 
 // `concat!` takes only literals, so the `ui` line is spliced in by a macro:
 // a headless build must not advertise a command it cannot run.

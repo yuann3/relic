@@ -5,37 +5,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::domain::{FLAG_LOSSY, Observation, ObservationKind, Provenance};
+use crate::domain::{FLAG_LOSSY, Observation, ObservationKind, Provenance, SourceKind};
 use crate::key::{self, InstallationKey};
 use crate::redact::{REDACTION_REVISION, Redactor};
 use crate::source::{self, RawRecord};
 use crate::store::{Cursor, RevisionTx, StatHint, Store, StoreError};
-
-/// What a source is: a shell history, by its format, a Claude Code session,
-/// or a Git repository.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceKind {
-    Zsh,
-    Bash,
-    /// A repository, imported through `git` rather than read as a file.
-    Git,
-    /// One Claude Code session's transcript.
-    Claude,
-    /// One shell session's frames from `relic hook`.
-    Hook,
-}
-
-impl std::fmt::Display for SourceKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Zsh => "zsh",
-            Self::Bash => "bash",
-            Self::Git => "git",
-            Self::Claude => "claude",
-            Self::Hook => "hook",
-        })
-    }
-}
 
 /// How an import related the file to what the store already held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

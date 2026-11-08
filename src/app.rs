@@ -845,7 +845,8 @@ fn report(question: String, r: InvestigationResult, models: Vec<String>) -> Reca
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::import::{SourceKind, import_file};
+    use crate::domain::SourceKind;
+    use crate::import::import_file;
     use crate::redact::Redactor;
     use std::io::Write;
 

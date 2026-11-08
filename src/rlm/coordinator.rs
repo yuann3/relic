@@ -682,8 +682,8 @@ fn build_root_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::SourceKind;
     use crate::domain::{Observation, ObservationKind, Provenance};
-    use crate::import::SourceKind;
     use crate::rlm::model::FakeModel;
     use crate::store::Cursor;
 

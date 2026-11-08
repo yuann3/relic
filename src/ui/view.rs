@@ -693,7 +693,8 @@ mod tests {
 
     use super::*;
     use crate::app::{self, MatchMode, SearchRequest};
-    use crate::import::{SourceKind, import_file};
+    use crate::domain::SourceKind;
+    use crate::import::import_file;
     use crate::redact::Redactor;
     use crate::store::Store;
     use crate::ui::model::{Key, RecallEvent, UiAction, UiEffect, update};

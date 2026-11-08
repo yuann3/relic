@@ -6,7 +6,8 @@ use std::sync::atomic::AtomicBool;
 
 use relic::app::{self, Budget, MatchMode, Order, SearchRequest};
 use relic::cli::{self, Command, Output, SearchArgs};
-use relic::import::{History, ImportError, ImportResult, Outcome, SourceKind};
+use relic::domain::SourceKind;
+use relic::import::{History, ImportError, ImportResult, Outcome};
 use relic::picker::{Pick, PickError, PickMode};
 use relic::store::Store;
 use serde::Serialize;

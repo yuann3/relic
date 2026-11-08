@@ -4,8 +4,9 @@
 
 use std::time::Instant;
 
+use relic::domain::SourceKind;
 use relic::fixture;
-use relic::import::{self, SourceKind};
+use relic::import;
 use relic::redact::Redactor;
 use relic::store::Store;
 

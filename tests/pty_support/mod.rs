@@ -66,7 +66,7 @@ impl Fixture {
         let r = relic::import::import_file(
             &mut store,
             &hist,
-            relic::import::SourceKind::Zsh,
+            relic::domain::SourceKind::Zsh,
             &relic::redact::Redactor::new(),
         )
         .unwrap();

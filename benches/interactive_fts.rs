@@ -1510,7 +1510,8 @@ fn rewrites(conn: &Connection, vocab: &[(String, i64)], keys: &[Keystroke], runs
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relic::import::{SourceKind, import_file};
+    use relic::domain::SourceKind;
+    use relic::import::import_file;
     use relic::redact::Redactor;
     use std::io::Write;
 

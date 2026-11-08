@@ -616,7 +616,7 @@ mod tests {
         .unwrap();
         let mut s = Store::open(&db).unwrap();
         let redactor = crate::redact::Redactor::new();
-        crate::import::import_file(&mut s, &hist, crate::import::SourceKind::Zsh, &redactor)
+        crate::import::import_file(&mut s, &hist, crate::domain::SourceKind::Zsh, &redactor)
             .unwrap();
         let s = Store::open_read_only(&db).unwrap();
         let mb = Arc::new(Mailbox::default());

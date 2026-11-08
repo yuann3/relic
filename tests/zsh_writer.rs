@@ -4,7 +4,8 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use relic::import::{SourceKind, import_file};
+use relic::domain::SourceKind;
+use relic::import::import_file;
 use relic::redact::Redactor;
 use relic::store::Store;
 

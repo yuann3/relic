@@ -2,8 +2,8 @@ mod schema;
 
 pub use schema::SCHEMA_VERSION;
 
+use crate::domain::SourceKind;
 use crate::domain::{Observation, ObservationKind, Provenance, SearchHit, StoredObservation};
-use crate::import::SourceKind;
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
