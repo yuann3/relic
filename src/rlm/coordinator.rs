@@ -113,12 +113,11 @@ pub struct SkillSeed<'a> {
     pub records: &'a [i64],
 }
 
-/// Most bytes of each skill record in the first state, as the inspect the
-/// prompt examples use.
-const SEED_ITEM_BYTES: u32 = 2048;
-/// Most skill records in the first state: 40 KiB of them leaves room under
-/// the 64 KiB root cap. The handle holds the rest for the root to inspect.
-const SEED_ITEMS: usize = 20;
+/// Most skill records every root state shows, and most bytes of each: they
+/// ride along with every inspection, so 8 KiB of them leaves the rest of the
+/// 64 KiB root cap to it. The handle holds the rest for the root to inspect.
+const SEED_ITEMS: usize = 8;
+const SEED_ITEM_BYTES: u32 = 1024;
 
 /// What one investigation's steps share.
 struct Run<'a> {
@@ -205,9 +204,10 @@ pub fn run_investigation(
     InvestigationResult { status, finish, cited, cost_microusd, turns: run.turns, child_calls: run.child_calls }
 }
 
-/// Put `skill`'s records in a handle and before the root, as an inspect of
-/// them would: the root can finish from them, or plan from them as from
-/// any handle. A record the user forgot since is said to be gone, so the
+/// Put `skill`'s records in a handle and in every root state, as an inspect
+/// of them would show them. Every state, because the root sees only the
+/// state in front of it: the next inspection must not take them out of
+/// what it can cite. A record the user forgot since is said to be gone, so the
 /// root does not look for it or rebuild it from the skill's prose.
 fn seed(run: &mut Run, skill: &SkillSeed) -> Result<(), InvestigationStatus> {
     let mut observations = Vec::new();
@@ -229,8 +229,9 @@ fn seed(run: &mut Run, skill: &SkillSeed) -> Result<(), InvestigationStatus> {
     let handle = run.registry.insert_evidence_set(observations);
     let packet = packet(&run.registry, &handle, SEED_ITEMS, SEED_ITEM_BYTES, format!("skill_{}", skill.name))
         .map_err(|e| InvestigationStatus::Failed(format!("skill {}: {e}", skill.name)))?;
-    run.last_inspection = Some(packet);
-    run.skill = Some(serde_json::json!({"name": skill.name, "description": skill.description, "handle": handle}));
+    run.skill = Some(serde_json::json!({
+        "name": skill.name, "description": skill.description, "handle": handle, "items": packet.items,
+    }));
     Ok(())
 }
 
@@ -583,12 +584,12 @@ mod tests {
         rev_id
     }
 
-    /// R2: a picked skill's records are the first state's inspection, in
-    /// step order, and stay a handle the root can plan from; a record the
-    /// user forgot since is said to be gone; and without a skill the first
-    /// state shows no evidence at all.
+    /// R2: a picked skill's records are in every root state, in step order,
+    /// citable after an inspection of something else, and a handle the root
+    /// can plan from; a record the user forgot since is said to be gone; and
+    /// without a skill the first state shows no evidence at all.
     #[test]
-    fn a_picked_skill_is_the_first_inspection_and_stays_in_every_state() {
+    fn a_picked_skill_is_in_every_state_and_citable_after_another_inspection() {
         let mut store = Store::open_memory().unwrap();
         seed_corpus(&mut store);
         let text = |id| store.get_observation(id).unwrap().unwrap().safe_text;
@@ -601,10 +602,10 @@ mod tests {
             .to_string()
         });
         model.add_root_fn(|state| {
-            let cite = state["last_inspection"]["items"][0]["evidence_id"].clone();
+            let cite = state["skill"]["items"][1]["evidence_id"].clone();
             serde_json::json!({"version": 1, "expected_state_version": 1, "kind": "finish", "plan": null, "finish": {
-                "status": "answered", "answer": "Check, then renew.", "claims": [{"text": "status ran", "supports": [cite]}],
-                "procedure": []}})
+                "status": "answered", "answer": "Renew.", "claims": [{"text": "renewed", "supports": [cite]}],
+                "procedure": [{"text": "Renew", "supports": [cite]}]}})
             .to_string()
         });
         let seed = SkillSeed { name: "certbot-renewal", description: "Renew a TLS certificate", records: &[27, 9999, 26] };
@@ -615,9 +616,9 @@ mod tests {
             }
         });
         assert_eq!(result.status, InvestigationStatus::Completed);
+        assert_eq!(result.cited.values().map(|o| o.id).collect::<Vec<_>>(), [26]);
         let states: Vec<serde_json::Value> = model.root_states().iter().map(|s| serde_json::from_str(s).unwrap()).collect();
-        let first: Vec<&str> = states[0]["last_inspection"]["items"].as_array().unwrap().iter().map(|i| i["safe_text"].as_str().unwrap()).collect();
-        assert_eq!(first, ["certbot status", "certbot renew --nginx -d example.com"]);
+        assert!(states[0].get("last_inspection").is_none(), "{}", states[0]);
         let gone = "record #9999, which skill certbot-renewal cites, is gone: the user forgot it. Do not reconstruct it.";
         assert_eq!((states[0]["notes"].clone(), notes), (serde_json::json!([gone]), vec![gone.to_string()]));
         // The inspect read the skill's handle: its first record, cut to 8 bytes.
@@ -625,6 +626,8 @@ mod tests {
         for state in &states {
             assert_eq!(state["skill"]["name"], "certbot-renewal");
             assert_eq!(state["skill"]["description"], "Renew a TLS certificate");
+            let items: Vec<&str> = state["skill"]["items"].as_array().unwrap().iter().map(|i| i["safe_text"].as_str().unwrap()).collect();
+            assert_eq!(items, ["certbot status", "certbot renew --nginx -d example.com"]);
         }
 
         let first_state = |skill: Option<&SkillSeed>| -> serde_json::Value {
@@ -636,10 +639,10 @@ mod tests {
         };
         let state = first_state(None);
         assert!(state.get("skill").is_none() && state.get("last_inspection").is_none(), "{state}");
-        // A long procedure: all of it in the handle, its first 20 shown.
+        // A long procedure: all of it in the handle, its first 8 shown.
         let all: Vec<i64> = (1..=50).collect();
         let state = first_state(Some(&SkillSeed { name: "long", description: "d", records: &all }));
-        assert_eq!((state["handles"][0]["count"].as_u64(), state["last_inspection"]["items"].as_array().unwrap().len()), (Some(50), 20));
+        assert_eq!((state["handles"][0]["count"].as_u64(), state["skill"]["items"].as_array().unwrap().len()), (Some(50), 8));
     }
 
     #[test]
