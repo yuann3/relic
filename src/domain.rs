@@ -62,7 +62,7 @@ impl Provenance {
     }
 
     pub fn as_i64(self) -> i64 {
-        self.0 as i64
+        i64::from(self.0)
     }
 
     pub fn from_i64(v: i64) -> Self {

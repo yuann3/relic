@@ -491,7 +491,7 @@ fn execute_op(
             // Reserve rows.
             ledger
                 .reserve(&Reservation {
-                    rows_returned: s.limit as u64,
+                    rows_returned: u64::from(s.limit),
                     evidence_handles: 1,
                     ..Default::default()
                 })
@@ -505,8 +505,8 @@ fn execute_op(
                 .map_err(CoordinatorError::Execution)?;
 
             // Release unused row reservation.
-            let actual = registry.get(&hid).map(|h| h.count as u64).unwrap_or(0);
-            let reserved = s.limit as u64;
+            let actual = registry.get(&hid).map(|h| u64::from(h.count)).unwrap_or(0);
+            let reserved = u64::from(s.limit);
             if actual < reserved {
                 ledger.release_rows(reserved - actual);
             }
@@ -517,7 +517,7 @@ fn execute_op(
         Op::Expand(e) => {
             ledger
                 .reserve(&Reservation {
-                    rows_returned: e.limit as u64,
+                    rows_returned: u64::from(e.limit),
                     evidence_handles: 1,
                     ..Default::default()
                 })
@@ -526,8 +526,8 @@ fn execute_op(
             let hid = executor::execute_expand(store, e, registry, plan_outputs, cancel)
                 .map_err(CoordinatorError::Execution)?;
 
-            let actual = registry.get(&hid).map(|h| h.count as u64).unwrap_or(0);
-            let reserved = e.limit as u64;
+            let actual = registry.get(&hid).map(|h| u64::from(h.count)).unwrap_or(0);
+            let reserved = u64::from(e.limit);
             if actual < reserved {
                 ledger.release_rows(reserved - actual);
             }

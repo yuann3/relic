@@ -726,7 +726,7 @@ fn store_records(
         }
         revision.insert(&observation)?;
         stored.count += 1;
-        stored.lossy += (observation.flags & FLAG_LOSSY != 0) as usize;
+        stored.lossy += usize::from(observation.flags & FLAG_LOSSY != 0);
     }
     Ok(stored)
 }

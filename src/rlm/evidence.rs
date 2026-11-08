@@ -90,7 +90,7 @@ pub fn verify_handle(
 fn content_hash(data: &[u8]) -> Vec<u8> {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in data {
-        hash ^= b as u64;
+        hash ^= u64::from(b);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash.to_le_bytes().to_vec()

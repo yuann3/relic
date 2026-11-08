@@ -218,7 +218,12 @@ unsafe fn supervise(
             say(-1);
             libc::_exit(1);
         }
-        if libc::ioctl(slave, libc::TIOCSCTTY as _, 0) < 0 {
+        // macOS widens a c_uint request to c_ulong, Linux passes it as is,
+        // where `.into()` would be a useless conversion: hence `allow`, not
+        // `expect`, which would go unfulfilled on Linux.
+        #[allow(clippy::cast_lossless)]
+        let ctty = libc::TIOCSCTTY as _;
+        if libc::ioctl(slave, ctty, 0) < 0 {
             say(-2);
             libc::_exit(1);
         }

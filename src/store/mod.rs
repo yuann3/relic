@@ -823,8 +823,8 @@ impl Store {
         before: u32,
         after: u32,
     ) -> Result<Vec<StoredObservation>, rusqlite::Error> {
-        let lo = center_ordinal - before as i64;
-        let hi = center_ordinal + after as i64;
+        let lo = center_ordinal - i64::from(before);
+        let hi = center_ordinal + i64::from(after);
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, revision_id, ordinal, kind, observed_at_ms, safe_text,
                     flags, locator
@@ -992,7 +992,7 @@ mod tests {
     #[test]
     fn open_sets_schema_version() {
         let store = Store::open_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION as i64);
+        assert_eq!(store.schema_version().unwrap(), i64::from(SCHEMA_VERSION));
     }
 
     #[test]
@@ -1006,7 +1006,7 @@ mod tests {
         }
 
         let store = Store::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION as i64);
+        assert_eq!(store.schema_version().unwrap(), i64::from(SCHEMA_VERSION));
     }
 
     #[test]
