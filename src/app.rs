@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::domain::{ObservationKind, Provenance, StoredObservation};
 use crate::redact::Redactor;
-use crate::rlm::coordinator::{InvestigationResult, InvestigationStatus, Progress, run_investigation};
+use crate::rlm::coordinator::{InvestigationResult, InvestigationStatus, Progress, SkillSeed, run_investigation};
 use crate::rlm::model::ModelBoundary;
 use crate::rlm::model::egress::Role;
 use crate::rlm::protocol::{AnswerStatus, BudgetV1, FinishV1};
@@ -649,9 +649,8 @@ pub fn recall(
     let target = model.target();
     log.line("start", serde_json::json!({"relic_version": env!("CARGO_PKG_VERSION"), "profile": target.profile, "origin": target.origin}));
     // Before any request leaves, so the log shows the pick preceding them.
-    let skill = crate::catalog::select(&question, skills)
-        .map(|s| SkillUsed { name: s.name.clone(), bundle: s.bundle.clone() });
-    if let Some(s) = &skill {
+    let picked = crate::catalog::select(&question, skills);
+    if let Some(s) = picked {
         log.line("skill", serde_json::json!({"name": s.name, "bundle": s.bundle}));
     }
     if let Some(e) = log.failed.take() {
@@ -672,9 +671,10 @@ pub fn recall(
         }
         progress(p)
     };
-    let r = run_investigation(&question, store, model, BudgetV1::prototype_default(), cancel, &mut progress);
+    let seed = picked.map(|s| SkillSeed { name: &s.name, description: &s.description, records: &s.cites });
+    let r = run_investigation(&question, seed.as_ref(), store, model, BudgetV1::prototype_default(), cancel, &mut progress);
     let mut report = report(question, r, models);
-    report.skill = skill;
+    report.skill = picked.map(|s| SkillUsed { name: s.name.clone(), bundle: s.bundle.clone() });
     if let Some(e) = log.finish(&report) {
         report.outcome = RecallOutcome::Failed;
         report.error = Some(log_error(e));

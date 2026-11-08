@@ -520,6 +520,10 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
                 {"op": "search", "op_id": "s1", "terms": ["git"], "match": "any", "limit": 20},
                 {"op": "inspect", "op_id": "i1", "input": {"output": "s1"}, "limit": 20, "max_item_bytes": 2048},
             ])),
+            // Once the user forgets the awk record, there is nothing to cite.
+            v if !inspected(state).iter().any(|i| i["safe_text"].as_str().unwrap().contains("awk")) => {
+                finish(v, json!({"status": "abstained", "answer": "", "claims": [], "procedure": [], "contradictions": [], "missing": ["the reflog step"]}))
+            }
             v => finish(v, json!({"status": "answered", "answer": "From the reflog.",
                 "claims": [{"text": "a branch on HEAD@{1} kept it", "supports": [cite(state, "branch rescue")]}], "procedure": [
                 {"text": "Find the lost commit in the reflog", "supports": [cite(state, "awk")]},
@@ -544,7 +548,8 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
     let recall = |question: &str| {
         let sent = bodies.lock().unwrap().len();
         let out = relic(&["recall", question, "--json"]);
-        ok(&out);
+        // Answered, or abstained once the user forgot what it would cite.
+        assert!(matches!(out.status.code(), Some(0 | 1)), "{}", String::from_utf8_lossy(&out.stderr));
         let report: Value = serde_json::from_slice(&out.stdout).unwrap();
         let log = std::fs::read_to_string(dir.path().join("relic.db.recall.log")).unwrap();
         let events: Vec<String> = log
@@ -601,9 +606,25 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
 
     let bundle = std::fs::read_link(&link).unwrap();
     let hash = bundle.parent().unwrap().file_name().unwrap().to_str().unwrap().to_string();
+    let sent = bodies.lock().unwrap().len();
     let (report, events) = recall("I dropped a stash by mistake, how do I recover it with git?");
     assert_eq!(report["skill"], json!({"name": "git-reflog-recovery", "bundle": hash}));
     assert_eq!(&events[..3], ["start", "skill", "send"], "the pick precedes every request");
+    // The first request already holds the skill's records, in step order.
+    let first = user_message(&bodies.lock().unwrap()[sent]);
+    assert_eq!(first["skill"]["name"], "git-reflog-recovery");
+    let seeded: Vec<&str> = first["last_inspection"]["items"].as_array().unwrap().iter().map(|i| i["safe_text"].as_str().unwrap()).collect();
+    assert_eq!(seeded[..2], recovery[1..3], "{first}");
+    assert!(seeded.len() == 3 && seeded[2].starts_with("git push https://bob:[REDACTED:"), "{first}");
+    // A record the user forgot is said to be gone, not sent.
+    ok(&relic(&["forget", &awk.to_string()]));
+    let sent = bodies.lock().unwrap().len();
+    let (report, _) = recall("I dropped a stash by mistake, how do I recover it with git?");
+    assert_eq!(report["outcome"], "abstained");
+    let first = user_message(&bodies.lock().unwrap()[sent]);
+    assert_eq!(first["last_inspection"]["items"].as_array().unwrap().len(), 2, "{first}");
+    let gone = format!("record #{awk}, which skill git-reflog-recovery cites, is gone");
+    assert!(first["notes"][0].as_str().unwrap().starts_with(&gone), "{first}");
     let (report, events) = recall("how did I renew the certbot certificate?");
     assert!(report.get("skill").is_none() && !events.contains(&"skill".into()), "{report}");
 

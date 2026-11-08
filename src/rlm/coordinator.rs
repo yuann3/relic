@@ -104,6 +104,19 @@ impl std::fmt::Display for CoordinatorError {
 
 impl std::error::Error for CoordinatorError {}
 
+/// The active skill the host step picked for the question (ADR 0016),
+/// which the investigation starts from instead of a search.
+pub struct SkillSeed<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    /// The records its procedure cites, in step order.
+    pub records: &'a [i64],
+}
+
+/// Most bytes of each skill record in the first state, as the inspect the
+/// prompt examples use.
+const SEED_ITEM_BYTES: u32 = 2048;
+
 /// What one investigation's steps share.
 struct Run<'a> {
     store: &'a Store,
@@ -115,6 +128,8 @@ struct Run<'a> {
     last_inspection: Option<EvidencePacket>,
     /// What the host tells the root about the last plan, besides its handles.
     notes: Vec<String>,
+    /// The picked skill, as every root state shows it.
+    skill: Option<serde_json::Value>,
     cancel: &'a Arc<AtomicBool>,
     progress: &'a mut dyn FnMut(Progress),
     /// When `wall_ms` runs out; every model call gives up by then.
@@ -141,11 +156,13 @@ impl Run<'_> {
     }
 }
 
-/// Run a bounded RLM investigation. Setting `cancel` from any thread stops
-/// it at the next admission point, or mid-statement in SQLite, with
+/// Run a bounded RLM investigation, from `skill`'s records when the host
+/// step picked one. Setting `cancel` from any thread stops it at the next
+/// admission point, or mid-statement in SQLite, with
 /// [`InvestigationStatus::Cancelled`].
 pub fn run_investigation(
     question: &str,
+    skill: Option<&SkillSeed>,
     store: &Store,
     model: Arc<dyn ModelBoundary>,
     budget: BudgetV1,
@@ -164,10 +181,15 @@ pub fn run_investigation(
         child_calls: 0,
         last_inspection: None,
         notes: Vec::new(),
+        skill: None,
         cancel,
         progress,
     };
-    let (status, finish) = investigate(&mut run, question);
+    let seeded = skill.map_or(Ok(()), |skill| seed(&mut run, skill));
+    let (status, finish) = match seeded {
+        Ok(()) => investigate(&mut run, question),
+        Err(status) => (status, None),
+    };
     let cited = finish
         .iter()
         .flat_map(|f| {
@@ -180,10 +202,70 @@ pub fn run_investigation(
     InvestigationResult { status, finish, cited, cost_microusd, turns: run.turns, child_calls: run.child_calls }
 }
 
+/// Put `skill`'s records in a handle and before the root, as an inspect of
+/// them would: the root can finish from them, or plan from them as from
+/// any handle. A record the user forgot since is said to be gone, so the
+/// root does not look for it or rebuild it from the skill's prose.
+fn seed(run: &mut Run, skill: &SkillSeed) -> Result<(), InvestigationStatus> {
+    let mut observations = Vec::new();
+    for &id in skill.records {
+        match run.store.get_observation(id) {
+            Ok(Some(o)) => observations.push(o),
+            Ok(None) => run.notes.push(format!(
+                "record #{id}, which skill {} cites, is gone: the user forgot it. Do not reconstruct it.",
+                skill.name
+            )),
+            Err(e) => return Err(InvestigationStatus::Failed(format!("skill {}: {e}", skill.name))),
+        }
+    }
+    for note in &run.notes {
+        (run.progress)(Progress::Note(note.clone()));
+    }
+    let rows = Reservation { rows_returned: observations.len() as u64, evidence_handles: 1, ..Default::default() };
+    run.ledger.reserve(&rows).map_err(|_| InvestigationStatus::BudgetExhausted)?;
+    let handle = run.registry.insert_evidence_set(observations);
+    let packet = packet(&run.registry, &handle, usize::MAX, SEED_ITEM_BYTES, format!("skill_{}", skill.name))
+        .map_err(|e| InvestigationStatus::Failed(format!("skill {}: {e}", skill.name)))?;
+    run.last_inspection = Some(packet);
+    run.skill = Some(serde_json::json!({"name": skill.name, "description": skill.description, "handle": handle}));
+    Ok(())
+}
+
+/// Up to `limit` items of an evidence set as the root is shown them, each
+/// cut to `max_item_bytes`.
+fn packet(
+    registry: &HandleRegistry,
+    handle: &str,
+    limit: usize,
+    max_item_bytes: u32,
+    packet_id: String,
+) -> Result<EvidencePacket, CoordinatorError> {
+    let missing = || CoordinatorError::Execution(ExecError::HandleNotFound(handle.to_string()));
+    let obs = registry.get_observations(handle).ok_or_else(missing)?;
+    let ev_handles = registry.get_evidence_handles(handle).ok_or_else(missing)?;
+    let items = obs
+        .iter()
+        .zip(ev_handles)
+        .take(limit)
+        .enumerate()
+        .map(|(idx, (o, ev))| {
+            let text = &o.safe_text;
+            let sent = text.floor_char_boundary(max_item_bytes as usize);
+            EvidenceItem {
+                item_id: format!("item_{idx}"),
+                evidence_id: ev.id.clone(),
+                safe_text: text[..sent].to_string(),
+                truncation: (sent < text.len()).then_some(TruncationV1 { original_bytes: text.len(), sent_bytes: sent }),
+            }
+        })
+        .collect();
+    Ok(EvidencePacket { packet_id, items })
+}
+
 fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<FinishV1>) {
     let mut state_version: u32 = 0;
     loop {
-        let state = build_root_state(
+        let mut state = build_root_state(
             question,
             state_version,
             &run.registry,
@@ -192,6 +274,9 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
             &run.ledger,
             run.store,
         );
+        if let Some(skill) = &run.skill {
+            state["skill"] = skill.clone();
+        }
         let job = Job { role: Role::Root, payload: state, admitted: Progress::RootCall { turn: run.turns + 1 } };
         let reply = match call_all(&mut run.calls(), vec![job]).map(|mut r| r.remove(0)) {
             Ok(Ok(reply)) => reply,
@@ -378,39 +463,8 @@ fn execute_op(
         Op::Inspect(i) => {
             let source_hid = executor::resolve_input(&i.input, plan_outputs)
                 .map_err(CoordinatorError::Execution)?;
-
-            let obs = registry
-                .get_observations(&source_hid)
-                .ok_or_else(|| {
-                    CoordinatorError::Execution(ExecError::HandleNotFound(source_hid.clone()))
-                })?;
-            let ev_handles = registry
-                .get_evidence_handles(&source_hid)
-                .ok_or_else(|| {
-                    CoordinatorError::Execution(ExecError::HandleNotFound(source_hid.clone()))
-                })?;
-
-            let limit = i.limit as usize;
-            let count = obs.len().min(limit);
-
-            let items: Vec<EvidenceItem> = (0..count)
-                .map(|idx| {
-                    let text = &obs[idx].safe_text;
-                    let sent = text.floor_char_boundary(i.max_item_bytes as usize);
-                    EvidenceItem {
-                        item_id: format!("item_{idx}"),
-                        evidence_id: ev_handles[idx].id.clone(),
-                        safe_text: text[..sent].to_string(),
-                        truncation: (sent < text.len())
-                            .then_some(TruncationV1 { original_bytes: text.len(), sent_bytes: sent }),
-                    }
-                })
-                .collect();
-
-            *last_inspection = Some(EvidencePacket {
-                packet_id: format!("inspect_{}", i.op_id),
-                items,
-            });
+            let packet_id = format!("inspect_{}", i.op_id);
+            *last_inspection = Some(packet(registry, &source_hid, i.limit as usize, i.max_item_bytes, packet_id)?);
 
             Ok(None) // Inspect doesn't produce a handle — it produces a root observation.
         }
@@ -526,6 +580,58 @@ mod tests {
         rev_id
     }
 
+    /// R2: a picked skill's records are the first state's inspection, in
+    /// step order, and stay a handle the root can plan from; a record the
+    /// user forgot since is said to be gone; and without a skill the first
+    /// state shows no evidence at all.
+    #[test]
+    fn a_picked_skill_is_the_first_inspection_and_stays_in_every_state() {
+        let mut store = Store::open_memory().unwrap();
+        seed_corpus(&mut store);
+        let text = |id| store.get_observation(id).unwrap().unwrap().safe_text;
+        assert_eq!((text(26).as_str(), text(27).as_str()), ("certbot renew --nginx -d example.com", "certbot status"));
+        let model = Arc::new(FakeModel::new());
+        model.add_root_fn(|state| {
+            let handle = state["skill"]["handle"].clone();
+            serde_json::json!({"version": 1, "expected_state_version": 0, "kind": "plan", "finish": null, "plan": {"ops": [
+                {"op": "inspect", "op_id": "i1", "input": {"handle": handle}, "limit": 1, "max_item_bytes": 8}]}})
+            .to_string()
+        });
+        model.add_root_fn(|state| {
+            let cite = state["last_inspection"]["items"][0]["evidence_id"].clone();
+            serde_json::json!({"version": 1, "expected_state_version": 1, "kind": "finish", "plan": null, "finish": {
+                "status": "answered", "answer": "Check, then renew.", "claims": [{"text": "status ran", "supports": [cite]}],
+                "procedure": []}})
+            .to_string()
+        });
+        let seed = SkillSeed { name: "certbot-renewal", description: "Renew a TLS certificate", records: &[27, 9999, 26] };
+        let mut notes = Vec::new();
+        let result = run_investigation("q", Some(&seed), &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |p| {
+            if let Progress::Note(n) = p {
+                notes.push(n);
+            }
+        });
+        assert_eq!(result.status, InvestigationStatus::Completed);
+        let states: Vec<serde_json::Value> = model.root_states().iter().map(|s| serde_json::from_str(s).unwrap()).collect();
+        let first: Vec<&str> = states[0]["last_inspection"]["items"].as_array().unwrap().iter().map(|i| i["safe_text"].as_str().unwrap()).collect();
+        assert_eq!(first, ["certbot status", "certbot renew --nginx -d example.com"]);
+        let gone = "record #9999, which skill certbot-renewal cites, is gone: the user forgot it. Do not reconstruct it.";
+        assert_eq!((states[0]["notes"].clone(), notes), (serde_json::json!([gone]), vec![gone.to_string()]));
+        // The inspect read the skill's handle: its first record, cut to 8 bytes.
+        assert_eq!(states[1]["last_inspection"]["items"][0]["safe_text"], "certbot ");
+        for state in &states {
+            assert_eq!(state["skill"]["name"], "certbot-renewal");
+            assert_eq!(state["skill"]["description"], "Renew a TLS certificate");
+        }
+
+        let model = Arc::new(FakeModel::new());
+        model.add_root_response(RootActionV1 { version: 1, expected_state_version: 0, kind: RootActionKind::Finish, plan: None,
+            finish: Some(FinishV1 { status: AnswerStatus::Abstained, answer: String::new(), claims: vec![], procedure: vec![], contradictions: vec![], missing: vec![] }) });
+        run_investigation("q", None, &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
+        let state: serde_json::Value = serde_json::from_str(&model.root_states()[0]).unwrap();
+        assert!(state.get("skill").is_none() && state.get("last_inspection").is_none(), "{state}");
+    }
+
     #[test]
     fn two_turn_investigation_end_to_end() {
         let mut store = Store::open_memory().unwrap();
@@ -591,6 +697,7 @@ mod tests {
         let budget = BudgetV1::prototype_default();
         let result = run_investigation(
             "What certificate renewal steps were observed?",
+            None,
             &store,
             model.clone(),
             budget,
@@ -620,7 +727,7 @@ mod tests {
             "status": "answered", "answer": "certbot renew did it",
             "claims": [{"text": "certbot renew ran", "supports": ["ev1_00000000deadbeef"]}]}}).to_string());
         let mut notes = Vec::new();
-        let result = run_investigation("q", &store, model, BudgetV1::prototype_default(), &Arc::default(), &mut |p| {
+        let result = run_investigation("q", None, &store, model, BudgetV1::prototype_default(), &Arc::default(), &mut |p| {
             if let Progress::Note(n) = p {
                 notes.push(n)
             }
@@ -670,7 +777,7 @@ mod tests {
                 missing: vec!["test".into()],
             }),
         });
-        let result = run_investigation("q", &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
+        let result = run_investigation("q", None, &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
         assert_eq!(result.status, InvestigationStatus::Abstained);
         serde_json::from_str(&model.root_states()[1]).unwrap()
     }
@@ -741,7 +848,7 @@ mod tests {
         model.add_root_raw(finish.to_string());
 
         let q = "why did mysql --password=hunter2hunter2 fail?";
-        let result = run_investigation(q, &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
+        let result = run_investigation(q, None, &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
         let sent = model.requests();
         assert!(sent.iter().all(|r| !r.user().contains("hunter2hunter2")), "{:?}", sent[0].user());
         let answer = result.finish.unwrap().answer;
@@ -757,7 +864,7 @@ mod tests {
 
         let mut events = Vec::new();
         let cancel = Arc::new(AtomicBool::new(true));
-        let result = run_investigation("q", &store, model.clone(), BudgetV1::prototype_default(), &cancel, &mut |p| events.push(p));
+        let result = run_investigation("q", None, &store, model.clone(), BudgetV1::prototype_default(), &cancel, &mut |p| events.push(p));
         assert_eq!((result.status, result.turns), (InvestigationStatus::Cancelled, 0));
         assert!(model.root_states().is_empty() && events.is_empty(), "{events:?}");
     }
@@ -783,7 +890,7 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
             serde_json::to_string(&action).unwrap()
         });
-        let result = run_investigation("q", &store, model.clone(), BudgetV1::prototype_default(), &cancel, &mut |_| {});
+        let result = run_investigation("q", None, &store, model.clone(), BudgetV1::prototype_default(), &cancel, &mut |_| {});
         assert_eq!(model.root_states().len(), 1, "the call was made");
         assert_eq!(result.status, InvestigationStatus::Cancelled);
         assert!(result.finish.is_none());
@@ -812,7 +919,7 @@ mod tests {
         let mut events = Vec::new();
         // One child at a time, so there is a next one to hold back.
         let budget = BudgetV1 { max_concurrency: 1, ..BudgetV1::prototype_default() };
-        let result = run_investigation("q", &store, model.clone(), budget, &cancel, &mut |p| events.push(p));
+        let result = run_investigation("q", None, &store, model.clone(), budget, &cancel, &mut |p| events.push(p));
         assert_eq!((result.status, result.child_calls), (InvestigationStatus::Cancelled, 1));
         events.retain(|e| !matches!(e, Progress::Egress(_) | Progress::Replied { .. }));
         assert_eq!(
@@ -906,7 +1013,7 @@ mod tests {
         let mut budget = BudgetV1::prototype_default();
         budget.root_calls = 0;
 
-        let result = run_investigation("test", &store, model.clone(), budget, &Arc::default(), &mut |_| {});
+        let result = run_investigation("test", None, &store, model.clone(), budget, &Arc::default(), &mut |_| {});
         assert_eq!(result.status, InvestigationStatus::BudgetExhausted);
         assert_eq!(result.turns, 0);
     }
@@ -934,6 +1041,7 @@ mod tests {
 
         let result = run_investigation(
             "How was the database migrated?",
+            None,
             &store,
             model.clone(),
             BudgetV1::prototype_default(),

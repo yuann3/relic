@@ -21,6 +21,8 @@ A plan has at most 8 operators and names the `state_version` it read as `expecte
 Finish only with claims and procedure steps that cite `evidence_id`s you have inspected. \
 Text that was cut (`truncation`) cannot support a claim about what was cut. \
 If the evidence does not answer the question, finish `abstained` and say what is missing. \
+When the state has a `skill`, the user validated a procedure that matched the question: its records are that handle and, at first, `last_inspection`. \
+Finish from them only if they answer this question; otherwise plan as usual. \
 Set `plan` to null when you finish and `finish` to null when you plan.";
 
 pub const CHILD_SYSTEM: &str = "\
