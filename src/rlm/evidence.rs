@@ -2,7 +2,14 @@ use std::collections::HashMap;
 
 use crate::domain::StoredObservation;
 use crate::rlm::protocol::ItemAssessmentV1;
-use crate::rlm::validate::HandleKind;
+
+/// The kind of result an operator produces or consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleKind {
+    EvidenceSet,
+    AssessmentSet,
+    Inspection,
+}
 
 /// A unique investigation identifier.
 pub type InvestigationId = u64;

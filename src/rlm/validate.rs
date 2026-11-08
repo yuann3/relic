@@ -1,14 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::rlm::evidence::HandleKind;
 use crate::rlm::protocol::*;
-
-/// The kind of result an operator produces or consumes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandleKind {
-    EvidenceSet,
-    AssessmentSet,
-    Inspection,
-}
 
 /// A plan that passed structural and semantic validation.
 #[derive(Debug)]

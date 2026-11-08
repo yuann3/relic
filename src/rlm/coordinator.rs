@@ -6,13 +6,13 @@ use std::time::{Duration, Instant};
 use crate::domain::StoredObservation;
 use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
 use crate::rlm::calls::{Calls, Job, Stop, call_all};
-use crate::rlm::evidence::{EvidenceId, HandleId, HandleRegistry};
+use crate::rlm::evidence::{EvidenceId, HandleId, HandleKind, HandleRegistry};
 use crate::rlm::executor::{self, ExecError};
 use crate::rlm::finish;
 use crate::rlm::model::egress::{PayloadAudit, Role};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary, parse_output};
 use crate::rlm::protocol::*;
-use crate::rlm::validate::{self, HandleKind, Op};
+use crate::rlm::validate::{self, Op};
 use crate::store::Store;
 
 /// Terminal result of an investigation.

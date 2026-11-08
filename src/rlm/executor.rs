@@ -1,11 +1,10 @@
 use crate::app::{self, Budget, Order, SearchRequest};
 use crate::domain::StoredObservation;
 use crate::rlm::budget::BudgetExhausted;
-use crate::rlm::evidence::{HandleId, HandleRegistry};
+use crate::rlm::evidence::{HandleId, HandleKind, HandleRegistry};
 use crate::rlm::model::egress::{self, Role};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, OutputError, parse_output};
 use crate::rlm::protocol::*;
-use crate::rlm::validate::HandleKind;
 use crate::store::{Store, is_interrupt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
