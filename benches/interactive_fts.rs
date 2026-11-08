@@ -278,11 +278,7 @@ fn build_variant(src: &Path, dir: &Path, schema: &Schema) -> (PathBuf, f64) {
 fn db_bytes(path: &Path) -> u64 {
     ["db", "db-wal"]
         .iter()
-        .map(|ext| {
-            fs::metadata(path.with_extension(ext))
-                .map(|m| m.len())
-                .unwrap_or(0)
-        })
+        .map(|ext| fs::metadata(path.with_extension(ext)).map_or(0, |m| m.len()))
         .sum()
 }
 
@@ -315,15 +311,14 @@ fn cell(s: Stats) -> String {
 }
 
 fn shell(cmd: &str, args: &[&str]) -> String {
-    Command::new(cmd)
-        .args(args)
-        .output()
-        .map(|o| {
+    Command::new(cmd).args(args).output().map_or_else(
+        |e| format!("({cmd} failed: {e})"),
+        |o| {
             String::from_utf8_lossy(&o.stdout)
                 .trim()
                 .replace('\n', " | ")
-        })
-        .unwrap_or_else(|e| format!("({cmd} failed: {e})"))
+        },
+    )
 }
 
 /// Length of the token that carries `*`; whole-word queries never get gated.

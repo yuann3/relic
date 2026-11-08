@@ -37,6 +37,8 @@ semicolon_if_nothing_returned = "warn"
 # `x as u64` where `u64::from(x)` cannot truncate: an `as` there hides the
 # one cast that can, once a type changes.
 cast_lossless = "warn"
+# `.map(f).unwrap_or(a)` is `.map_or(a, f)`.
+map_unwrap_or = "warn"
 
 [[bin]]
 name = "relic"
