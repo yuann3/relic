@@ -1,8 +1,8 @@
 //! Fake fzf executables for picker tests. Each one records its pid, argv and
 //! environment in its own temp directory (`$D`) before running a test body.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -33,9 +33,17 @@ impl FakeFzf {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fzf");
         let d = dir.path().display();
-        std::fs::write(&path, format!("#!/bin/sh\nD='{d}'\necho $$ >> \"$D/pids\"\n{script}"))
+        // A short-lived sh writes the script, not this process: a child that
+        // another test thread forks inherits every fd open here until it
+        // execs, and on Linux a script still open for writing anywhere fails
+        // to exec with ETXTBSY. Once sh has exited, no writer is left.
+        let written = Command::new("/bin/sh")
+            .args(["-c", "printf %s \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
+            .arg(format!("#!/bin/sh\nD='{d}'\necho $$ >> \"$D/pids\"\n{script}"))
+            .arg(&path)
+            .status()
             .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(written.success(), "writing {}: {written}", path.display());
         Self { dir, path }
     }
 

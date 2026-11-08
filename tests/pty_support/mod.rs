@@ -37,9 +37,8 @@ pub const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 pub const PASTE_ON: &[u8] = b"\x1b[?2004h";
 pub const PASTE_OFF: &[u8] = b"\x1b[?2004l";
 
-/// The sessions run one at a time. Concurrent sessions would race on CPU
-/// against the deadline, and a fake fzf written by one test thread while
-/// another thread forks can fail to exec with ETXTBSY on Linux.
+/// The sessions run one at a time: concurrent sessions would race on CPU
+/// against the deadline.
 pub fn serial() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
