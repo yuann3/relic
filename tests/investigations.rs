@@ -310,7 +310,7 @@ fn corpus(db: &Path) -> Vec<Record> {
         let kind = relic::domain::ObservationKind::from_i64(r.get(1)?).expect("a known kind");
         Ok(Record {
             id: r.get(0)?,
-            source: relic::app::source_label(kind),
+            source: kind.source_label(),
             at_ms: r.get(2)?,
             text: r.get(3)?,
         })

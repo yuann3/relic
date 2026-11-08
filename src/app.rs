@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::domain::{ObservationKind, Provenance, StoredObservation};
+use crate::domain::{Provenance, StoredObservation, When};
 use crate::redact::Redactor;
 use crate::rlm::coordinator::{
     InvestigationResult, InvestigationStatus, Progress, SkillSeed, run_investigation,
@@ -296,7 +296,7 @@ pub fn search(
                 id: h.id,
                 observed_at_ms: h.observed_at_ms,
                 observed_before_ms: h.observed_before_ms,
-                source: source_label(h.kind),
+                source: h.kind.source_label(),
                 text: h.safe_text,
             })
             .collect(),
@@ -351,19 +351,6 @@ pub fn open_evidence(
     }))
 }
 
-pub fn source_label(kind: ObservationKind) -> &'static str {
-    match kind {
-        ObservationKind::ZshCommand => "zsh",
-        ObservationKind::BashCommand => "bash",
-        ObservationKind::HookFrame => "hook",
-        ObservationKind::AgentMessage => "agent",
-        ObservationKind::GitReflog | ObservationKind::GitRef => "git",
-        ObservationKind::AgentCommand => "claude",
-        ObservationKind::AgentOutput => "claude-out",
-        ObservationKind::AgentTool => "claude-tool",
-    }
-}
-
 /// History text is hostile input. Render it as one line that cannot drive the
 /// terminal, break NUL/tab framing, or visually reorder itself: line-breaking
 /// whitespace becomes a space; every other control and invisible format
@@ -386,79 +373,6 @@ pub fn display_char(c: char) -> char {
         '\u{E0001}' | '\u{E0020}'..='\u{E007F}' => '\u{FFFD}',
         c => c,
     }
-}
-
-/// When a command ran, as far as the source can say.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum When {
-    At(i64),
-    /// The source has no time for it, but a later timestamped command in the
-    /// same file bounds it.
-    NoLaterThan(i64),
-    Unknown,
-}
-
-impl When {
-    fn from_parts(at: Option<i64>, before: Option<i64>) -> Self {
-        match (at, before) {
-            (Some(ms), _) => Self::At(ms),
-            (None, Some(ms)) => Self::NoLaterThan(ms),
-            (None, None) => Self::Unknown,
-        }
-    }
-
-    /// Fixed 17 columns for result lists. The first column marks an
-    /// inferred bound, so exact and bounded dates line up.
-    pub fn label(self) -> String {
-        match self {
-            Self::At(ms) => format!(" {}", format_utc(ms)),
-            Self::NoLaterThan(ms) => format!("≤{}", format_utc(ms)),
-            Self::Unknown => " unknown time    ".into(),
-        }
-    }
-
-    /// Fixed 12 columns, month-day only, for the timeline beside the year.
-    pub fn short(self) -> String {
-        match self {
-            Self::At(ms) => format!(" {}", &format_utc(ms)[5..]),
-            Self::NoLaterThan(ms) => format!("≤{}", &format_utc(ms)[5..]),
-            Self::Unknown => " unknown    ".into(),
-        }
-    }
-
-    /// Spelled out, saying which part is inferred.
-    pub fn detail(self) -> String {
-        match self {
-            Self::At(ms) => format!("{} UTC", format_utc(ms)),
-            Self::NoLaterThan(ms) => format!(
-                "not recorded; no later than {} UTC (inferred from history order)",
-                format_utc(ms)
-            ),
-            Self::Unknown => "not recorded".into(),
-        }
-    }
-}
-
-/// `YYYY-MM-DD HH:MM` in UTC. Local time needs a tz database, which the
-/// prototype does not carry.
-pub fn format_utc(ms: i64) -> String {
-    let secs = ms.div_euclid(1000);
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
-        rem / 3600,
-        rem % 3600 / 60
-    )
 }
 
 pub const RECALL_SCHEMA: &str = "relic.recall/v1";
@@ -563,7 +477,7 @@ pub fn show(store: &Store, ids: &[i64]) -> Result<RecordsPage, rusqlite::Error> 
                 id: o.id,
                 revision: o.revision_id,
                 ordinal: o.ordinal,
-                source: source_label(o.kind),
+                source: o.kind.source_label(),
                 observed_at_ms: o.observed_at_ms,
                 text: o.safe_text,
             }),
@@ -796,7 +710,7 @@ fn report(question: String, r: InvestigationResult, models: Vec<String>) -> Reca
                         id: o.id,
                         revision: o.revision_id,
                         ordinal: o.ordinal,
-                        source: source_label(o.kind),
+                        source: o.kind.source_label(),
                         observed_at_ms: o.observed_at_ms,
                         text: o.safe_text.clone(),
                     });
@@ -1220,26 +1134,6 @@ mod tests {
             ]
         );
         assert_eq!(view.when(&view.observation), When::NoLaterThan(first_timed));
-    }
-
-    #[test]
-    fn time_labels_keep_their_columns() {
-        let ms = 1_791_017_948_000;
-        for w in [When::At(ms), When::NoLaterThan(ms), When::Unknown] {
-            assert_eq!(w.label().chars().count(), 17, "{w:?}");
-            assert_eq!(w.short().chars().count(), 12, "{w:?}");
-        }
-        assert_eq!(When::NoLaterThan(ms).label(), "≤2026-10-03 08:59");
-        assert_eq!(When::NoLaterThan(ms).short(), "≤10-03 08:59");
-        assert!(When::NoLaterThan(ms).detail().contains("inferred"));
-    }
-
-    #[test]
-    fn utc_formatting() {
-        assert_eq!(format_utc(0), "1970-01-01 00:00");
-        assert_eq!(format_utc(1_700_000_000_000), "2023-11-14 22:13");
-        assert_eq!(format_utc(951_782_400_000), "2000-02-29 00:00");
-        assert_eq!(format_utc(-60_000), "1969-12-31 23:59");
     }
 
     #[test]

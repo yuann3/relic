@@ -64,6 +64,19 @@ impl ObservationKind {
             _ => None,
         }
     }
+
+    pub fn source_label(self) -> &'static str {
+        match self {
+            Self::ZshCommand => "zsh",
+            Self::BashCommand => "bash",
+            Self::HookFrame => "hook",
+            Self::AgentMessage => "agent",
+            Self::GitReflog | Self::GitRef => "git",
+            Self::AgentCommand => "claude",
+            Self::AgentOutput => "claude-out",
+            Self::AgentTool => "claude-tool",
+        }
+    }
 }
 
 /// Which observation fields a revision's source file itself encodes. A field
@@ -135,4 +148,102 @@ pub struct SearchHit {
     pub kind: ObservationKind,
     pub safe_text: String,
     pub score: f64,
+}
+
+/// When a command ran, as far as the source can say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    At(i64),
+    /// The source has no time for it, but a later timestamped command in the
+    /// same file bounds it.
+    NoLaterThan(i64),
+    Unknown,
+}
+
+impl When {
+    pub(crate) fn from_parts(at: Option<i64>, before: Option<i64>) -> Self {
+        match (at, before) {
+            (Some(ms), _) => Self::At(ms),
+            (None, Some(ms)) => Self::NoLaterThan(ms),
+            (None, None) => Self::Unknown,
+        }
+    }
+
+    /// Fixed 17 columns for result lists. The first column marks an
+    /// inferred bound, so exact and bounded dates line up.
+    pub fn label(self) -> String {
+        match self {
+            Self::At(ms) => format!(" {}", format_utc(ms)),
+            Self::NoLaterThan(ms) => format!("≤{}", format_utc(ms)),
+            Self::Unknown => " unknown time    ".into(),
+        }
+    }
+
+    /// Fixed 12 columns, month-day only, for the timeline beside the year.
+    pub fn short(self) -> String {
+        match self {
+            Self::At(ms) => format!(" {}", &format_utc(ms)[5..]),
+            Self::NoLaterThan(ms) => format!("≤{}", &format_utc(ms)[5..]),
+            Self::Unknown => " unknown    ".into(),
+        }
+    }
+
+    /// Spelled out, saying which part is inferred.
+    pub fn detail(self) -> String {
+        match self {
+            Self::At(ms) => format!("{} UTC", format_utc(ms)),
+            Self::NoLaterThan(ms) => format!(
+                "not recorded; no later than {} UTC (inferred from history order)",
+                format_utc(ms)
+            ),
+            Self::Unknown => "not recorded".into(),
+        }
+    }
+}
+
+/// `YYYY-MM-DD HH:MM` in UTC. Local time needs a tz database, which the
+/// prototype does not carry.
+pub fn format_utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_labels_keep_their_columns() {
+        let ms = 1_791_017_948_000;
+        for w in [When::At(ms), When::NoLaterThan(ms), When::Unknown] {
+            assert_eq!(w.label().chars().count(), 17, "{w:?}");
+            assert_eq!(w.short().chars().count(), 12, "{w:?}");
+        }
+        assert_eq!(When::NoLaterThan(ms).label(), "≤2026-10-03 08:59");
+        assert_eq!(When::NoLaterThan(ms).short(), "≤10-03 08:59");
+        assert!(When::NoLaterThan(ms).detail().contains("inferred"));
+    }
+
+    #[test]
+    fn utc_formatting() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00");
+        assert_eq!(format_utc(1_700_000_000_000), "2023-11-14 22:13");
+        assert_eq!(format_utc(951_782_400_000), "2000-02-29 00:00");
+        assert_eq!(format_utc(-60_000), "1969-12-31 23:59");
+    }
 }

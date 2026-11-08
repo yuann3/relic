@@ -11,8 +11,7 @@
 
 use std::fmt::Write as _;
 
-use crate::app::{When, source_label};
-use crate::domain::ObservationKind;
+use crate::domain::{ObservationKind, When, format_utc};
 
 /// One procedure step: what the model wrote, and the records it cites.
 pub struct Step<'a> {
@@ -131,7 +130,7 @@ pub fn render(
     if steps.is_empty() {
         return Err(CompileError::NoSteps);
     }
-    let date = &crate::app::format_utc(confirmed_at_ms)[..10];
+    let date = &format_utc(confirmed_at_ms)[..10];
     // JSON strings are YAML double-quoted scalars.
     let quoted =
         serde_json::to_string(description).map_err(|e| CompileError::Description(e.to_string()))?;
@@ -160,7 +159,7 @@ pub fn render(
             let label = format!(
                 "Recorded command #{} ({}, {when}",
                 r.id,
-                source_label(r.kind)
+                r.kind.source_label()
             );
             // CommonMark ends a line at a bare \r too, which would let the
             // rest of the text out of the fence.

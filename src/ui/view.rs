@@ -8,7 +8,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::model::{Focus, Modal, RecallState, RecallStatus, StepState, UiModel};
-use crate::app::{MIN_PREFIX_CHARS, RecallOutcome, When, display_line, source_label};
+use crate::app::{MIN_PREFIX_CHARS, RecallOutcome, display_line};
+use crate::domain::When;
 use crate::domain::{ObservationKind, Provenance};
 use crate::rlm::protocol::BudgetV1;
 
@@ -315,7 +316,7 @@ fn timeline(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     };
     let title = format!(
         "Timeline · {} · revision {}",
-        source_label(v.observation.kind),
+        v.observation.kind.source_label(),
         v.observation.revision_id
     );
     let items: Vec<ListItem> = v
@@ -381,7 +382,7 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     };
     let mut lines = vec![
         field("id", format!("#{}", o.id)),
-        field("source", source_label(o.kind).to_string()),
+        field("source", o.kind.source_label().to_string()),
         field("time", when.detail()),
         field(
             "revision",

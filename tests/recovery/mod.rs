@@ -753,7 +753,7 @@ fn frames(story: &[Typed]) -> Vec<u8> {
 
 /// One Claude Code 2.1.318 record of a session in `cwd`, at `at` seconds.
 fn claude(cwd: &str, at: i64, kind: &str, content: &str) -> String {
-    let time = relic::app::format_utc(at * 1000).replace(' ', "T");
+    let time = relic::domain::format_utc(at * 1000).replace(' ', "T");
     format!(
         r#"{{"type":"{kind}","version":"2.1.318","timestamp":"{time}:{:02}.000Z","cwd":"{cwd}","gitBranch":"main","message":{{"content":{content}}}}}"#,
         at % 60
