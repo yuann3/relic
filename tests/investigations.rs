@@ -454,6 +454,9 @@ fn run(bench: &Bench, out: &Path, configured: &str, model: &dyn Fn(bool) -> Arc<
             }
             let answer = Answer::of(&r);
             let (correct, exact) = case.mark(arm, &needed, &on_topic, &answer);
+            // A real model takes minutes over the 48 runs; without a line
+            // each, the run looks hung.
+            eprintln!("{} {:<15} correct {correct:<5} {} calls {:.1} s", case.id, arm.name(), m.calls, wall_ms as f64 / 1e3);
             rows.push(json!({
                 "case": case.id, "group": case.group.name(), "arm": arm.name(), "outcome": answer.outcome, "error": answer.error,
                 "correct": correct, "exact": exact, "cited": answer.cited, "needed": needed, "missing": answer.missing,
