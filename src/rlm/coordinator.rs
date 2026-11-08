@@ -116,6 +116,9 @@ pub struct SkillSeed<'a> {
 /// Most bytes of each skill record in the first state, as the inspect the
 /// prompt examples use.
 const SEED_ITEM_BYTES: u32 = 2048;
+/// Most skill records in the first state: 40 KiB of them leaves room under
+/// the 64 KiB root cap. The handle holds the rest for the root to inspect.
+const SEED_ITEMS: usize = 20;
 
 /// What one investigation's steps share.
 struct Run<'a> {
@@ -224,7 +227,7 @@ fn seed(run: &mut Run, skill: &SkillSeed) -> Result<(), InvestigationStatus> {
     let rows = Reservation { rows_returned: observations.len() as u64, evidence_handles: 1, ..Default::default() };
     run.ledger.reserve(&rows).map_err(|_| InvestigationStatus::BudgetExhausted)?;
     let handle = run.registry.insert_evidence_set(observations);
-    let packet = packet(&run.registry, &handle, usize::MAX, SEED_ITEM_BYTES, format!("skill_{}", skill.name))
+    let packet = packet(&run.registry, &handle, SEED_ITEMS, SEED_ITEM_BYTES, format!("skill_{}", skill.name))
         .map_err(|e| InvestigationStatus::Failed(format!("skill {}: {e}", skill.name)))?;
     run.last_inspection = Some(packet);
     run.skill = Some(serde_json::json!({"name": skill.name, "description": skill.description, "handle": handle}));
@@ -624,12 +627,19 @@ mod tests {
             assert_eq!(state["skill"]["description"], "Renew a TLS certificate");
         }
 
-        let model = Arc::new(FakeModel::new());
-        model.add_root_response(RootActionV1 { version: 1, expected_state_version: 0, kind: RootActionKind::Finish, plan: None,
-            finish: Some(FinishV1 { status: AnswerStatus::Abstained, answer: String::new(), claims: vec![], procedure: vec![], contradictions: vec![], missing: vec![] }) });
-        run_investigation("q", None, &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
-        let state: serde_json::Value = serde_json::from_str(&model.root_states()[0]).unwrap();
+        let first_state = |skill: Option<&SkillSeed>| -> serde_json::Value {
+            let model = Arc::new(FakeModel::new());
+            model.add_root_response(RootActionV1 { version: 1, expected_state_version: 0, kind: RootActionKind::Finish, plan: None,
+                finish: Some(FinishV1 { status: AnswerStatus::Abstained, answer: String::new(), claims: vec![], procedure: vec![], contradictions: vec![], missing: vec![] }) });
+            run_investigation("q", skill, &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
+            serde_json::from_str(&model.root_states()[0]).unwrap()
+        };
+        let state = first_state(None);
         assert!(state.get("skill").is_none() && state.get("last_inspection").is_none(), "{state}");
+        // A long procedure: all of it in the handle, its first 20 shown.
+        let all: Vec<i64> = (1..=50).collect();
+        let state = first_state(Some(&SkillSeed { name: "long", description: "d", records: &all }));
+        assert_eq!((state["handles"][0]["count"].as_u64(), state["last_inspection"]["items"].as_array().unwrap().len()), (Some(50), 20));
     }
 
     #[test]
