@@ -985,7 +985,7 @@ mod tests {
         assert!(!receipt.to_string().contains(origin), "{receipt}");
 
         // A reply that recall would reject fails the check, and says where.
-        let (receipt, verdict, _, _) = run(child("item_9"), plan.clone());
+        let (receipt, verdict, _, _) = run(child("item_9"), plan);
         assert!(
             verdict
                 .unwrap_err()

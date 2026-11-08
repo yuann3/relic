@@ -1106,7 +1106,7 @@ mod tests {
             &git,
             &Budget {
                 deadline: far,
-                cancel: Some(cancel.clone()),
+                cancel: Some(cancel),
             },
         )
         .unwrap();

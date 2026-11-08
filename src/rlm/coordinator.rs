@@ -915,7 +915,7 @@ mod tests {
             "What certificate renewal steps were observed?",
             None,
             &store,
-            model.clone(),
+            model,
             budget,
             &Arc::default(),
             &mut |_| {},
@@ -1232,15 +1232,9 @@ mod tests {
             max_concurrency: 1,
             ..BudgetV1::prototype_default()
         };
-        let result = run_investigation(
-            "q",
-            None,
-            &store,
-            model.clone(),
-            budget,
-            &cancel,
-            &mut |p| events.push(p),
-        );
+        let result = run_investigation("q", None, &store, model, budget, &cancel, &mut |p| {
+            events.push(p);
+        });
         assert_eq!(
             (result.status, result.child_calls),
             (InvestigationStatus::Cancelled, 1)
@@ -1344,7 +1338,7 @@ mod tests {
             "test",
             None,
             &store,
-            model.clone(),
+            model,
             budget,
             &Arc::default(),
             &mut |_| {},
@@ -1378,7 +1372,7 @@ mod tests {
             "How was the database migrated?",
             None,
             &store,
-            model.clone(),
+            model,
             BudgetV1::prototype_default(),
             &Arc::default(),
             &mut |_| {},

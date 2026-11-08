@@ -1795,11 +1795,7 @@ mod tests {
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
-        for path in [
-            fifo.clone(),
-            PathBuf::from("/dev/null"),
-            dir.path().to_path_buf(),
-        ] {
+        for path in [fifo, PathBuf::from("/dev/null"), dir.path().to_path_buf()] {
             // On a thread: a FIFO nobody writes to blocks in open forever, and
             // a wrong check must fail this test, not hang the suite.
             let (done, refused) = std::sync::mpsc::channel();

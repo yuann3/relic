@@ -47,6 +47,8 @@ stable_sort_primitive = "warn"
 cloned_instead_of_copied = "warn"
 # `format!("{}", x)` where `format!("{x}")` names the value in place.
 uninlined_format_args = "warn"
+# A clone of a value that is never used again.
+redundant_clone = "warn"
 
 [[bin]]
 name = "relic"
