@@ -136,7 +136,7 @@ fn cases(a: &Recovery, later: &Later) -> Vec<Case> {
         question,
         window,
         needs,
-        says: says.iter().map(|s| s.to_string()).collect(),
+        says: says.iter().map(ToString::to_string).collect(),
     };
     let lost_commit = "How did I get back the commit that git reset --hard threw away in shop?";
     let stash = short(a.stash.as_deref().expect("the sibling is imported"));
@@ -773,7 +773,7 @@ struct Script {
 }
 
 fn script(hints: &'static [&'static str], cite: &[&str], answer: Option<&str>) -> Script {
-    let cite = cite.iter().map(|c| c.to_string()).collect();
+    let cite = cite.iter().map(ToString::to_string).collect();
     Script {
         hints,
         cite,
@@ -1018,7 +1018,7 @@ fn scripted_client(url: &str) -> Arc<dyn ModelBoundary> {
     ]);
     Arc::new(
         ChatCompletionsClient::new(
-            ChatConfig::from_env(|k| vars.get(k).map(|v| v.to_string())).unwrap(),
+            ChatConfig::from_env(|k| vars.get(k).map(ToString::to_string)).unwrap(),
         )
         .unwrap(),
     )

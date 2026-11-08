@@ -4,7 +4,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, Once};
+use std::sync::{Arc, Condvar, Mutex, Once, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -258,18 +258,18 @@ impl InputReader {
     /// Returns once the reader is parked outside `poll`/`read`.
     pub fn pause(&self) {
         let (lock, cv) = &*self.gate;
-        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock.lock().unwrap_or_else(PoisonError::into_inner);
         g.pause = true;
         // A reader backing off on a full channel waits on this condvar.
         cv.notify_all();
         while !g.parked {
-            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            g = cv.wait(g).unwrap_or_else(PoisonError::into_inner);
         }
     }
 
     pub fn resume(&self) {
         let (lock, cv) = &*self.gate;
-        lock.lock().unwrap_or_else(|e| e.into_inner()).pause = false;
+        lock.lock().unwrap_or_else(PoisonError::into_inner).pause = false;
         cv.notify_all();
     }
 }
@@ -277,7 +277,7 @@ impl InputReader {
 impl Drop for InputReader {
     fn drop(&mut self) {
         let (lock, cv) = &*self.gate;
-        lock.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+        lock.lock().unwrap_or_else(PoisonError::into_inner).stop = true;
         cv.notify_all();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -308,7 +308,7 @@ fn read_loop(
     // However the loop ended, a pause in progress must return and later
     // ones must not wait.
     let (lock, cv) = gate;
-    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = lock.lock().unwrap_or_else(PoisonError::into_inner);
     g.parked = true;
     g.stop = true;
     cv.notify_all();
@@ -316,11 +316,11 @@ fn read_loop(
 
 /// Parks while paused. False once stopped.
 fn wait_while_paused((lock, cv): &(Mutex<Gate>, Condvar)) -> bool {
-    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = lock.lock().unwrap_or_else(PoisonError::into_inner);
     while g.pause && !g.stop {
         g.parked = true;
         cv.notify_all();
-        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        g = cv.wait(g).unwrap_or_else(PoisonError::into_inner);
     }
     g.parked = false;
     !g.stop
@@ -339,7 +339,7 @@ fn send(gate: &(Mutex<Gate>, Condvar), tx: &SyncSender<UiAction>, mut a: UiActio
         }
         {
             let (lock, cv) = gate;
-            let g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let g = lock.lock().unwrap_or_else(PoisonError::into_inner);
             // pause() and drop notify, so a request is seen at once; the
             // timeout only paces retries while the main thread catches up.
             if !g.pause && !g.stop {

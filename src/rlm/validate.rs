@@ -396,7 +396,7 @@ mod tests {
     fn search(id: &str, terms: &[&str], limit: u32) -> PlanOpV1 {
         PlanOpV1::Search(SearchV1 {
             op_id: id.to_string(),
-            terms: terms.iter().map(|s| s.to_string()).collect(),
+            terms: terms.iter().map(ToString::to_string).collect(),
             match_mode: MatchMode::Any,
             limit,
         })

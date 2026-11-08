@@ -318,7 +318,7 @@ fn parse(line: &[u8], pending: &mut std::collections::HashSet<String>) -> Parsed
                     .tool_use_result
                     .as_ref()
                     .and_then(|r| r.get("interrupted"))
-                    .and_then(|i| i.as_bool());
+                    .and_then(serde_json::Value::as_bool);
                 let said = match content {
                     Some(ResultContent::Text(text)) => text,
                     Some(ResultContent::Blocks(blocks)) => blocks

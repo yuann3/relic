@@ -586,7 +586,7 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
         let cmds: Vec<String> = (0..20).map(|i| format!("cargo cmd_{i}")).collect();
-        let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
+        let cmd_refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
         insert_commands(&mut store, rev_id, &cmd_refs);
 
         let mut registry = HandleRegistry::new(64);
@@ -621,7 +621,7 @@ mod tests {
                 }
             })
             .collect();
-        let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
+        let cmd_refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
         insert_commands(&mut store, rev_id, &cmd_refs);
 
         let mut registry = HandleRegistry::new(64);
@@ -685,7 +685,7 @@ mod tests {
                 }
             })
             .collect();
-        let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
+        let cmd_refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
         insert_commands(&mut store, rev_id, &cmd_refs);
 
         let mut registry = HandleRegistry::new(64);
@@ -856,7 +856,7 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
         let cmds: Vec<String> = (0..8).map(|i| format!("cargo task_{i}")).collect();
-        let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
+        let cmd_refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
         insert_commands(&mut store, rev_id, &cmd_refs);
 
         let mut registry = HandleRegistry::new(64);

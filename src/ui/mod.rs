@@ -17,7 +17,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -428,12 +428,12 @@ struct Mailbox {
 
 impl Mailbox {
     fn put(&self, job: SearchJob) {
-        self.slot.lock().unwrap_or_else(|e| e.into_inner()).0 = Some(job);
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner).0 = Some(job);
         self.cv.notify_one();
     }
 
     fn close(&self) {
-        self.slot.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
         self.cv.notify_one();
     }
 
@@ -441,7 +441,7 @@ impl Mailbox {
     /// timeout or close.
     fn take(&self, timeout: Option<Duration>) -> Option<SearchJob> {
         let deadline = timeout.map(|t| Instant::now() + t);
-        let mut g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if g.1 {
                 return None;
@@ -450,7 +450,7 @@ impl Mailbox {
                 return Some(job);
             }
             g = match deadline {
-                None => self.cv.wait(g).unwrap_or_else(|e| e.into_inner()),
+                None => self.cv.wait(g).unwrap_or_else(PoisonError::into_inner),
                 Some(d) => {
                     let left = d.saturating_duration_since(Instant::now());
                     if left.is_zero() {
@@ -458,7 +458,7 @@ impl Mailbox {
                     }
                     self.cv
                         .wait_timeout(g, left)
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(PoisonError::into_inner)
                         .0
                 }
             };
@@ -466,7 +466,7 @@ impl Mailbox {
     }
 
     fn closed(&self) -> bool {
-        self.slot.lock().unwrap_or_else(|e| e.into_inner()).1
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner).1
     }
 }
 
@@ -726,7 +726,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .map(|c| c.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect()
     }
 

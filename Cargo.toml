@@ -28,6 +28,8 @@ use_debug = "warn"
 # A panic for a state a guard elsewhere rules out: return the error the
 # guard would, so moving the guard cannot crash Relic.
 unreachable = "warn"
+# `.map(|s| s.as_str())` where `.map(String::as_str)` names the method.
+redundant_closure_for_method_calls = "warn"
 
 [[bin]]
 name = "relic"
