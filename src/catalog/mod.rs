@@ -120,6 +120,8 @@ pub struct ActiveSkill {
     pub bundle: String,
     /// `<base>/.agents/skills/<name>` or `<base>/.claude/skills/<name>`.
     pub link: PathBuf,
+    /// The records its procedure cites, in step order, each once.
+    pub cites: Vec<i64>,
 }
 
 pub struct Catalog {
@@ -508,16 +510,25 @@ impl Catalog {
     pub fn active(&self) -> Result<Vec<ActiveSkill>, CatalogError> {
         use std::os::unix::ffi::OsStrExt as _;
         let mut stmt = self.conn.prepare(
-            "SELECT b.name, b.description, b.hash, a.link FROM activation a JOIN bundle b ON b.hash = a.bundle
+            "SELECT b.name, b.description, b.hash, a.link, b.cites FROM activation a JOIN bundle b ON b.hash = a.bundle
              WHERE a.id IN (SELECT MAX(id) FROM activation GROUP BY link) ORDER BY b.name, a.link",
         )?;
         let rows = stmt.query_map([], |r| {
             let link: Vec<u8> = r.get(3)?;
+            let cites: Vec<(i64, String)> = serde_json::from_str(&r.get::<_, String>(4)?)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+            let mut ids: Vec<i64> = Vec::new();
+            for (id, _) in cites {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
             Ok(ActiveSkill {
                 name: r.get(0)?,
                 description: r.get(1)?,
                 bundle: r.get(2)?,
                 link: PathBuf::from(std::ffi::OsStr::from_bytes(&link)),
+                cites: ids,
             })
         })?;
         let all: Vec<ActiveSkill> = rows.collect::<Result<_, _>>()?;
@@ -580,7 +591,7 @@ mod tests {
     use super::*;
 
     fn skill(name: &str, description: &str) -> ActiveSkill {
-        ActiveSkill { name: name.into(), description: description.into(), bundle: name.into(), link: PathBuf::new() }
+        ActiveSkill { name: name.into(), description: description.into(), bundle: name.into(), link: PathBuf::new(), cites: vec![] }
     }
 
     #[test]
