@@ -51,6 +51,7 @@ Release evidence (not gating):
 - S3 (shell hooks, then Git) supplies the exit statuses and the Git leg. S4's validate → compile → activate → rollback prototype runs on this fixture.
 - S5 owns the rest: replacing the synthetic Claude-trace leg with the Claude Code adapter that [S10](https://github.com/yuann3/relic/issues/34) built (the Prime adapter, S11, was dropped from v0.1), the full fixture, the 12 seeded investigations, the reuse gate and the release dogfood session.
 - The reuse gate runs in CI against recorded model responses. It needs no live model.
+- The fixture as built ([R1](https://github.com/yuann3/relic/issues/39)) is `tests/recovery/mod.rs`, shared by the R tickets' tests. `shop` loses a commit to `git reset --hard` and has `feature/coupons` deleted by a Claude Code session; 2000 seeded noise commands come first. The contradictory variant typed the rescue outside the repository, so the hook saw it fail and Git has no `rescue`. The held-out sibling `notes` has its stash imported, then dropped. Every leg goes through `relic import`. A Git ref's observed-at is when it was imported, so that is the one field that differs between two builds.
 - The catalog must expose enough metadata for the host step to match the question deterministically.
 
 ## Rejected alternatives
