@@ -12,13 +12,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// When the story starts, after the noise history ends.
-const S: i64 = 1_700_100_000;
+pub const S: i64 = 1_700_100_000;
 /// Seeded noise commands before the story.
 pub const NOISE: usize = 2000;
 /// Where the commands ran, as the hook and Claude Code saw it.
 const HOME: &str = "/home/dev";
 const SHOP: &str = "/home/dev/src/shop";
 const NOTES: &str = "/home/dev/src/notes";
+const BILLING: &str = "/home/dev/src/billing";
+const API: &str = "/home/dev/src/api";
+const INFRA: &str = "/home/dev/src/infra";
+const SITE: &str = "/home/dev/src/site";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
@@ -44,6 +48,19 @@ pub struct Recovery {
     /// The stash dropped in `notes`, once the sibling is imported.
     pub stash: Option<String>,
     input: PathBuf,
+}
+
+/// The commits of the work [`Recovery::import_investigations`] adds.
+pub struct Later {
+    /// The tip of the tax fix committed on a detached HEAD in `billing`.
+    pub tax: String,
+    /// The two commits `git reset --hard HEAD~2` threw away in `api`.
+    pub limiter: String,
+    pub rejected: String,
+    /// The fix on `fix/timeout` in `infra`, the branch Claude Code deleted.
+    pub timeout: String,
+    /// That fix, cherry-picked onto `main`.
+    pub picked: String,
 }
 
 /// One command as the user typed it: when, how long, its status and where.
@@ -114,11 +131,11 @@ impl Recovery {
         let project = input.join("claude/projects/-home-dev-src-shop");
         std::fs::create_dir_all(&project).unwrap();
         let session = [
-            claude(S + 590, "user", r#""tidy up the branches that are already merged""#),
-            claude(S + 600, "assistant", &bash_call("t1", "git branch --merged main")),
-            claude(S + 601, "user", &bash_result("t1", "* main")),
-            claude(S + 610, "assistant", &bash_call("t2", "git branch -D feature/coupons")),
-            claude(S + 611, "user", &bash_result("t2", &format!("Deleted branch feature/coupons (was {short})."))),
+            claude(SHOP, S + 590, "user", r#""tidy up the branches that are already merged""#),
+            claude(SHOP, S + 600, "assistant", &bash_call("t1", "git branch --merged main")),
+            claude(SHOP, S + 601, "user", &bash_result("t1", "* main")),
+            claude(SHOP, S + 610, "assistant", &bash_call("t2", "git branch -D feature/coupons")),
+            claude(SHOP, S + 611, "user", &bash_result("t2", &format!("Deleted branch feature/coupons (was {short})."))),
         ]
         .concat();
         std::fs::write(project.join("6b0e3c1d-0d6e-4c43-9a3e-2f0c3d7e9a11.jsonl"), session).unwrap();
@@ -172,6 +189,164 @@ impl Recovery {
         self.import(&["--hooks", hooks.to_str().unwrap()]);
         self.import(&[self.notes.to_str().unwrap()]);
         self.stash = Some(stash);
+    }
+
+    /// The rest of the seeded investigations' corpus (ADR 0016, R4), each
+    /// leg through `relic import`. In `billing`, commits made on a detached
+    /// HEAD and later kept on a branch, and edits a Claude Code session
+    /// discarded for good. In `api`, a build that one update fixed, and two
+    /// commits a reset threw away whose cherry-pick failed. In `infra`, a fix
+    /// whose branch Claude Code deleted, cherry-picked onto main. Then a later
+    /// week in `site` and `api`, imported last: as in a real store, the most
+    /// recently imported records are unrelated work, some in the same repo.
+    pub fn import_investigations(&self) -> Later {
+        let repo = |name: &str| {
+            let path = self._dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+
+        let billing = repo("billing");
+        let g = |at: i64, args: &[&str]| git(&billing, at, args);
+        g(S + 6900, &["init", "-q", "-b", "main"]);
+        g(S + 6900, &["commit", "-q", "--allow-empty", "-m", "add invoices"]);
+        g(S + 6900, &["tag", "v1.2"]);
+        g(S + 7060, &["checkout", "-q", "v1.2"]);
+        g(S + 7120, &["commit", "-q", "--allow-empty", "-m", "fix tax rounding for EU invoices"]);
+        g(S + 7180, &["commit", "-q", "--allow-empty", "-m", "test EU tax rounding"]);
+        let tax = g(S + 7180, &["rev-parse", "HEAD"]);
+        g(S + 7240, &["checkout", "-q", "main"]);
+        g(S + 7300, &["commit", "-q", "--allow-empty", "-m", "bump the invoice template"]);
+        g(S + 7800, &["branch", "wip-2", &tax[..7]]);
+        let billing_story = [
+            typed(S + 6990, 0, 0, HOME, "cd ~/src/billing"),
+            typed(S + 7060, 0, 0, BILLING, "git checkout v1.2"),
+            typed(S + 7120, 0, 0, BILLING, "git commit -m 'fix tax rounding for EU invoices'"),
+            typed(S + 7180, 0, 0, BILLING, "git commit -m 'test EU tax rounding'"),
+            typed(S + 7240, 0, 0, BILLING, "git checkout main"),
+            typed(S + 7300, 0, 0, BILLING, "git commit -m 'bump the invoice template'"),
+            // After the session below: looking for the edits it discarded.
+            typed(S + 7500, 0, 0, BILLING, "git stash list"),
+            typed(S + 7520, 0, 0, BILLING, "git diff src/tax.rs"),
+            typed(S + 7790, 0, 0, BILLING, "git log --oneline -3"),
+            typed(S + 7800, 0, 0, BILLING, format!("git branch wip-2 {}", &tax[..7])),
+        ];
+        let discarded = [
+            claude(BILLING, S + 7400, "user", r#""make the tax tests pass""#),
+            claude(BILLING, S + 7410, "assistant", &bash_call("b1", "git status --short")),
+            claude(BILLING, S + 7411, "user", &bash_result("b1", "M src/tax.rs")),
+            claude(BILLING, S + 7420, "assistant", &bash_call("b2", "git checkout -- src/tax.rs")),
+            claude(BILLING, S + 7421, "user", &bash_result("b2", "Updated 1 path from the index")),
+        ];
+
+        let api = repo("api");
+        let g = |at: i64, args: &[&str]| git(&api, at, args);
+        g(S + 8900, &["init", "-q", "-b", "main"]);
+        g(S + 8900, &["commit", "-q", "--allow-empty", "-m", "add the request router"]);
+        g(S + 9200, &["commit", "-q", "--allow-empty", "-m", "add a rate limiter"]);
+        let limiter = g(S + 9200, &["rev-parse", "HEAD"]);
+        g(S + 9260, &["commit", "-q", "--allow-empty", "-m", "log rejected requests"]);
+        let rejected = g(S + 9260, &["rev-parse", "HEAD"]);
+        g(S + 9400, &["reset", "-q", "--hard", "HEAD~2"]);
+        g(S + 9900, &["commit", "-q", "--allow-empty", "-m", "add a health endpoint"]);
+        let api_story = [
+            typed(S + 8990, 0, 0, HOME, "cd ~/src/api"),
+            typed(S + 9000, 41, 101, API, "cargo build"),
+            typed(S + 9045, 40, 101, API, "cargo build"),
+            typed(S + 9090, 2, 0, API, "cargo update -p ring"),
+            typed(S + 9095, 38, 0, API, "cargo build"),
+            typed(S + 9200, 0, 0, API, "git commit -m 'add a rate limiter'"),
+            typed(S + 9260, 0, 0, API, "git commit -m 'log rejected requests'"),
+            typed(S + 9400, 0, 0, API, "git reset --hard HEAD~2"),
+            typed(S + 9410, 0, 0, API, "git status"),
+            // It conflicted and was aborted: Git kept nothing of it.
+            typed(S + 9600, 0, 1, API, format!("git cherry-pick {} {}", &limiter[..7], &rejected[..7])),
+            typed(S + 9620, 0, 0, API, "git cherry-pick --abort"),
+            typed(S + 9900, 0, 0, API, "git commit -m 'add a health endpoint'"),
+        ];
+
+        let infra = repo("infra");
+        let g = |at: i64, args: &[&str]| git(&infra, at, args);
+        g(S + 10900, &["init", "-q", "-b", "main"]);
+        std::fs::write(infra.join("main.tf"), "timeout = 10\n").unwrap();
+        g(S + 10900, &["add", "main.tf"]);
+        g(S + 10900, &["commit", "-q", "-m", "add the terraform modules"]);
+        g(S + 11060, &["switch", "-q", "-c", "fix/timeout"]);
+        std::fs::write(infra.join("main.tf"), "timeout = 30\n").unwrap();
+        g(S + 11070, &["commit", "-q", "-am", "raise the request timeout to 30s"]);
+        let timeout = g(S + 11070, &["rev-parse", "HEAD"]);
+        g(S + 11120, &["switch", "-q", "main"]);
+        g(S + 11300, &["branch", "-q", "-D", "fix/timeout"]);
+        g(S + 11600, &["cherry-pick", &timeout]);
+        let picked = g(S + 11600, &["rev-parse", "HEAD"]);
+        let infra_story = [
+            typed(S + 10990, 0, 0, HOME, "cd ~/src/infra"),
+            typed(S + 11060, 0, 0, INFRA, "git switch -c fix/timeout"),
+            typed(S + 11070, 0, 0, INFRA, "git commit -am 'raise the request timeout to 30s'"),
+            typed(S + 11120, 0, 0, INFRA, "git switch main"),
+            typed(S + 11500, 0, 128, INFRA, "git switch fix/timeout"),
+            typed(S + 11600, 0, 0, INFRA, format!("git cherry-pick {}", &timeout[..7])),
+            typed(S + 11610, 0, 0, INFRA, "git log --oneline -2"),
+        ];
+        let deleted = [
+            claude(INFRA, S + 11290, "user", r#""delete the branches nobody needs""#),
+            claude(INFRA, S + 11300, "assistant", &bash_call("i1", "git branch -D fix/timeout")),
+            claude(INFRA, S + 11301, "user", &bash_result("i1", &format!("Deleted branch fix/timeout (was {}).", &timeout[..7]))),
+        ];
+
+        let hooks = self.input.join("hooks");
+        for (story, session) in [(&billing_story[..], "zsh-1700106990-6001-1"), (&api_story, "zsh-1700108990-6002-1"), (&infra_story, "zsh-1700110990-6003-1")] {
+            append(&self.input.join("zsh_history"), &zsh_history(story));
+            std::fs::write(hooks.join(format!("{session}.frames")), frames(story)).unwrap();
+        }
+        let projects = self.input.join("claude/projects");
+        for (cwd, session, id) in [(BILLING, &discarded[..], "2c4f7a90-1b3d-4e5f-8a6b-7c8d9e0f1a2b"), (INFRA, &deleted[..], "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a")] {
+            let project = projects.join(cwd.replace('/', "-"));
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join(format!("{id}.jsonl")), session.concat()).unwrap();
+        }
+        self.import(&[self.input.join("zsh_history").to_str().unwrap(), "--shell", "zsh"]);
+        self.import(&["--hooks", hooks.to_str().unwrap()]);
+        self.import(&["--claude", projects.to_str().unwrap()]);
+        for repo in [&billing, &api, &infra] {
+            self.import(&[repo.to_str().unwrap()]);
+        }
+
+        // A week of feature branches in `site`, merged and deleted, and api
+        // run and tested beside it.
+        let site = repo("site");
+        let g = |at: i64, args: &[&str]| git(&site, at, args);
+        g(S + 19900, &["init", "-q", "-b", "main"]);
+        g(S + 19900, &["commit", "-q", "--allow-empty", "-m", "site: first page"]);
+        let mut week = vec![typed(S + 19990, 0, 0, HOME, "cd ~/src/site")];
+        for (i, feature) in ["header-spacing", "footer-links", "dark-mode", "rss-feed", "typo-fixes", "image-sizes"].iter().enumerate() {
+            let at = S + 20_000 + 600 * i as i64;
+            g(at, &["switch", "-q", "-c", feature]);
+            g(at + 120, &["commit", "-q", "--allow-empty", "-m", &format!("site: {feature}")]);
+            g(at + 180, &["switch", "-q", "main"]);
+            g(at + 240, &["merge", "-q", feature]);
+            g(at + 300, &["branch", "-q", "-d", feature]);
+            week.extend([
+                typed(at, 0, 0, SITE, format!("git switch -c {feature}")),
+                typed(at + 60, 12, 0, SITE, "npm run build"),
+                typed(at + 120, 0, 0, SITE, format!("git commit -am 'site: {feature}'")),
+                typed(at + 180, 0, 0, SITE, "git switch main"),
+                typed(at + 240, 0, 0, SITE, format!("git merge {feature}")),
+                typed(at + 300, 0, 0, SITE, format!("git branch -d {feature}")),
+                typed(at + 360, 0, 0, SITE, "git log --oneline -3"),
+                typed(at + 420, 0, 0, SITE, "git status"),
+                // Back in api the same day, so its newer records are not the story.
+                typed(at + 480, 30, 0, API, "cargo test"),
+                typed(at + 520, 8, 0, API, "cargo clippy"),
+                typed(at + 540, 2, 0, API, "cargo run -- --port 8080"),
+            ]);
+        }
+        append(&self.input.join("zsh_history"), &zsh_history(&week));
+        std::fs::write(hooks.join("zsh-1700119990-6004-1.frames"), frames(&week)).unwrap();
+        self.import(&[self.input.join("zsh_history").to_str().unwrap(), "--shell", "zsh"]);
+        self.import(&["--hooks", hooks.to_str().unwrap()]);
+        self.import(&[site.to_str().unwrap()]);
+        Later { tax, limiter, rejected, timeout, picked }
     }
 
     /// `relic` on this fixture's store, with its home.
@@ -229,11 +404,11 @@ fn frames(story: &[Typed]) -> Vec<u8> {
         .into_bytes()
 }
 
-/// One Claude Code 2.1.318 record in `shop`, at `at` seconds.
-fn claude(at: i64, kind: &str, content: &str) -> String {
+/// One Claude Code 2.1.318 record of a session in `cwd`, at `at` seconds.
+fn claude(cwd: &str, at: i64, kind: &str, content: &str) -> String {
     let time = relic::app::format_utc(at * 1000).replace(' ', "T");
     format!(
-        r#"{{"type":"{kind}","version":"2.1.318","timestamp":"{time}:{:02}.000Z","cwd":"{SHOP}","gitBranch":"main","message":{{"content":{content}}}}}"#,
+        r#"{{"type":"{kind}","version":"2.1.318","timestamp":"{time}:{:02}.000Z","cwd":"{cwd}","gitBranch":"main","message":{{"content":{content}}}}}"#,
         at % 60
     ) + "\n"
 }

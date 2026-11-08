@@ -39,6 +39,10 @@ fn the_same_seed_builds_the_same_store_and_another_seed_other_noise() {
     let stable = |r: &Recovery| -> Vec<_> { rows(&r.db).into_iter().map(|(k, t, s)| (k, if k == REF { None } else { t }, s)).collect() };
     let (a, b, c) = (Recovery::build(Variant::Answerable, 7), Recovery::build(Variant::Answerable, 7), Recovery::build(Variant::Answerable, 8));
     assert_eq!((&a.lost, &a.deleted), (&b.lost, &b.deleted));
+    // With the seeded investigations' legs too.
+    let (x, y) = (a.import_investigations(), b.import_investigations());
+    assert_eq!([x.tax, x.limiter, x.rejected, x.timeout, x.picked], [y.tax, y.limiter, y.rejected, y.timeout, y.picked]);
+    c.import_investigations();
     assert_eq!(stable(&a), stable(&b));
     let (a, c) = (stable(&a), stable(&c));
     assert_ne!(texts(&a, ZSH)[..NOISE], texts(&c, ZSH)[..NOISE]);
