@@ -138,7 +138,7 @@ mod tests {
             &tx,
         );
         drop(tx);
-        for a in rx.iter() {
+        for a in &rx {
             update(&mut m, a);
         }
         let r = &m.recall;

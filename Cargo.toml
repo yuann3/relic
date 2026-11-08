@@ -39,6 +39,8 @@ semicolon_if_nothing_returned = "warn"
 cast_lossless = "warn"
 # `.map(f).unwrap_or(a)` is `.map_or(a, f)`.
 map_unwrap_or = "warn"
+# `for x in v.iter()` is `for x in &v`.
+explicit_iter_loop = "warn"
 
 [[bin]]
 name = "relic"

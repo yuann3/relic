@@ -65,7 +65,7 @@ impl Theme {
 pub fn view(frame: &mut Frame, m: &UiModel) {
     workspace(frame, m);
     if m.ascii {
-        for cell in frame.buffer_mut().content.iter_mut() {
+        for cell in &mut frame.buffer_mut().content {
             if !cell.symbol().is_ascii() {
                 let c = ascii_for(cell.symbol());
                 cell.set_char(c);
