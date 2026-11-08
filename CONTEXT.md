@@ -40,7 +40,7 @@ Relic imports local experience artifacts: shell history, shell hooks, Git and ag
 | Reuse Evaluation | every context above it. It drives the full path and reads Skill Catalog metadata for the pre-recall host step. |
 | Presentation | Source Ingestion, Search, Recall, Model Boundary, Validation, Skill Catalog, all through `src/app.rs` |
 
-The pre-recall skill match is a host step that runs before Recall. It is not part of Recall's operator kernel ([0016](docs/adr/0016-acceptance-fixture-and-reuse-gate.md)).
+The pre-recall skill match is a host step that runs before Recall. It is not part of Recall's operator kernel ([0016](docs/adr/0016-acceptance-fixture-and-reuse-gate.md)). When it picks a skill, Recall starts from it: the records the skill cites become an evidence handle and the first `last_inspection`, and every root state carries a `skill` field naming the skill and that handle. A cited record the user forgot is a note saying it is gone. No operator is added.
 
 ## Glossary
 
