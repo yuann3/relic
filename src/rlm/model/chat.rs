@@ -189,6 +189,11 @@ impl ChatCompletionsClient {
         })?)
     }
 
+    /// The model it asks for.
+    pub fn model(&self) -> &str {
+        &self.config.model
+    }
+
     pub fn new(config: ChatConfig) -> Result<Self, String> {
         let (origin, local) = origin(&config.base_url)?;
         let endpoint = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));

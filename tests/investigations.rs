@@ -8,11 +8,11 @@
 //!
 //! Here the model is scripted on loopback, which checks the cases, the
 //! scoring and the meters. Real numbers come from the ignored test, against
-//! the model the `RELIC_MODEL_*` variables configure (as for `relic recall`):
+//! the model `relic recall` would ask, configured by the `RELIC_MODEL_*`
+//! variables or `~/.config/relic/env`:
 //!
 //! ```text
-//! RELIC_MODEL_PROFILE=… RELIC_MODEL_URL=… RELIC_MODEL_NAME=… RELIC_MODEL_API_KEY=… \
-//!   cargo nextest run --test investigations --run-ignored only --no-capture
+//! cargo nextest run --test investigations --run-ignored only --no-capture
 //! ```
 //!
 //! It prints a line per arm and writes JSON lines to
@@ -510,8 +510,9 @@ fn summary(arm: Arm, rows: &[Value]) -> Value {
 #[test]
 #[ignore = "asks the model RELIC_MODEL_* configures: real calls, time and money"]
 fn against_the_configured_model() {
-    let model: Arc<dyn ModelBoundary> = Arc::new(ChatCompletionsClient::from_env().unwrap_or_else(|e| panic!("{e}")));
-    let configured = std::env::var("RELIC_MODEL_NAME").unwrap();
+    let client = ChatCompletionsClient::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let configured = client.model().to_string();
+    let model: Arc<dyn ModelBoundary> = Arc::new(client);
     let out = std::env::var_os("RELIC_INVESTIGATIONS_OUT")
         .map_or_else(|| Path::new(env!("CARGO_TARGET_TMPDIR")).join("investigations.jsonl"), PathBuf::from);
     run(&bench(), &out, &configured, &|_| Arc::clone(&model));
