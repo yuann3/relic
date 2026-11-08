@@ -30,6 +30,8 @@ use_debug = "warn"
 unreachable = "warn"
 # `.map(|s| s.as_str())` where `.map(String::as_str)` names the method.
 redundant_closure_for_method_calls = "warn"
+# `s.push_str(&format!(..))` builds a String only to copy it; `write!` into s.
+format_push_string = "warn"
 
 [[bin]]
 name = "relic"

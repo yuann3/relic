@@ -9,6 +9,8 @@
 //! a recorded command is shown by id for `relic show`, and step prose or a
 //! description is refused (docs/research/validation-skill-packaging.md).
 
+use std::fmt::Write as _;
+
 use crate::app::{When, source_label};
 use crate::domain::ObservationKind;
 
@@ -151,7 +153,7 @@ pub fn render(
         let marker = format!("{}. ", n + 1);
         // What continues a list item is indented as wide as its marker.
         let pad = " ".repeat(marker.len());
-        md.push_str(&format!("\n{marker}{text}\n"));
+        let _ = write!(md, "\n{marker}{text}\n");
         for r in &step.records {
             let when = r.observed_at_ms.map_or(When::Unknown, When::At).label();
             let when = when.trim();
@@ -165,11 +167,12 @@ pub fn render(
             if hazard(r.text).is_some() || r.text.contains('\r') {
                 // The label alone: what the hook saw holds a directory name,
                 // as hostile as the command.
-                md.push_str(&format!(
+                let _ = write!(
+                    md,
                     "\n{pad}{label}) is not copied here, because an agent would not see it exactly as recorded. \
                      Read it exactly with `relic show {}`.\n",
                     r.id
-                ));
+                );
                 continue;
             }
             // A hook record's last line is what the hook saw, not part of
@@ -190,11 +193,11 @@ pub fn render(
             // Longer than any backtick run inside, so the text cannot close it.
             let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
             let fence = "`".repeat(longest.max(2) + 1);
-            md.push_str(&format!("\n{pad}{label}:\n\n{pad}{fence}text\n"));
+            let _ = write!(md, "\n{pad}{label}:\n\n{pad}{fence}text\n");
             for line in text.split('\n') {
-                md.push_str(&format!("{pad}{line}\n"));
+                let _ = writeln!(md, "{pad}{line}");
             }
-            md.push_str(&format!("{pad}{fence}\n"));
+            let _ = writeln!(md, "{pad}{fence}");
         }
     }
     md.push_str(

@@ -10,6 +10,7 @@
 //! which takes minutes instead of the full run's ~40.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -859,7 +860,7 @@ fn end_to_end(path: &Path, name: &str, with_store: bool, runs: usize) {
                 let (s, _) = measure(runs, || {
                     app::search(store, &req, &far()).unwrap().hits.len()
                 });
-                line.push_str(&format!(" {} |", cell(s)));
+                let _ = write!(line, " {} |", cell(s));
             } else if store.is_some() {
                 line.push_str(" n/a |");
             }
@@ -1309,7 +1310,7 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
         let mut header =
             "| query | class | `*` chars | terms under last token | postings under last token | matches |".to_owned();
         for &vi in &variants {
-            header.push_str(&format!(" {} |", HOT_SCHEMAS[vi].name));
+            let _ = write!(header, " {} |", HOT_SCHEMAS[vi].name);
         }
         println!("{header}");
         println!("|---|---|---|---|---|---|{}", "---|".repeat(variants.len()));
@@ -1332,7 +1333,7 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
             for row in &timed {
                 let (s, rows) = &row[ki];
                 let same = rows == &timed[0][ki].1;
-                line.push_str(&format!(" {}{} |", p95(*s), if same { "" } else { " !" }));
+                let _ = write!(line, " {}{} |", p95(*s), if same { "" } else { " !" });
             }
             println!("{line}");
         }
