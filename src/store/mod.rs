@@ -98,7 +98,9 @@ pub struct StatHint {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cursor {
     pub stat: StatHint,
-    /// Byte end of the last committed record.
+    /// Byte end of the last committed record. A Git source has no bytes:
+    /// there it is the newest reflog `observed_at_ms` imported, so an older
+    /// entry the store lacks is known to be forgotten.
     pub stable_len: i64,
     /// Keyed hash of the bytes just before `stable_len`. `None` proves
     /// nothing about the prefix, so the next import must not trust it.

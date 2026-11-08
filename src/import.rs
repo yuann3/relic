@@ -387,6 +387,12 @@ pub fn import_git(
     for (kind, at, text) in source.records()? {
         *known.entry(key(kind, at, text)).or_default() += 1;
     }
+    // The newest reflog time an earlier import saw. An entry before it that
+    // the store lacks was stored and then forgotten: Git still holds it, but
+    // storing it again would undo `relic forget`. One forgotten in that very
+    // second comes back, as a move Git makes later in it must be stored.
+    let forgotten_before = source.newest().map_or(0, |n| n.cursor.stable_len);
+    let mut high_water = forgotten_before;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -401,12 +407,20 @@ pub fn import_git(
             source::git::RecordKind::Reflog => r.timestamp.and_then(|t| t.checked_mul(1000)),
             source::git::RecordKind::Ref => Some(now_ms),
         };
+        if kind == ObservationKind::GitReflog {
+            high_water = high_water.max(observed_at_ms.unwrap_or(0));
+        }
         let safe_text = redactor.import(&r.text);
         if let Some(n) = known
             .get_mut(&key(kind, observed_at_ms, safe_text.clone()))
             .filter(|n| **n > 0)
         {
             *n -= 1;
+            continue;
+        }
+        if kind == ObservationKind::GitReflog
+            && observed_at_ms.is_some_and(|at| at < forgotten_before)
+        {
             continue;
         }
         let flags = if r.lossy { FLAG_LOSSY } else { 0 };
@@ -440,9 +454,13 @@ pub fn import_git(
     for o in &fresh {
         revision.insert(o)?;
     }
-    // No cursor: Git is asked again on every import, never stat-skipped.
+    // Git is asked again on every import, never stat-skipped: the cursor
+    // keeps only the reflog's high-water mark.
     revision.commit(
-        &Cursor::default(),
+        &Cursor {
+            stable_len: high_water,
+            ..Cursor::default()
+        },
         Provenance::COMMAND.with(Provenance::OBSERVED_AT),
     )?;
     result.checkpoint_blocked = checkpoint_blocked(store, fresh.len())?;
@@ -2186,8 +2204,8 @@ mod tests {
         );
         git_at(repo, 1_700_000_100, &["reset", "-q", "--hard", "HEAD"]);
         // Long after the commit it points at: stored when the ref moved, not
-        // by commit date.
-        git_at(repo, 1_700_000_200, &["branch", "late", "HEAD~2"]);
+        // by commit date. In the newest second, which a repeat can join.
+        git_at(repo, 1_700_000_100, &["branch", "late", "HEAD~2"]);
         let mut store = Store::open_memory().unwrap();
         import_git(&mut store, read_git(repo), &Redactor::new()).unwrap();
         let rows = git_texts(&store);
@@ -2210,6 +2228,52 @@ mod tests {
         git_at(repo, 1_700_000_100, &["reset", "-q", "--hard", "HEAD"]);
         let again = import_git(&mut store, read_git(repo), &Redactor::new()).unwrap();
         assert_eq!((again.reflog_stored, again.refs_stored), (1, 0));
+    }
+
+    #[test]
+    fn a_forgotten_reflog_entry_stays_forgotten_and_a_later_move_like_it_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(repo, &["reset", "-q", "--hard", "HEAD"]);
+        // A newer entry that leaves HEAD where it is, so a later reset
+        // writes the forgotten entry's text again.
+        git_at(repo, 1_700_000_100, &["branch", "side"]);
+        let mut store = Store::open_memory().unwrap();
+        let redactor = Redactor::new();
+        import_git(&mut store, read_git(repo), &redactor).unwrap();
+        let reset = |store: &Store| {
+            store
+                .recent(1000)
+                .unwrap()
+                .into_iter()
+                .filter(|h| {
+                    h.safe_text.starts_with("git reflog HEAD ")
+                        && h.safe_text.ends_with(" reset: moving to HEAD")
+                })
+                .map(|h| (h.id, h.observed_at_ms))
+                .collect::<Vec<_>>()
+        };
+        let [(id, Some(1_700_000_000_000))] = reset(&store)[..] else {
+            panic!("{:#?}", git_texts(&store))
+        };
+        store.forget(&[id]).unwrap();
+
+        let again = import_git(&mut store, read_git(repo), &redactor).unwrap();
+        assert_eq!(
+            (again.outcome, again.reflog_stored, again.refs_stored),
+            (Outcome::Unchanged, 0, 0)
+        );
+        assert_eq!(reset(&store), []);
+
+        git_at(repo, 1_700_000_200, &["reset", "-q", "--hard", "HEAD"]);
+        let later = import_git(&mut store, read_git(repo), &redactor).unwrap();
+        assert_eq!((later.reflog_stored, later.refs_stored), (1, 0));
+        let [(_, at)] = reset(&store)[..] else {
+            panic!("{:#?}", git_texts(&store))
+        };
+        assert_eq!(at, Some(1_700_000_200_000));
     }
 
     #[test]
