@@ -881,3 +881,30 @@ fn reuse_gate_a_skill_makes_the_held_out_sibling_cheaper_and_still_verified() {
     let notes = r.notes.to_str().unwrap();
     ok(&relic(&["validate", report2.to_str().unwrap(), "--cwd", notes, "--", "git", "rev-parse", "--verify", "release-draft"]));
 }
+
+/// The model settings file is read as a shell would `source` it, and a
+/// variable set in the environment wins over it.
+#[test]
+fn model_settings_come_from_the_settings_file_unless_the_environment_sets_them() {
+    let config = tempfile::tempdir().unwrap();
+    std::fs::create_dir(config.path().join("relic")).unwrap();
+    let check = |file: &str, env: &[(&str, &str)]| {
+        std::fs::write(config.path().join("relic/env"), file).unwrap();
+        let mut relic = Command::new(env!("CARGO_BIN_EXE_relic"));
+        relic.args(["model", "check"]).env("XDG_CONFIG_HOME", config.path());
+        for k in ["PROFILE", "URL", "NAME", "API_KEY", "OUTPUT", "TOKEN_FIELD", "PRICE_IN", "PRICE_OUT"] {
+            relic.env_remove(format!("RELIC_MODEL_{k}"));
+        }
+        let out = relic.envs(env.iter().copied()).output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        String::from_utf8(out.stderr).unwrap()
+    };
+    let stderr = check("# which preset\n\nRELIC_MODEL_PROFILE=\"bogus\"\n", &[]);
+    assert!(stderr.contains(r#"RELIC_MODEL_PROFILE "bogus" is not"#), "{stderr}");
+    let stderr = check("RELIC_MODEL_PROFILE='bogus'\n", &[("RELIC_MODEL_PROFILE", "")]);
+    assert!(stderr.contains(r#"RELIC_MODEL_PROFILE "bogus" is not"#), "{stderr}");
+    let stderr = check("RELIC_MODEL_PROFILE=bogus\n", &[("RELIC_MODEL_PROFILE", "llama_cpp")]);
+    assert!(stderr.contains("RELIC_MODEL_URL is required"), "{stderr}");
+    let stderr = check("RELIC_MODEL_PROFILE\n", &[]);
+    assert!(stderr.contains("relic/env:1: not KEY=VALUE"), "{stderr}");
+}

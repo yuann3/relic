@@ -98,7 +98,9 @@ MODEL:
     also appends them, with how the recall ended, to <db>.recall.log: one
     relic.recall-log/v1 JSON line each, metadata and record ids only.
     model check sends a synthetic request, never your history, and prints
-    a relic.model-check/v1 receipt. Configure the model with:
+    a relic.model-check/v1 receipt. Configure the model with these
+    variables, or with KEY=VALUE lines in $XDG_CONFIG_HOME/relic/env
+    (~/.config/relic/env); a variable set in the environment wins:
     RELIC_MODEL_PROFILE   openai (default), llama_cpp or custom
     RELIC_MODEL_URL       Base URL up to the API version. Default for openai:
                           https://api.openai.com/v1. Plain http only to a

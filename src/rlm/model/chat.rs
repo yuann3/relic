@@ -138,6 +138,38 @@ impl ChatConfig {
     }
 }
 
+/// The `KEY=VALUE` lines of `$XDG_CONFIG_HOME/relic/env` (else
+/// `~/.config/relic/env`), read as a shell would `source` them; none when the
+/// file is absent. Not a `.env` in the working directory: a cloned repository
+/// could ship one that sends your records and key to its own server.
+fn settings() -> Result<std::collections::HashMap<String, String>, String> {
+    let dir = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    // As for the database, a relative XDG value is ignored, or the settings
+    // would depend on where the command ran.
+    let Some(config) = dir("XDG_CONFIG_HOME").filter(|p| p.is_absolute()).or_else(|| dir("HOME").map(|h| h.join(".config")))
+    else {
+        return Ok(Default::default());
+    };
+    let path = config.join("relic/env");
+    let text = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        r => r.map_err(|e| format!("{}: {e}", path.display()))?,
+    };
+    let mut vars = std::collections::HashMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (k, v) = line.split_once('=').ok_or_else(|| format!("{}:{}: not KEY=VALUE", path.display(), n + 1))?;
+        let v = v.trim();
+        // `source` strips the quotes; a key kept in them would not authenticate.
+        let v = ['"', '\''].iter().find_map(|&q| v.strip_prefix(q)?.strip_suffix(q)).unwrap_or(v);
+        vars.insert(k.trim().to_string(), v.to_string());
+    }
+    Ok(vars)
+}
+
 pub struct ChatCompletionsClient {
     config: ChatConfig,
     endpoint: String,
@@ -148,9 +180,13 @@ pub struct ChatCompletionsClient {
 }
 
 impl ChatCompletionsClient {
-    /// Configured by the `RELIC_MODEL_*` variables ([`ChatConfig::from_env`]).
+    /// Configured by the `RELIC_MODEL_*` variables ([`ChatConfig::from_env`]),
+    /// each one unset or empty in the environment taken from [`settings`].
     pub fn from_env() -> Result<Self, String> {
-        Self::new(ChatConfig::from_env(|k| std::env::var(k).ok())?)
+        let file = settings()?;
+        Self::new(ChatConfig::from_env(|k| {
+            std::env::var(k).ok().filter(|v| !v.is_empty()).or_else(|| file.get(k).cloned())
+        })?)
     }
 
     pub fn new(config: ChatConfig) -> Result<Self, String> {
