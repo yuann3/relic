@@ -80,7 +80,7 @@ pub fn run(db: &Path) -> Result<()> {
         let (mb, tx) = (Arc::clone(&mailbox), tx.clone());
         let builder = std::thread::Builder::new().name("relic-search".into());
         crate::signal::spawn(builder, move || {
-            search_worker(&worker_store, &mb, &tx, debounce())
+            search_worker(&worker_store, &mb, &tx, debounce());
         })?
     };
     // Joined once the action channel is closed: a recall blocked on a full

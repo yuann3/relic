@@ -152,7 +152,7 @@ fn admit(c: &mut Calls, job: Job) -> Result<Result<Flight, String>, Stop> {
     let target = c.model.target();
     let mut audit = None;
     let req = match EgressRequest::new(job.role, job.payload, &target, c.ledger, &mut |a| {
-        audit = Some(a)
+        audit = Some(a);
     }) {
         Ok(req) => req,
         Err(EgressError::Budget(b)) => return Err(Stop::Budget(b)),

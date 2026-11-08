@@ -896,7 +896,7 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
             out.status.success(),
             "{}",
             String::from_utf8_lossy(&out.stderr)
-        )
+        );
     };
     let recall = |question: &str| {
         let sent = bodies.lock().unwrap().len();
@@ -1313,7 +1313,7 @@ fn reuse_gate_a_skill_makes_the_held_out_sibling_cheaper_and_still_verified() {
             out.status.success(),
             "{}",
             String::from_utf8_lossy(&out.stderr)
-        )
+        );
     };
     let log_path = db.with_extension("db.recall.log");
     let recall = |question: &str| -> (Value, Vec<Value>, Spent) {

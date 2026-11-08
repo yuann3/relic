@@ -32,6 +32,8 @@ unreachable = "warn"
 redundant_closure_for_method_calls = "warn"
 # `s.push_str(&format!(..))` builds a String only to copy it; `write!` into s.
 format_push_string = "warn"
+# A unit expression left without `;` reads as a value the block returns.
+semicolon_if_nothing_returned = "warn"
 
 [[bin]]
 name = "relic"

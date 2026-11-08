@@ -645,10 +645,10 @@ impl RecallLog {
             })),
             Progress::Replied { role: r, returned_model, usage } => {
                 let usage = usage.map(|u| serde_json::json!({"prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens}));
-                self.line("reply", serde_json::json!({"role": role(r), "model": returned_model, "usage": usage}))
+                self.line("reply", serde_json::json!({"role": role(r), "model": returned_model, "usage": usage}));
             }
             Progress::Retry { role: r, attempt, reason } => {
-                self.line("retry", serde_json::json!({"role": role(r), "attempt": attempt, "reason": redact(reason)}))
+                self.line("retry", serde_json::json!({"role": role(r), "attempt": attempt, "reason": redact(reason)}));
             }
             // Notes quote what the model wrote; the rest is in the finish line.
             Progress::RootCall { .. } | Progress::Op { .. } | Progress::ChildCall { .. } | Progress::Note(_) => {}
@@ -739,7 +739,7 @@ pub fn recall(
         {
             models.push(m.clone());
         }
-        progress(p)
+        progress(p);
     };
     let seed = picked.map(|s| SkillSeed {
         name: &s.name,

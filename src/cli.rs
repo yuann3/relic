@@ -289,7 +289,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                             "zsh" => SourceKind::Zsh,
                             "bash" => SourceKind::Bash,
                             other => return Err(format!("unknown shell: {other}")),
-                        })
+                        });
                     }
                     f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
                     _ if path.is_none() => path = Some(PathBuf::from(a)),
@@ -415,11 +415,11 @@ fn parse_skill(mut args: impl Iterator<Item = Result<String, String>>) -> Result
             "--db" => db = Some(value(&mut args, "--db")?.into()),
             "--name" if sub == "compile" => name = Some(value(&mut args, "--name")?),
             "--description" if sub == "compile" => {
-                description = Some(value(&mut args, "--description")?)
+                description = Some(value(&mut args, "--description")?);
             }
             "--user" if sub != "compile" => user = true,
             "--project" if sub != "compile" => {
-                project = Some(PathBuf::from(value(&mut args, "--project")?))
+                project = Some(PathBuf::from(value(&mut args, "--project")?));
             }
             "--claude" if sub != "compile" => claude = true,
             "--yes" if sub == "activate" => yes = true,

@@ -249,7 +249,7 @@ mod tests {
         let mut ledger = BudgetLedger::new(BudgetV1::prototype_default());
         let mut audits = Vec::new();
         let req = EgressRequest::new(Role::Child, payload, &target(), &mut ledger, &mut |a| {
-            audits.push(a)
+            audits.push(a);
         })
         .unwrap();
 
@@ -307,7 +307,7 @@ mod tests {
         );
         // The same payload fits a root request, whose cap is larger.
         EgressRequest::new(Role::Root, big, &target(), &mut ledger, &mut |_| {
-            audits += 1
+            audits += 1;
         })
         .unwrap();
         assert_eq!(audits, 1);
@@ -316,7 +316,7 @@ mod tests {
         budget.model_egress_bytes = 1000;
         let mut ledger = BudgetLedger::new(budget);
         let err = EgressRequest::new(Role::Child, json!({}), &target(), &mut ledger, &mut |_| {
-            audits += 1
+            audits += 1;
         })
         .unwrap_err();
         assert_eq!(err, EgressError::Budget(BudgetExhausted::ModelEgressBytes));

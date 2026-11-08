@@ -218,7 +218,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
             for (link, now) in links.iter().zip(catalog.rollback(&links)?) {
                 match now {
                     Some(hash) => {
-                        eprintln!("relic: {} points at {} again", shown(link), &hash[..12])
+                        eprintln!("relic: {} points at {} again", shown(link), &hash[..12]);
                     }
                     None => eprintln!("relic: removed {}", shown(link)),
                 }
@@ -356,13 +356,13 @@ fn run(cmd: Command) -> Result<ExitCode> {
             match r.outcome {
                 Outcome::Unchanged => eprintln!("{name}: unchanged since last import"),
                 Outcome::First => {
-                    eprintln!("{name}: stored {n} {} {what} in {}", r.kind, shown(&db))
+                    eprintln!("{name}: stored {n} {} {what} in {}", r.kind, shown(&db));
                 }
                 Outcome::Appended => eprintln!("{name}: added {n} new {what}"),
                 Outcome::Aligned => {
                     eprintln!(
                         "{name}: the file was rewritten; added {n} new {what} and kept the earlier ones"
-                    )
+                    );
                 }
                 Outcome::Superseded => eprintln!(
                     "{name}: the file was rewritten beyond what relic could align; stored it whole ({n} {what}) as a new revision and kept the earlier ones"

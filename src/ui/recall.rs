@@ -25,7 +25,7 @@ pub fn spawn(
 ) -> std::io::Result<JoinHandle<()>> {
     let builder = std::thread::Builder::new().name(format!("relic-recall-{op}"));
     crate::signal::spawn(builder, move || {
-        run(op, &question, &store, model, &log, &cancel, &tx)
+        run(op, &question, &store, model, &log, &cancel, &tx);
     })
 }
 

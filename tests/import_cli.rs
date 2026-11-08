@@ -322,7 +322,7 @@ fn a_write_open_leaves_relics_own_files_owner_only() {
     let mode =
         |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     let loosen = |path: &std::path::Path, mode| {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     };
 
     let home = tempfile::tempdir().unwrap();

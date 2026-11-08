@@ -961,7 +961,7 @@ mod tests {
             &Arc::default(),
             &mut |p| {
                 if let Progress::Note(n) = p {
-                    notes.push(n)
+                    notes.push(n);
                 }
             },
         );
