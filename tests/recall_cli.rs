@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
+#[expect(dead_code, reason = "the gate builds only the answerable variant")]
+mod recovery;
+
 /// Every request body the server was sent, in arrival order.
 type Bodies = Arc<Mutex<Vec<String>>>;
 
@@ -694,4 +697,178 @@ fn record_of(report: &Value, needle: &str) -> i64 {
     let hits: Vec<&Value> = report["evidence"].as_array().unwrap().iter().filter(|e| e["text"].as_str().unwrap().contains(needle)).collect();
     assert_eq!(hits.len(), 1, "{report}");
     hits[0]["id"].as_i64().unwrap()
+}
+
+/// The evidence id of the first item at `items` (`last_inspection` or the
+/// skill's) whose first line is `first`, or whose text holds `needle`.
+fn item(state: &Value, at: &str, matches: impl Fn(&str) -> bool) -> Value {
+    let items = match at {
+        "skill" => &state["skill"]["items"],
+        _ => &state["last_inspection"]["items"],
+    };
+    let found = items.as_array().unwrap().iter().find(|i| matches(i["safe_text"].as_str().unwrap()));
+    found.unwrap_or_else(|| panic!("no {at} item matches: {state}"))["evidence_id"].clone()
+}
+
+fn first_line(line: &'static str) -> impl Fn(&str) -> bool {
+    move |t: &str| t.lines().next() == Some(line)
+}
+
+/// One scripted model, standing in for recorded responses, that plays both
+/// runs by one policy: with no skill it searches broadly and has helpers
+/// judge what it found; with a skill it searches only for what the skill
+/// does not hold, the thing this question lost, and finishes from both.
+fn recorded_model(state: &Value) -> Option<Value> {
+    if is_child(state) {
+        let packet = &state["packet"];
+        let assessments: Vec<Value> = packet["items"].as_array().unwrap().iter().map(|i| {
+            let text = i["safe_text"].as_str().unwrap();
+            let relevant = text.contains("reflog") || text.contains("rescue");
+            let verdict = if relevant { "supports" } else { "irrelevant" };
+            let claims = if relevant { json!([{"text": "it is part of the rescue", "supports": [i["evidence_id"]]}]) } else { json!([]) };
+            json!({"item_id": i["item_id"], "verdict": verdict, "confidence": "high", "claims": claims})
+        }).collect();
+        return Some(json!({"version": 1, "packet_id": packet["packet_id"], "assessments": assessments}));
+    }
+    let skilled = state.get("skill").is_some();
+    Some(match (state["state_version"].as_u64().unwrap(), skilled) {
+        (0, false) => plan(json!([
+            {"op": "search", "op_id": "s1", "terms": ["rescue"], "match": "any", "limit": 20},
+            {"op": "expand", "op_id": "e1", "input": {"output": "s1"}, "scope": "same_source", "before": 2, "after": 0, "limit": 40},
+            {"op": "assess", "op_id": "a1", "input": {"output": "e1"}, "objective": "how the lost commit was recovered", "max_items": 64},
+            {"op": "select", "op_id": "k1", "input": {"output": "a1"}, "verdicts": ["supports"], "limit": 20},
+            {"op": "inspect", "op_id": "i1", "input": {"output": "k1"}, "limit": 20, "max_item_bytes": 2048},
+        ])),
+        (0, true) => plan(json!([
+            {"op": "search", "op_id": "s1", "terms": ["stash", "draft"], "match": "all", "limit": 20},
+            {"op": "inspect", "op_id": "i1", "input": {"output": "s1"}, "limit": 20, "max_item_bytes": 2048},
+        ])),
+        (v, false) => finish(v, json!({"status": "answered", "answer": "rescue holds the commit git reset lost.",
+            "claims": [{"text": "rescue points at the lost commit", "supports": [item(state, "inspection", |t| t.starts_with("git ref refs/heads/rescue"))]}],
+            "procedure": [
+                {"text": "Find the lost commit in the reflog", "supports": [item(state, "inspection", first_line("git reflog"))]},
+                {"text": "Put a branch on it", "supports": [item(state, "inspection", first_line("git branch rescue HEAD@{1}"))]},
+            ]})),
+        (v, true) => {
+            let stash = item(state, "inspection", |t| t.starts_with("git reflog refs/stash "));
+            finish(v, json!({"status": "answered", "answer": "The dropped stash is still in the stash reflog.",
+                "claims": [{"text": "the stash reflog names the dropped draft", "supports": [stash]}],
+                "procedure": [
+                    {"text": "Find the dropped stash in the reflog", "supports": [item(state, "skill", first_line("git reflog")), stash]},
+                    {"text": "Put a branch on it", "supports": [item(state, "skill", first_line("git branch rescue HEAD@{1}"))]},
+                ]}))
+        }
+    })
+}
+
+/// What one recall spent, from its report and its lines of the recall log.
+struct Spent {
+    calls: u64,
+    egress_bytes: u64,
+    /// Prompt plus completion tokens, where the provider reported them.
+    tokens: Option<u64>,
+    wall: std::time::Duration,
+}
+
+/// R3 (#41), the CI reuse gate of ADR 0016, on the Git-recovery fixture and
+/// recorded responses: run 1 recovers `shop`'s lost commit with no skill,
+/// and its validated procedure becomes the active skill; run 2 recovers the
+/// held-out `notes` sibling's dropped stash with it, picks it before any
+/// operator runs, spends fewer calls and egress bytes, and the user's
+/// verifier passes on what it recovered.
+#[test]
+fn reuse_gate_a_skill_makes_the_held_out_sibling_cheaper_and_still_verified() {
+    let mut r = recovery::Recovery::build(recovery::Variant::Answerable, 7);
+    let (url, bodies) = serve(recorded_model);
+    // Owned: importing the sibling needs `r` mutably between the runs.
+    let (db, home) = (r.db.clone(), r.home.clone());
+    let relic = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_relic"))
+            .args(args)
+            .env("RELIC_DB", &db)
+            .env("HOME", &home)
+            .env_remove("RELIC_MODEL_API_KEY")
+            .env("RELIC_MODEL_PROFILE", "llama_cpp")
+            .env("RELIC_MODEL_URL", &url)
+            .env("RELIC_MODEL_NAME", "scripted")
+            .output()
+            .unwrap()
+    };
+    let ok = |out: &Output| assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let log_path = db.with_extension("db.recall.log");
+    let recall = |question: &str| -> (Value, Vec<Value>, Spent) {
+        let sent = bodies.lock().unwrap().len();
+        let started = std::time::Instant::now();
+        let out = relic(&["recall", question, "--json"]);
+        let wall = started.elapsed();
+        ok(&out);
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let log: Vec<Value> = std::fs::read_to_string(&log_path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let id = log.last().unwrap()["recall"].clone();
+        let lines: Vec<Value> = log.into_iter().filter(|l| l["recall"] == id).collect();
+        let of = |event: &'static str| lines.iter().filter(move |l| l["event"] == event);
+        let usage: Vec<&Value> = of("reply").map(|l| &l["usage"]).collect();
+        let tokens = usage.iter().all(|u| u.is_object()).then(|| {
+            usage.iter().map(|u| u["prompt_tokens"].as_u64().unwrap() + u["completion_tokens"].as_u64().unwrap()).sum()
+        });
+        let spent = Spent {
+            calls: report["root_calls"].as_u64().unwrap() + report["child_calls"].as_u64().unwrap(),
+            egress_bytes: of("send").map(|l| l["bytes"].as_u64().unwrap()).sum(),
+            tokens,
+            wall,
+        };
+        // The log counts every request the server saw, and nothing else.
+        assert_eq!(of("send").count(), bodies.lock().unwrap().len() - sent);
+        (report, lines, spent)
+    };
+
+    // Run 1: no skill. The procedure is validated where it ran, then
+    // compiled and activated for the user.
+    let (report, lines, run1) = recall("how did I get back the commit git reset lost?");
+    assert!(report.get("skill").is_none() && !lines.iter().any(|l| l["event"] == "skill"), "{report}");
+    assert_eq!(report["outcome"], "answered", "{report}");
+    assert!(report["child_calls"].as_u64() > Some(0), "run 1 had helpers judge: {report}");
+    let report1 = r.db.with_file_name("run1.json");
+    std::fs::write(&report1, serde_json::to_vec(&report).unwrap()).unwrap();
+    let shop = r.shop.to_str().unwrap();
+    ok(&relic(&["validate", report1.to_str().unwrap(), "--cwd", shop, "--", "git", "rev-parse", "--verify", "rescue"]));
+    ok(&relic(&["skill", "compile", report1.to_str().unwrap(), "--name", "git-reflog-recovery", "--description",
+        "Recover lost Git work, such as commits, branches or stashes, from the reflog"]));
+    std::fs::create_dir_all(r.home.join(".agents/skills")).unwrap();
+    ok(&relic(&["skill", "activate", "git-reflog-recovery", "--user", "--yes"]));
+
+    // Run 2: the held-out sibling, unseen when the skill was compiled.
+    r.import_sibling();
+    let stash = r.stash.clone().unwrap();
+    let sent = bodies.lock().unwrap().len();
+    let (report, lines, run2) = recall("I dropped a git stash by mistake, how do I recover it?");
+    assert_eq!(report["outcome"], "answered", "{report}");
+    // The exact skill, picked before any request, so before any search or
+    // expand: those run only on a plan, which only a reply can carry.
+    assert_eq!(report["skill"]["name"], "git-reflog-recovery");
+    let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
+    assert_eq!(&events[..3], ["start", "skill", "send"], "{events:?}");
+    assert_eq!(user_message(&bodies.lock().unwrap()[sent])["skill"]["name"], "git-reflog-recovery");
+    let show = |s: &Spent| {
+        let tokens = s.tokens.map_or("not reported".into(), |t| t.to_string());
+        format!("{} calls, {} egress bytes, {tokens} tokens, {} ms", s.calls, s.egress_bytes, s.wall.as_millis())
+    };
+    let gate = format!("run 1: {}; run 2: {}", show(&run1), show(&run2));
+    assert!(run2.calls < run1.calls, "model calls: {gate}");
+    assert!(run2.egress_bytes < run1.egress_bytes, "egress bytes: {gate}");
+    assert!(run1.tokens.is_some() && run2.tokens.is_some(), "the provider reported usage: {gate}");
+    // Reported, not gated: tokens follow bytes, and wall time is noise here.
+    eprintln!("reuse gate: {gate}");
+
+    // The user does what run 2 says, then the same kind of verifier passes.
+    let found = report["evidence"].as_array().unwrap().iter().find_map(|e| {
+        e["text"].as_str().unwrap().strip_prefix("git reflog refs/stash ").map(|rest| rest.split(' ').next().unwrap().to_string())
+    });
+    assert_eq!(found.as_deref(), Some(stash.as_str()), "{report}");
+    let branched = Command::new("git").arg("-C").arg(&r.notes).args(["branch", "release-draft", &stash]).output().unwrap();
+    assert!(branched.status.success(), "{}", String::from_utf8_lossy(&branched.stderr));
+    let report2 = r.db.with_file_name("run2.json");
+    std::fs::write(&report2, serde_json::to_vec(&report).unwrap()).unwrap();
+    let notes = r.notes.to_str().unwrap();
+    ok(&relic(&["validate", report2.to_str().unwrap(), "--cwd", notes, "--", "git", "rev-parse", "--verify", "release-draft"]));
 }
