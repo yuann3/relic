@@ -31,7 +31,10 @@ fn serve(script: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static) -> (S
 }
 
 /// [`serve`], saying `model` answered.
-fn serve_as(model: &'static str, script: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static) -> (String, Bodies) {
+fn serve_as(
+    model: &'static str,
+    script: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static,
+) -> (String, Bodies) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let bodies = Bodies::default();
@@ -67,13 +70,20 @@ fn answer(mut stream: TcpStream, model: &str, seen: &Bodies, script: &Script) {
         Some(content) => {
             // Usage as a provider reports it, a token for every 4 bytes.
             let content = content.to_string();
-            let usage = json!({"prompt_tokens": length / 4, "completion_tokens": content.len() / 4});
+            let usage =
+                json!({"prompt_tokens": length / 4, "completion_tokens": content.len() / 4});
             let reply = json!({"model": model, "choices": [{"message": {"content": content}, "finish_reason": "stop"}], "usage": usage});
             ("200 OK", reply.to_string())
         }
-        None => ("500 Internal Server Error", json!({"error": {"message": "the scripted model is down"}}).to_string()),
+        None => (
+            "500 Internal Server Error",
+            json!({"error": {"message": "the scripted model is down"}}).to_string(),
+        ),
     };
-    let head = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+    let head = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
     let _ = stream.write_all(format!("{head}{body}").as_bytes());
 }
 
@@ -93,8 +103,10 @@ fn supports_all(user: &Value, claim: &str) -> Value {
     let items = packet["items"].as_array().unwrap();
     let assessments: Vec<Value> = items
         .iter()
-        .map(|i| json!({"item_id": i["item_id"], "verdict": "supports", "confidence": "high",
-            "claims": [{"text": claim, "supports": [i["evidence_id"]]}]}))
+        .map(|i| {
+            json!({"item_id": i["item_id"], "verdict": "supports", "confidence": "high",
+            "claims": [{"text": claim, "supports": [i["evidence_id"]]}]})
+        })
         .collect();
     json!({"version": 1, "packet_id": packet["packet_id"], "assessments": assessments})
 }
@@ -114,12 +126,17 @@ fn inspected(state: &Value) -> &Vec<Value> {
 
 /// The evidence id of the inspected item whose text holds `needle`.
 fn cite(state: &Value, needle: &str) -> Value {
-    let item = inspected(state).iter().find(|i| i["safe_text"].as_str().unwrap().contains(needle));
-    item.unwrap_or_else(|| panic!("no inspected item holds {needle:?}: {state}"))["evidence_id"].clone()
+    let item = inspected(state)
+        .iter()
+        .find(|i| i["safe_text"].as_str().unwrap().contains(needle));
+    item.unwrap_or_else(|| panic!("no inspected item holds {needle:?}: {state}"))["evidence_id"]
+        .clone()
 }
 
 /// Search `certbot` and inspect what it found, then answer with `answer`.
-fn search_then(answer: impl Fn(&Value) -> Value + Send + Sync + 'static) -> impl Fn(&Value) -> Option<Value> + Send + Sync {
+fn search_then(
+    answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
+) -> impl Fn(&Value) -> Option<Value> + Send + Sync {
     move |state| {
         Some(match state["state_version"].as_u64().unwrap() {
             0 => plan(json!([
@@ -146,13 +163,25 @@ fn relic(args: &[&str], db: &Path, url: &str) -> Output {
 }
 
 fn import(db: &Path, hist: &Path, shell: &str) {
-    let out = relic(&["import", hist.to_str().unwrap(), "--shell", shell], db, "");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = relic(
+        &["import", hist.to_str().unwrap(), "--shell", shell],
+        db,
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn store_with(dir: &Path, commands: &[&str]) -> PathBuf {
     let hist = dir.join("zsh_history");
-    let lines: String = commands.iter().enumerate().map(|(i, c)| format!(": {}:0;{c}\n", 1_700_000_000 + i)).collect();
+    let lines: String = commands
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!(": {}:0;{c}\n", 1_700_000_000 + i))
+        .collect();
     std::fs::write(&hist, lines).unwrap();
     let db = dir.join("relic.db");
     import(&db, &hist, "zsh");
@@ -163,12 +192,22 @@ fn store_with(dir: &Path, commands: &[&str]) -> PathBuf {
 fn record_id(db: &Path, text: &str) -> i64 {
     let out = relic(&["search", "--json", "certbot"], db, "");
     let page: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let hits: Vec<&Value> = page["hits"].as_array().unwrap().iter().filter(|h| h["text"] == text).collect();
+    let hits: Vec<&Value> = page["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|h| h["text"] == text)
+        .collect();
     assert_eq!(hits.len(), 1, "{page}");
     hits[0]["id"].as_i64().unwrap()
 }
 
-const CERTBOT: &[&str] = &["ls", "certbot renew --nginx -d example.com", "certbot certificates", "git status"];
+const CERTBOT: &[&str] = &[
+    "ls",
+    "certbot renew --nginx -d example.com",
+    "certbot certificates",
+    "git status",
+];
 
 #[test]
 fn an_answer_cites_the_records_it_rests_on_by_id() {
@@ -187,8 +226,14 @@ fn an_answer_cites_the_records_it_rests_on_by_id() {
     assert_eq!(report["schema"], "relic.recall/v1");
     assert_eq!(report["outcome"], "answered");
     assert_eq!(report["question"], "how did I renew");
-    assert_eq!(report["claims"], json!([{"text": "certbot renew ran", "supports": [renew], "contradicts": [certs]}]));
-    assert_eq!(report["procedure"], json!([{"text": "Run certbot renew --nginx", "supports": [renew]}]));
+    assert_eq!(
+        report["claims"],
+        json!([{"text": "certbot renew ran", "supports": [renew], "contradicts": [certs]}])
+    );
+    assert_eq!(
+        report["procedure"],
+        json!([{"text": "Run certbot renew --nginx", "supports": [renew]}])
+    );
     let evidence: Vec<(i64, &str)> = report["evidence"]
         .as_array()
         .unwrap()
@@ -196,46 +241,126 @@ fn an_answer_cites_the_records_it_rests_on_by_id() {
         .map(|e| (e["id"].as_i64().unwrap(), e["text"].as_str().unwrap()))
         .collect();
     assert_eq!(evidence, [(renew, CERTBOT[1]), (certs, CERTBOT[2])]);
-    assert_eq!((report["root_calls"].as_u64(), bodies.lock().unwrap().len()), (Some(2), 2));
+    assert_eq!(
+        (report["root_calls"].as_u64(), bodies.lock().unwrap().len()),
+        (Some(2), 2)
+    );
     // A model on loopback bills nothing; the server named itself.
-    assert_eq!((&report["cost_microusd"], &report["models"]), (&json!(0), &json!(["scripted"])));
+    assert_eq!(
+        (&report["cost_microusd"], &report["models"]),
+        (&json!(0), &json!(["scripted"]))
+    );
     // The payload audit: each request's size and destination, on stderr.
     let origin = url.trim_end_matches("/v1");
-    assert_eq!(stderr.matches("send a root request of ").count(), 2, "{stderr}");
-    assert!(stderr.contains(&format!("to {origin} (llama_cpp)")), "{stderr}");
+    assert_eq!(
+        stderr.matches("send a root request of ").count(),
+        2,
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("to {origin} (llama_cpp)")),
+        "{stderr}"
+    );
 
     // The log: what was sent and how it ended, under one recall id, and no
     // evidence text, which would outlive `forget`.
     let log_path = dir.path().join("relic.db.recall.log");
     let log = std::fs::read_to_string(&log_path).unwrap();
-    let lines: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let lines: Vec<Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
     let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
-    assert_eq!(events, ["start", "send", "reply", "send", "reply", "finish"], "{log}");
-    assert!(lines.iter().all(|l| l["schema"] == "relic.recall-log/v1" && l["recall"] == lines[0]["recall"]), "{log}");
-    assert_eq!((&lines[0]["origin"], &lines[0]["profile"]), (&json!(origin), &json!("llama_cpp")));
-    assert_eq!((&lines[1]["role"], &lines[2]["model"]), (&json!("root"), &json!("scripted")));
+    assert_eq!(
+        events,
+        ["start", "send", "reply", "send", "reply", "finish"],
+        "{log}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|l| l["schema"] == "relic.recall-log/v1" && l["recall"] == lines[0]["recall"]),
+        "{log}"
+    );
+    assert_eq!(
+        (&lines[0]["origin"], &lines[0]["profile"]),
+        (&json!(origin), &json!("llama_cpp"))
+    );
+    assert_eq!(
+        (&lines[1]["role"], &lines[2]["model"]),
+        (&json!("root"), &json!("scripted"))
+    );
     // The tokens the provider said the call took, as it said them.
     let sent = bodies.lock().unwrap()[0].len() as u64;
-    assert_eq!(lines[2]["usage"]["prompt_tokens"].as_u64(), Some(sent / 4), "{log}");
-    assert!(lines[2]["usage"]["completion_tokens"].as_u64() > Some(0), "{log}");
+    assert_eq!(
+        lines[2]["usage"]["prompt_tokens"].as_u64(),
+        Some(sent / 4),
+        "{log}"
+    );
+    assert!(
+        lines[2]["usage"]["completion_tokens"].as_u64() > Some(0),
+        "{log}"
+    );
     let finish = &lines[5];
-    assert_eq!((&finish["outcome"], &finish["cited"], &finish["cost_microusd"]), (&json!("answered"), &json!([renew, certs]), &json!(0)));
+    assert_eq!(
+        (
+            &finish["outcome"],
+            &finish["cited"],
+            &finish["cost_microusd"]
+        ),
+        (&json!("answered"), &json!([renew, certs]), &json!(0))
+    );
     assert!(!log.contains("certbot") && !log.contains("renew"), "{log}");
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(&log_path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(&log_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 
     // The same recall as text.
     let out = relic(&["recall", "how", "did", "I", "renew"], &db, &url);
     let text = String::from_utf8(out.stdout).unwrap();
     assert_eq!(out.status.code(), Some(0));
-    assert!(text.starts_with("answered: You renewed with certbot.\n"), "{text}");
-    assert!(text.contains(&format!("  - certbot renew ran [#{renew}, against #{certs}]\n")), "{text}");
-    assert!(text.contains(&format!("  1. Run certbot renew --nginx [#{renew}]\n")), "{text}");
-    assert!(text.contains(&format!("  #{renew:<6} ")) && text.contains("zsh   certbot renew --nginx -d example.com"), "{text}");
-    assert!(text.ends_with("spent: 2 root + 0 child calls, at most $0.0000, answered by scripted\n"), "{text}");
+    assert!(
+        text.starts_with("answered: You renewed with certbot.\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "  - certbot renew ran [#{renew}, against #{certs}]\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("  1. Run certbot renew --nginx [#{renew}]\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("  #{renew:<6} "))
+            && text.contains("zsh   certbot renew --nginx -d example.com"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("spent: 2 root + 0 child calls, at most $0.0000, answered by scripted\n"),
+        "{text}"
+    );
     let log = std::fs::read_to_string(&log_path).unwrap();
-    let recalls: std::collections::HashSet<&str> = log.lines().map(|l| l.split("\"recall\":\"").nth(1).unwrap().split('"').next().unwrap()).collect();
-    assert_eq!((log.lines().count(), recalls.len()), (12, 2), "a second recall appends under its own id:\n{log}");
+    let recalls: std::collections::HashSet<&str> = log
+        .lines()
+        .map(|l| {
+            l.split("\"recall\":\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        (log.lines().count(), recalls.len()),
+        (12, 2),
+        "a second recall appends under its own id:\n{log}"
+    );
 }
 
 #[test]
@@ -245,18 +370,29 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let run = |script: Box<Script>, args: &[&str]| {
         let (url, _) = serve(script);
         let out = relic(&[&["recall", "renew"][..], args].concat(), &db, &url);
-        (out.status.code(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+        (
+            out.status.code(),
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
     };
 
     let partial = |_: &Value| json!({"status": "partial", "answer": "maybe certbot", "claims": [], "missing": ["the date"]});
     let (code, stdout, _) = run(Box::new(search_then(partial)), &[]);
     assert_eq!(code, Some(0));
-    assert!(stdout.starts_with("partly answered: maybe certbot\n") && stdout.contains("missing:\n  - the date\n"), "{stdout}");
+    assert!(
+        stdout.starts_with("partly answered: maybe certbot\n")
+            && stdout.contains("missing:\n  - the date\n"),
+        "{stdout}"
+    );
 
     let abstain = |_: &Value| json!({"status": "abstained", "answer": "", "claims": [], "missing": ["no renewal found"]});
     let (code, stdout, _) = run(Box::new(search_then(abstain)), &["--json"]);
     assert_eq!(code, Some(1), "{stdout}");
-    assert_eq!(serde_json::from_str::<Value>(&stdout).unwrap()["outcome"], "abstained");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap()["outcome"],
+        "abstained"
+    );
 
     // Citing what it was never shown is no evidence: the finish gate
     // turns it into an abstention, exit 1 like any other.
@@ -264,38 +400,65 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let (code, stdout, stderr) = run(Box::new(search_then(forged)), &["--json"]);
     assert_eq!(code, Some(1), "{stderr}");
     let report: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!((report["outcome"].as_str(), report["claims"].as_array().unwrap().len()), (Some("abstained"), 0));
-    assert!(stderr.contains("note: the finish gate refused the answer"), "{stderr}");
+    assert_eq!(
+        (
+            report["outcome"].as_str(),
+            report["claims"].as_array().unwrap().len()
+        ),
+        (Some("abstained"), 0)
+    );
+    assert!(
+        stderr.contains("note: the finish gate refused the answer"),
+        "{stderr}"
+    );
 
     let (code, stdout, stderr) = run(Box::new(|_: &Value| None), &["--json"]);
     assert_eq!(code, Some(2), "{stderr}");
     let report: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(report["outcome"], "failed");
     let said = "model endpoint answered HTTP 500: the scripted model is down";
-    assert!(report["error"].as_str().unwrap().contains(said) && stderr.contains(said), "{report}\n{stderr}");
+    assert!(
+        report["error"].as_str().unwrap().contains(said) && stderr.contains(said),
+        "{report}\n{stderr}"
+    );
     // An error can echo evidence back, which the log must not keep.
     let log = std::fs::read_to_string(dir.path().join("relic.db.recall.log")).unwrap();
     let finish: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
-    assert!(finish["outcome"] == "failed" && !log.contains("scripted model is down"), "{log}");
+    assert!(
+        finish["outcome"] == "failed" && !log.contains("scripted model is down"),
+        "{log}"
+    );
 
     // A root that never finishes runs out of root calls: exit 2, like a
     // failure, and the report says which.
     let forever = |state: &Value| {
         let v = state["state_version"].as_u64().unwrap();
-        Some(json!({"version": 1, "expected_state_version": v, "kind": "plan", "finish": null, "plan": {"ops": [
-            {"op": "search", "op_id": "s1", "terms": ["certbot"], "match": "any", "limit": 1}]}}))
+        Some(
+            json!({"version": 1, "expected_state_version": v, "kind": "plan", "finish": null, "plan": {"ops": [
+            {"op": "search", "op_id": "s1", "terms": ["certbot"], "match": "any", "limit": 1}]}}),
+        )
     };
     let (code, stdout, stderr) = run(Box::new(forever), &["--json"]);
     assert_eq!(code, Some(2), "{stderr}");
     let report: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!((report["outcome"].as_str(), report["root_calls"].as_u64()), (Some("budget_exhausted"), Some(8)), "{report}");
+    assert_eq!(
+        (report["outcome"].as_str(), report["root_calls"].as_u64()),
+        (Some("budget_exhausted"), Some(8)),
+        "{report}"
+    );
     assert!(stderr.contains("ran out of budget"), "{stderr}");
 
     // A remote model without prices: its cost cannot be capped, so recall
     // refuses before any call unless told the cost may be unknown.
     let remote = |extra: &[&str]| {
         let out = Command::new(env!("CARGO_BIN_EXE_relic"))
-            .args([&["recall", "renew", "--json", "--db", db.to_str().unwrap()][..], extra].concat())
+            .args(
+                [
+                    &["recall", "renew", "--json", "--db", db.to_str().unwrap()][..],
+                    extra,
+                ]
+                .concat(),
+            )
             .env("XDG_CONFIG_HOME", NO_SETTINGS)
             .env("RELIC_MODEL_PROFILE", "llama_cpp")
             .env("RELIC_MODEL_URL", "https://127.0.0.1:9/v1")
@@ -304,16 +467,32 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
             .env_remove("RELIC_MODEL_PRICE_OUT")
             .output()
             .unwrap();
-        (out.status.code(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+        (
+            out.status.code(),
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
     };
     let (code, stdout, stderr) = remote(&[]);
     assert_eq!(code, Some(2));
-    assert!(stdout.is_empty() && stderr.contains("--allow-unknown-cost") && !stderr.contains("send a root"), "{stderr}");
+    assert!(
+        stdout.is_empty()
+            && stderr.contains("--allow-unknown-cost")
+            && !stderr.contains("send a root"),
+        "{stderr}"
+    );
     let (code, stdout, stderr) = remote(&["--allow-unknown-cost"]);
     assert_eq!(code, Some(2), "{stderr}");
     let report: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!((report["outcome"].as_str(), &report["cost_microusd"]), (Some("failed"), &Value::Null), "{report}");
-    assert!(stderr.contains("send a root request") && stderr.contains("could not reach the model"), "{stderr}");
+    assert_eq!(
+        (report["outcome"].as_str(), &report["cost_microusd"]),
+        (Some("failed"), &Value::Null),
+        "{report}"
+    );
+    assert!(
+        stderr.contains("send a root request") && stderr.contains("could not reach the model"),
+        "{stderr}"
+    );
 
     let out = Command::new(env!("CARGO_BIN_EXE_relic"))
         .args(["recall", "renew", "--db"])
@@ -326,7 +505,10 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr.contains("RELIC_MODEL_NAME is required") && out.stdout.is_empty(), "{stderr}");
+    assert!(
+        stderr.contains("RELIC_MODEL_NAME is required") && out.stdout.is_empty(),
+        "{stderr}"
+    );
 
     // A log that cannot be opened: nothing leaves unaudited.
     let log = dir.path().join("relic.db.recall.log");
@@ -335,9 +517,22 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let (url, bodies) = serve(search_then(partial));
     let out = relic(&["recall", "renew", "--json"], &db, &url);
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!((out.status.code(), report["outcome"].as_str()), (Some(2), Some("failed")), "{report}");
-    assert!(report["error"].as_str().unwrap().contains("could not write the recall log"), "{report}");
-    assert!(bodies.lock().unwrap().is_empty(), "a request left without its audit");
+    assert_eq!(
+        (out.status.code(), report["outcome"].as_str()),
+        (Some(2), Some("failed")),
+        "{report}"
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap()
+            .contains("could not write the recall log"),
+        "{report}"
+    );
+    assert!(
+        bodies.lock().unwrap().is_empty(),
+        "a request left without its audit"
+    );
 }
 
 /// ADR 0004: canaries in every field of a history, then import, search and
@@ -362,10 +557,18 @@ fn privacy_canary_gate() {
         "echo Zq9CanaryPipe5 | sudo -S certbot renew",
         "certbot renew \\\n--token=Zq9CanaryCont6",
     ];
-    let zsh: String = zsh_commands.iter().enumerate().map(|(i, c)| format!(": {}:{i};{c}\n", 1_700_000_000 + i)).collect();
+    let zsh: String = zsh_commands
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!(": {}:{i};{c}\n", 1_700_000_000 + i))
+        .collect();
     std::fs::write(histories.join("zsh_history"), zsh).unwrap();
     let bash_commands = ["certbot renew --api-key=Zq9CanaryBash7"];
-    std::fs::write(histories.join("bash_history"), format!("#1700000100\n{}\n", bash_commands[0])).unwrap();
+    std::fs::write(
+        histories.join("bash_history"),
+        format!("#1700000100\n{}\n", bash_commands[0]),
+    )
+    .unwrap();
     import(&db, &histories.join("zsh_history"), "zsh");
     import(&db, &histories.join("bash_history"), "bash");
     // A repository whose commit subject, branch name and stash message
@@ -377,20 +580,39 @@ fn privacy_canary_gate() {
             .arg(&repo)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+            .envs([
+                ("GIT_AUTHOR_NAME", "t"),
+                ("GIT_AUTHOR_EMAIL", "t@t"),
+                ("GIT_COMMITTER_NAME", "t"),
+                ("GIT_COMMITTER_EMAIL", "t@t"),
+            ])
             .output()
             .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     std::fs::create_dir(&repo).unwrap();
     git(&["init", "-q", "-b", "main"]);
-    git(&["commit", "-q", "--allow-empty", "-m", "certbot renew; password=Zq9CanaryGit13"]);
+    git(&[
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "certbot renew; password=Zq9CanaryGit13",
+    ]);
     git(&["branch", "certbot/api_key=Zq9CanaryRef14"]);
     std::fs::write(repo.join("f"), "x").unwrap();
     git(&["add", "f"]);
     git(&["stash", "-q", "-m", "certbot wip token=Zq9CanaryStash15"]);
     let out = relic(&["import", repo.to_str().unwrap()], &db, "");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     // A Claude Code session: secrets in what Relic keeps (a command, its
     // output, a skill's args), and in every field it must not keep at all.
     let envelope = r#""version":"2.1.318","timestamp":"2026-11-06T04:11:29.660Z","cwd":"/Zq9CanaryCwd16","gitBranch":"Zq9CanaryBranch17""#;
@@ -411,7 +633,10 @@ fn privacy_canary_gate() {
     std::fs::write(&session_path, session).unwrap();
     let out = relic(&["import", session_path.to_str().unwrap()], &db, "");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success() && stderr.contains("stored 3 claude records"), "{stderr}");
+    assert!(
+        out.status.success() && stderr.contains("stored 3 claude records"),
+        "{stderr}"
+    );
 
     // A shell hook session: secrets in the command and in the directory.
     let hooks = histories.join("hooks");
@@ -425,12 +650,19 @@ fn privacy_canary_gate() {
     std::fs::write(hooks.join("bash-1.frames"), [frames[1], frames[2]].concat()).unwrap();
     let out = relic(&["import", "--hooks", hooks.to_str().unwrap()], &db, "");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success() && stderr.contains("added 2 records from 2 of 2 sessions"), "{stderr}");
+    assert!(
+        out.status.success() && stderr.contains("added 2 records from 2 of 2 sessions"),
+        "{stderr}"
+    );
 
     let redactor = relic::redact::Redactor::new();
     for raw in zsh_commands.iter().chain(&bash_commands) {
         let safe = redactor.import(raw);
-        assert_eq!(redactor.redact(&safe), safe, "redact(redact(x)) != redact(x) for {raw:?}");
+        assert_eq!(
+            redactor.redact(&safe),
+            safe,
+            "redact(redact(x)) != redact(x) for {raw:?}"
+        );
     }
 
     // The model echoes secrets back too, in its answer, its child claims and
@@ -447,35 +679,90 @@ fn privacy_canary_gate() {
                 {"op": "inspect", "op_id": "i1", "input": {"output": "k1"}, "limit": 20, "max_item_bytes": 2048},
             ])),
             v => {
-                let all: Vec<Value> = inspected(user).iter().map(|i| i["evidence_id"].clone()).collect();
-                finish(v, json!({"status": "answered", "answer": "certbot renew, then mysql --password=Zq9CanaryAnswer10",
+                let all: Vec<Value> = inspected(user)
+                    .iter()
+                    .map(|i| i["evidence_id"].clone())
+                    .collect();
+                finish(
+                    v,
+                    json!({"status": "answered", "answer": "certbot renew, then mysql --password=Zq9CanaryAnswer10",
                     "claims": [{"text": "renewed; api_key=Zq9CanaryClaim11", "supports": all}],
-                    "procedure": [{"text": "certbot renew", "supports": [cite(user, "renew --nginx")]}]}))
+                    "procedure": [{"text": "certbot renew", "supports": [cite(user, "renew --nginx")]}]}),
+                )
             }
         })
     });
-    let recall = relic(&["recall", "how", "did", "I", "renew?", "PGPASSWORD=Zq9CanaryQuestion12", "--json"], &db, &url);
+    let recall = relic(
+        &[
+            "recall",
+            "how",
+            "did",
+            "I",
+            "renew?",
+            "PGPASSWORD=Zq9CanaryQuestion12",
+            "--json",
+        ],
+        &db,
+        &url,
+    );
     let search = relic(&["search", "certbot", "--json"], &db, &url);
-    assert_eq!((recall.status.code(), search.status.code()), (Some(0), Some(0)), "{}", String::from_utf8_lossy(&recall.stderr));
+    assert_eq!(
+        (recall.status.code(), search.status.code()),
+        (Some(0), Some(0)),
+        "{}",
+        String::from_utf8_lossy(&recall.stderr)
+    );
 
     // Not vacuous: every record went out, redacted, to the root and to
     // children, and the answer came back with its markers.
     let bodies = bodies.lock().unwrap().clone();
     let children = bodies.iter().filter(|b| is_child(&user_message(b))).count();
-    assert!(bodies.len() >= 3 && children >= 1, "{} requests, {children} child", bodies.len());
+    assert!(
+        bodies.len() >= 3 && children >= 1,
+        "{} requests, {children} child",
+        bodies.len()
+    );
     let sent = bodies.concat();
     for marker in ["[REDACTED:password]", "[REDACTED:token]", "[REDACTED:key]"] {
         assert!(sent.contains(marker), "no {marker} in what was sent");
     }
     let report: Value = serde_json::from_slice(&recall.stdout).unwrap();
-    let hits = serde_json::from_slice::<Value>(&search.stdout).unwrap()["hits"].as_array().unwrap().len();
-    let git_rows = report["evidence"].as_array().unwrap().iter().filter(|e| e["source"] == "git").count();
-    assert!(git_rows >= 6, "the commit, branch and stash went out: {report}");
+    let hits = serde_json::from_slice::<Value>(&search.stdout).unwrap()["hits"]
+        .as_array()
+        .unwrap()
+        .len();
+    let git_rows = report["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["source"] == "git")
+        .count();
+    assert!(
+        git_rows >= 6,
+        "the commit, branch and stash went out: {report}"
+    );
     for source in ["claude", "claude-out", "claude-tool", "hook"] {
-        assert!(report["evidence"].as_array().unwrap().iter().any(|e| e["source"] == source), "no {source} record went out: {report}");
+        assert!(
+            report["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["source"] == source),
+            "no {source} record went out: {report}"
+        );
     }
-    assert_eq!(report["evidence"].as_array().unwrap().len(), hits, "{report}");
-    assert!(report["answer"].as_str().unwrap().ends_with("--password=[REDACTED:password]"), "{report}");
+    assert_eq!(
+        report["evidence"].as_array().unwrap().len(),
+        hits,
+        "{report}"
+    );
+    assert!(
+        report["answer"]
+            .as_str()
+            .unwrap()
+            .ends_with("--password=[REDACTED:password]"),
+        "{report}"
+    );
 
     let mut haystacks: Vec<(String, Vec<u8>)> = vec![
         ("recall stdout".into(), recall.stdout),
@@ -483,16 +770,34 @@ fn privacy_canary_gate() {
         ("search stdout".into(), search.stdout),
         ("search stderr".into(), search.stderr),
     ];
-    haystacks.extend(bodies.into_iter().enumerate().map(|(i, b)| (format!("request {i}"), b.into_bytes())));
-    let files: Vec<PathBuf> = std::fs::read_dir(&state).unwrap().map(|e| e.unwrap().path()).collect();
+    haystacks.extend(
+        bodies
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| (format!("request {i}"), b.into_bytes())),
+    );
+    let files: Vec<PathBuf> = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
     for wanted in ["relic.db", "relic.db-wal", "relic.db.recall.log"] {
-        assert!(files.iter().any(|f| f.ends_with(wanted)), "no {wanted} to check in {files:?}");
+        assert!(
+            files.iter().any(|f| f.ends_with(wanted)),
+            "no {wanted} to check in {files:?}"
+        );
     }
-    haystacks.extend(files.into_iter().map(|f| (f.display().to_string(), std::fs::read(&f).unwrap())));
+    haystacks.extend(
+        files
+            .into_iter()
+            .map(|f| (f.display().to_string(), std::fs::read(&f).unwrap())),
+    );
     for (name, bytes) in &haystacks {
         // FTS keeps lowercased terms.
         let folded = bytes.to_ascii_lowercase();
-        assert!(!folded.windows(9).any(|w| w == b"zq9canary"), "a canary in {name}");
+        assert!(
+            !folded.windows(9).any(|w| w == b"zq9canary"),
+            "a canary in {name}"
+        );
     }
 }
 
@@ -512,15 +817,30 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
             .arg(&repo)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+            .envs([
+                ("GIT_AUTHOR_NAME", "t"),
+                ("GIT_AUTHOR_EMAIL", "t@t"),
+                ("GIT_COMMITTER_NAME", "t"),
+                ("GIT_COMMITTER_EMAIL", "t@t"),
+            ])
             .output()
             .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     };
     git(&["init", "-q", "-b", "main"]);
     git(&["commit", "-q", "--allow-empty", "-m", "base"]);
-    git(&["commit", "-q", "--allow-empty", "-m", "the work that got lost"]);
+    git(&[
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "the work that got lost",
+    ]);
     let lost = git(&["rev-parse", "HEAD"]);
     git(&["reset", "-q", "--hard", "HEAD~1"]);
     let recovery = [
@@ -538,15 +858,24 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
                 {"op": "inspect", "op_id": "i1", "input": {"output": "s1"}, "limit": 20, "max_item_bytes": 2048},
             ])),
             // Once the user forgets the awk record, there is nothing to cite.
-            v if !inspected(state).iter().any(|i| i["safe_text"].as_str().unwrap().contains("awk")) => {
-                finish(v, json!({"status": "abstained", "answer": "", "claims": [], "procedure": [], "contradictions": [], "missing": ["the reflog step"]}))
+            v if !inspected(state)
+                .iter()
+                .any(|i| i["safe_text"].as_str().unwrap().contains("awk")) =>
+            {
+                finish(
+                    v,
+                    json!({"status": "abstained", "answer": "", "claims": [], "procedure": [], "contradictions": [], "missing": ["the reflog step"]}),
+                )
             }
-            v => finish(v, json!({"status": "answered", "answer": "From the reflog.",
-                "claims": [{"text": "a branch on HEAD@{1} kept it", "supports": [cite(state, "branch rescue")]}], "procedure": [
-                {"text": "Find the lost commit in the reflog", "supports": [cite(state, "awk")]},
-                {"text": "Put a branch on it", "supports": [cite(state, "branch rescue")]},
-                {"text": "Push the branch", "supports": [cite(state, "git push")]},
-            ]})),
+            v => finish(
+                v,
+                json!({"status": "answered", "answer": "From the reflog.",
+                    "claims": [{"text": "a branch on HEAD@{1} kept it", "supports": [cite(state, "branch rescue")]}], "procedure": [
+                    {"text": "Find the lost commit in the reflog", "supports": [cite(state, "awk")]},
+                    {"text": "Put a branch on it", "supports": [cite(state, "branch rescue")]},
+                    {"text": "Push the branch", "supports": [cite(state, "git push")]},
+                ]}),
+            ),
         })
     });
     let relic = |args: &[&str]| {
@@ -562,18 +891,31 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
             .output()
             .unwrap()
     };
-    let ok = |out: &Output| assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let ok = |out: &Output| {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
     let recall = |question: &str| {
         let sent = bodies.lock().unwrap().len();
         let out = relic(&["recall", question, "--json"]);
         // Answered, or abstained once the user forgot what it would cite.
-        assert!(matches!(out.status.code(), Some(0 | 1)), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            matches!(out.status.code(), Some(0 | 1)),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let report: Value = serde_json::from_slice(&out.stdout).unwrap();
         let log = std::fs::read_to_string(dir.path().join("relic.db.recall.log")).unwrap();
         let events: Vec<String> = log
             .lines()
             .map(|l| serde_json::from_str::<Value>(l).unwrap())
-            .filter(|l| l["recall"] == serde_json::from_str::<Value>(log.lines().last().unwrap()).unwrap()["recall"])
+            .filter(|l| {
+                l["recall"]
+                    == serde_json::from_str::<Value>(log.lines().last().unwrap()).unwrap()["recall"]
+            })
             .map(|l| l["event"].as_str().unwrap().to_string())
             .collect();
         assert!(bodies.lock().unwrap().len() > sent);
@@ -581,7 +923,10 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
     };
 
     let (report, events) = recall("how did I get back the commit git reset lost?");
-    assert!(report.get("skill").is_none() && !events.contains(&"skill".into()), "no skill is active yet");
+    assert!(
+        report.get("skill").is_none() && !events.contains(&"skill".into()),
+        "no skill is active yet"
+    );
     let report_path = dir.path().join("report.json");
     std::fs::write(&report_path, serde_json::to_vec(&report).unwrap()).unwrap();
     let report_arg = report_path.to_str().unwrap();
@@ -589,19 +934,61 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
 
     // Only a verifier that passes, for exactly this report, lets it compile.
     let compile = |report: &str| {
-        relic(&["skill", "compile", report, "--name", "git-reflog-recovery", "--description",
-            "Recover lost Git work, such as commits, branches or stashes, from the reflog"])
+        relic(&[
+            "skill",
+            "compile",
+            report,
+            "--name",
+            "git-reflog-recovery",
+            "--description",
+            "Recover lost Git work, such as commits, branches or stashes, from the reflog",
+        ])
     };
     let repo_arg = repo.to_str().unwrap();
-    let failed = relic(&["validate", report_arg, "--cwd", repo_arg, "--", "git", "rev-parse", "--verify", "-q", "deadbeef"]);
-    assert_eq!(failed.status.code(), Some(1), "{}", String::from_utf8_lossy(&failed.stderr));
+    let failed = relic(&[
+        "validate",
+        report_arg,
+        "--cwd",
+        repo_arg,
+        "--",
+        "git",
+        "rev-parse",
+        "--verify",
+        "-q",
+        "deadbeef",
+    ]);
+    assert_eq!(
+        failed.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
     assert_eq!(compile(report_arg).status.code(), Some(2));
     // A secret in the verifier's own argv is stored redacted.
-    ok(&relic(&["validate", report_arg, "--cwd", repo_arg, "--", "env", "TOKEN=Zq9CanaryArgv7abcdefgh", "git", "rev-parse", "--verify", &lost]));
+    ok(&relic(&[
+        "validate",
+        report_arg,
+        "--cwd",
+        repo_arg,
+        "--",
+        "env",
+        "TOKEN=Zq9CanaryArgv7abcdefgh",
+        "git",
+        "rev-parse",
+        "--verify",
+        &lost,
+    ]));
     let edited = dir.path().join("edited.json");
-    std::fs::write(&edited, [std::fs::read(&report_path).unwrap(), b"\n".to_vec()].concat()).unwrap();
+    std::fs::write(
+        &edited,
+        [std::fs::read(&report_path).unwrap(), b"\n".to_vec()].concat(),
+    )
+    .unwrap();
     let out = compile(edited.to_str().unwrap());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("no verifier has passed"), "an edited report needs its own validation");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no verifier has passed"),
+        "an edited report needs its own validation"
+    );
     ok(&compile(report_arg));
 
     // Activation is confirmed: with no terminal to ask on, only --yes. Here
@@ -611,55 +998,140 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
     std::fs::create_dir(home.join(".claude")).unwrap();
     std::os::unix::fs::symlink(home.join(".agents/skills"), home.join(".claude/skills")).unwrap();
     let link = home.join(".agents/skills/git-reflog-recovery");
-    let out = relic(&["skill", "activate", "git-reflog-recovery", "--user", "--claude"]);
+    let out = relic(&[
+        "skill",
+        "activate",
+        "git-reflog-recovery",
+        "--user",
+        "--claude",
+    ]);
     assert!(out.status.code() == Some(2) && std::fs::symlink_metadata(&link).is_err());
-    ok(&relic(&["skill", "activate", "git-reflog-recovery", "--user", "--claude", "--yes"]));
+    ok(&relic(&[
+        "skill",
+        "activate",
+        "git-reflog-recovery",
+        "--user",
+        "--claude",
+        "--yes",
+    ]));
     let skill = std::fs::read_to_string(link.join("SKILL.md")).unwrap();
-    assert!(skill.starts_with("---\nname: \"git-reflog-recovery\"\ndescription: \"Recover lost Git work"), "{skill}");
-    assert!(skill.lines().any(|l| l.trim() == "git branch rescue HEAD@{1}"), "{skill}");
-    assert!(skill.contains(&format!("relic show {awk}")) && !skill.contains("$1"), "{skill}");
+    assert!(
+        skill.starts_with(
+            "---\nname: \"git-reflog-recovery\"\ndescription: \"Recover lost Git work"
+        ),
+        "{skill}"
+    );
+    assert!(
+        skill
+            .lines()
+            .any(|l| l.trim() == "git branch rescue HEAD@{1}"),
+        "{skill}"
+    );
+    assert!(
+        skill.contains(&format!("relic show {awk}")) && !skill.contains("$1"),
+        "{skill}"
+    );
     let shown = relic(&["show", &awk.to_string()]);
-    assert!(String::from_utf8_lossy(&shown.stdout).contains(recovery[1]), "relic show gives the exact command");
-    assert!(skill.contains(&format!("#{push}")) && skill.contains("[REDACTED:"), "{skill}");
+    assert!(
+        String::from_utf8_lossy(&shown.stdout).contains(recovery[1]),
+        "relic show gives the exact command"
+    );
+    assert!(
+        skill.contains(&format!("#{push}")) && skill.contains("[REDACTED:"),
+        "{skill}"
+    );
 
     let bundle = std::fs::read_link(&link).unwrap();
-    let hash = bundle.parent().unwrap().file_name().unwrap().to_str().unwrap().to_string();
+    let hash = bundle
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let sent = bodies.lock().unwrap().len();
     let (report, events) = recall("I dropped a stash by mistake, how do I recover it with git?");
-    assert_eq!(report["skill"], json!({"name": "git-reflog-recovery", "bundle": hash}));
-    assert_eq!(&events[..3], ["start", "skill", "send"], "the pick precedes every request");
+    assert_eq!(
+        report["skill"],
+        json!({"name": "git-reflog-recovery", "bundle": hash})
+    );
+    assert_eq!(
+        &events[..3],
+        ["start", "skill", "send"],
+        "the pick precedes every request"
+    );
     // The first request already holds the skill's records, in step order.
     let first = user_message(&bodies.lock().unwrap()[sent]);
     assert_eq!(first["skill"]["name"], "git-reflog-recovery");
-    let seeded: Vec<&str> = first["skill"]["items"].as_array().unwrap().iter().map(|i| i["safe_text"].as_str().unwrap()).collect();
+    let seeded: Vec<&str> = first["skill"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["safe_text"].as_str().unwrap())
+        .collect();
     assert_eq!(seeded[..2], recovery[1..3], "{first}");
-    assert!(seeded.len() == 3 && seeded[2].starts_with("git push https://bob:[REDACTED:"), "{first}");
+    assert!(
+        seeded.len() == 3 && seeded[2].starts_with("git push https://bob:[REDACTED:"),
+        "{first}"
+    );
     // A record the user forgot is said to be gone, not sent.
     ok(&relic(&["forget", &awk.to_string()]));
     let sent = bodies.lock().unwrap().len();
     let (report, _) = recall("I dropped a stash by mistake, how do I recover it with git?");
     assert_eq!(report["outcome"], "abstained");
     let first = user_message(&bodies.lock().unwrap()[sent]);
-    assert_eq!(first["skill"]["items"].as_array().unwrap().len(), 2, "{first}");
+    assert_eq!(
+        first["skill"]["items"].as_array().unwrap().len(),
+        2,
+        "{first}"
+    );
     let gone = format!("record #{awk}, which skill git-reflog-recovery cites, is gone");
-    assert!(first["notes"][0].as_str().unwrap().starts_with(&gone), "{first}");
+    assert!(
+        first["notes"][0].as_str().unwrap().starts_with(&gone),
+        "{first}"
+    );
     let (report, events) = recall("how did I renew the certbot certificate?");
-    assert!(report.get("skill").is_none() && !events.contains(&"skill".into()), "{report}");
+    assert!(
+        report.get("skill").is_none() && !events.contains(&"skill".into()),
+        "{report}"
+    );
 
-    ok(&relic(&["skill", "rollback", "git-reflog-recovery", "--user", "--claude"]));
-    assert!(std::fs::symlink_metadata(&link).is_err(), "nothing was there before");
+    ok(&relic(&[
+        "skill",
+        "rollback",
+        "git-reflog-recovery",
+        "--user",
+        "--claude",
+    ]));
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "nothing was there before"
+    );
     let (report, _) = recall("I dropped a stash by mistake, how do I recover it with git?");
-    assert!(report.get("skill").is_none(), "a rolled-back skill is not picked");
+    assert!(
+        report.get("skill").is_none(),
+        "a rolled-back skill is not picked"
+    );
 
     // No secret reached the catalog: its database (the WAL goes when the
     // last connection closes) or the bundle.
     let catalog = dir.path().join("relic.db.catalog");
     let mut files = vec![bundle.join("SKILL.md")];
-    files.extend(std::fs::read_dir(&catalog).unwrap().map(|e| e.unwrap().path()).filter(|p| p.is_file()));
+    files.extend(
+        std::fs::read_dir(&catalog)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file()),
+    );
     assert!(files.iter().any(|f| f.ends_with("catalog.db")), "{files:?}");
     for f in &files {
         let bytes = std::fs::read(f).unwrap().to_ascii_lowercase();
-        assert!(!bytes.windows(9).any(|w| w == b"zq9canary"), "a canary in {}", f.display());
+        assert!(
+            !bytes.windows(9).any(|w| w == b"zq9canary"),
+            "a canary in {}",
+            f.display()
+        );
     }
 }
 
@@ -674,14 +1146,28 @@ fn a_verifier_dies_with_relic() {
     std::fs::write(&report, procedure.to_string()).unwrap();
     let pidfile = dir.path().join("pid");
     let mut relic = Command::new(env!("CARGO_BIN_EXE_relic"))
-        .args(["validate", report.to_str().unwrap(), "--db", db.to_str().unwrap(), "--"])
-        .args(["sh", "-c", "echo $$ > \"$0\"; exec sleep 30", pidfile.to_str().unwrap()])
+        .args([
+            "validate",
+            report.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--",
+        ])
+        .args([
+            "sh",
+            "-c",
+            "echo $$ > \"$0\"; exec sleep 30",
+            pidfile.to_str().unwrap(),
+        ])
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
     let t = std::time::Instant::now();
     let verifier: libc::pid_t = loop {
-        if let Some(pid) = std::fs::read_to_string(&pidfile).ok().and_then(|p| p.trim().parse().ok()) {
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|p| p.trim().parse().ok())
+        {
             break pid;
         }
         assert!(t.elapsed().as_secs() < 10, "the verifier never started");
@@ -702,7 +1188,12 @@ fn a_verifier_dies_with_relic() {
 
 /// The id of the one evidence record in `report` whose text holds `needle`.
 fn record_of(report: &Value, needle: &str) -> i64 {
-    let hits: Vec<&Value> = report["evidence"].as_array().unwrap().iter().filter(|e| e["text"].as_str().unwrap().contains(needle)).collect();
+    let hits: Vec<&Value> = report["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["text"].as_str().unwrap().contains(needle))
+        .collect();
     assert_eq!(hits.len(), 1, "{report}");
     hits[0]["id"].as_i64().unwrap()
 }
@@ -714,7 +1205,11 @@ fn item(state: &Value, at: &str, matches: impl Fn(&str) -> bool) -> Value {
         "skill" => &state["skill"]["items"],
         _ => &state["last_inspection"]["items"],
     };
-    let found = items.as_array().unwrap().iter().find(|i| matches(i["safe_text"].as_str().unwrap()));
+    let found = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| matches(i["safe_text"].as_str().unwrap()));
     found.unwrap_or_else(|| panic!("no {at} item matches: {state}"))["evidence_id"].clone()
 }
 
@@ -736,7 +1231,9 @@ fn recorded_model(state: &Value) -> Option<Value> {
             let claims = if relevant { json!([{"text": "it is part of the rescue", "supports": [i["evidence_id"]]}]) } else { json!([]) };
             json!({"item_id": i["item_id"], "verdict": verdict, "confidence": "high", "claims": claims})
         }).collect();
-        return Some(json!({"version": 1, "packet_id": packet["packet_id"], "assessments": assessments}));
+        return Some(
+            json!({"version": 1, "packet_id": packet["packet_id"], "assessments": assessments}),
+        );
     }
     let skilled = state.get("skill").is_some();
     Some(match (state["state_version"].as_u64().unwrap(), skilled) {
@@ -751,20 +1248,28 @@ fn recorded_model(state: &Value) -> Option<Value> {
             {"op": "search", "op_id": "s1", "terms": ["stash", "draft"], "match": "all", "limit": 20},
             {"op": "inspect", "op_id": "i1", "input": {"output": "s1"}, "limit": 20, "max_item_bytes": 2048},
         ])),
-        (v, false) => finish(v, json!({"status": "answered", "answer": "rescue holds the commit git reset lost.",
+        (v, false) => finish(
+            v,
+            json!({"status": "answered", "answer": "rescue holds the commit git reset lost.",
             "claims": [{"text": "rescue points at the lost commit", "supports": [item(state, "inspection", |t| t.starts_with("git ref refs/heads/rescue"))]}],
             "procedure": [
                 {"text": "Find the lost commit in the reflog", "supports": [item(state, "inspection", first_line("git reflog"))]},
                 {"text": "Put a branch on it", "supports": [item(state, "inspection", first_line("git branch rescue HEAD@{1}"))]},
-            ]})),
+            ]}),
+        ),
         (v, true) => {
-            let stash = item(state, "inspection", |t| t.starts_with("git reflog refs/stash "));
-            finish(v, json!({"status": "answered", "answer": "The dropped stash is still in the stash reflog.",
+            let stash = item(state, "inspection", |t| {
+                t.starts_with("git reflog refs/stash ")
+            });
+            finish(
+                v,
+                json!({"status": "answered", "answer": "The dropped stash is still in the stash reflog.",
                 "claims": [{"text": "the stash reflog names the dropped draft", "supports": [stash]}],
                 "procedure": [
                     {"text": "Find the dropped stash in the reflog", "supports": [item(state, "skill", first_line("git reflog")), stash]},
                     {"text": "Put a branch on it", "supports": [item(state, "skill", first_line("git branch rescue HEAD@{1}"))]},
-                ]}))
+                ]}),
+            )
         }
     })
 }
@@ -803,7 +1308,13 @@ fn reuse_gate_a_skill_makes_the_held_out_sibling_cheaper_and_still_verified() {
             .output()
             .unwrap()
     };
-    let ok = |out: &Output| assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let ok = |out: &Output| {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
     let log_path = db.with_extension("db.recall.log");
     let recall = |question: &str| -> (Value, Vec<Value>, Spent) {
         let sent = bodies.lock().unwrap().len();
@@ -812,13 +1323,22 @@ fn reuse_gate_a_skill_makes_the_held_out_sibling_cheaper_and_still_verified() {
         let wall = started.elapsed();
         ok(&out);
         let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-        let log: Vec<Value> = std::fs::read_to_string(&log_path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let log: Vec<Value> = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
         let id = log.last().unwrap()["recall"].clone();
         let lines: Vec<Value> = log.into_iter().filter(|l| l["recall"] == id).collect();
         let of = |event: &'static str| lines.iter().filter(move |l| l["event"] == event);
         let usage: Vec<&Value> = of("reply").map(|l| &l["usage"]).collect();
         let tokens = usage.iter().all(|u| u.is_object()).then(|| {
-            usage.iter().map(|u| u["prompt_tokens"].as_u64().unwrap() + u["completion_tokens"].as_u64().unwrap()).sum()
+            usage
+                .iter()
+                .map(|u| {
+                    u["prompt_tokens"].as_u64().unwrap() + u["completion_tokens"].as_u64().unwrap()
+                })
+                .sum()
         });
         let spent = Spent {
             calls: report["root_calls"].as_u64().unwrap() + report["child_calls"].as_u64().unwrap(),
@@ -834,17 +1354,46 @@ fn reuse_gate_a_skill_makes_the_held_out_sibling_cheaper_and_still_verified() {
     // Run 1: no skill. The procedure is validated where it ran, then
     // compiled and activated for the user.
     let (report, lines, run1) = recall("how did I get back the commit git reset lost?");
-    assert!(report.get("skill").is_none() && !lines.iter().any(|l| l["event"] == "skill"), "{report}");
+    assert!(
+        report.get("skill").is_none() && !lines.iter().any(|l| l["event"] == "skill"),
+        "{report}"
+    );
     assert_eq!(report["outcome"], "answered", "{report}");
-    assert!(report["child_calls"].as_u64() > Some(0), "run 1 had helpers judge: {report}");
+    assert!(
+        report["child_calls"].as_u64() > Some(0),
+        "run 1 had helpers judge: {report}"
+    );
     let report1 = r.db.with_file_name("run1.json");
     std::fs::write(&report1, serde_json::to_vec(&report).unwrap()).unwrap();
     let shop = r.shop.to_str().unwrap();
-    ok(&relic(&["validate", report1.to_str().unwrap(), "--cwd", shop, "--", "git", "rev-parse", "--verify", "rescue"]));
-    ok(&relic(&["skill", "compile", report1.to_str().unwrap(), "--name", "git-reflog-recovery", "--description",
-        "Recover lost Git work, such as commits, branches or stashes, from the reflog"]));
+    ok(&relic(&[
+        "validate",
+        report1.to_str().unwrap(),
+        "--cwd",
+        shop,
+        "--",
+        "git",
+        "rev-parse",
+        "--verify",
+        "rescue",
+    ]));
+    ok(&relic(&[
+        "skill",
+        "compile",
+        report1.to_str().unwrap(),
+        "--name",
+        "git-reflog-recovery",
+        "--description",
+        "Recover lost Git work, such as commits, branches or stashes, from the reflog",
+    ]));
     std::fs::create_dir_all(r.home.join(".agents/skills")).unwrap();
-    ok(&relic(&["skill", "activate", "git-reflog-recovery", "--user", "--yes"]));
+    ok(&relic(&[
+        "skill",
+        "activate",
+        "git-reflog-recovery",
+        "--user",
+        "--yes",
+    ]));
 
     // Run 2: the held-out sibling, unseen when the skill was compiled.
     r.import_sibling();
@@ -857,29 +1406,66 @@ fn reuse_gate_a_skill_makes_the_held_out_sibling_cheaper_and_still_verified() {
     assert_eq!(report["skill"]["name"], "git-reflog-recovery");
     let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
     assert_eq!(&events[..3], ["start", "skill", "send"], "{events:?}");
-    assert_eq!(user_message(&bodies.lock().unwrap()[sent])["skill"]["name"], "git-reflog-recovery");
+    assert_eq!(
+        user_message(&bodies.lock().unwrap()[sent])["skill"]["name"],
+        "git-reflog-recovery"
+    );
     let show = |s: &Spent| {
         let tokens = s.tokens.map_or("not reported".into(), |t| t.to_string());
-        format!("{} calls, {} egress bytes, {tokens} tokens, {} ms", s.calls, s.egress_bytes, s.wall.as_millis())
+        format!(
+            "{} calls, {} egress bytes, {tokens} tokens, {} ms",
+            s.calls,
+            s.egress_bytes,
+            s.wall.as_millis()
+        )
     };
     let gate = format!("run 1: {}; run 2: {}", show(&run1), show(&run2));
     assert!(run2.calls < run1.calls, "model calls: {gate}");
-    assert!(run2.egress_bytes < run1.egress_bytes, "egress bytes: {gate}");
-    assert!(run1.tokens.is_some() && run2.tokens.is_some(), "the provider reported usage: {gate}");
+    assert!(
+        run2.egress_bytes < run1.egress_bytes,
+        "egress bytes: {gate}"
+    );
+    assert!(
+        run1.tokens.is_some() && run2.tokens.is_some(),
+        "the provider reported usage: {gate}"
+    );
     // Reported, not gated: tokens follow bytes, and wall time is noise here.
     eprintln!("reuse gate: {gate}");
 
     // The user does what run 2 says, then the same kind of verifier passes.
     let found = report["evidence"].as_array().unwrap().iter().find_map(|e| {
-        e["text"].as_str().unwrap().strip_prefix("git reflog refs/stash ").map(|rest| rest.split(' ').next().unwrap().to_string())
+        e["text"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("git reflog refs/stash ")
+            .map(|rest| rest.split(' ').next().unwrap().to_string())
     });
     assert_eq!(found.as_deref(), Some(stash.as_str()), "{report}");
-    let branched = Command::new("git").arg("-C").arg(&r.notes).args(["branch", "release-draft", &stash]).output().unwrap();
-    assert!(branched.status.success(), "{}", String::from_utf8_lossy(&branched.stderr));
+    let branched = Command::new("git")
+        .arg("-C")
+        .arg(&r.notes)
+        .args(["branch", "release-draft", &stash])
+        .output()
+        .unwrap();
+    assert!(
+        branched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&branched.stderr)
+    );
     let report2 = r.db.with_file_name("run2.json");
     std::fs::write(&report2, serde_json::to_vec(&report).unwrap()).unwrap();
     let notes = r.notes.to_str().unwrap();
-    ok(&relic(&["validate", report2.to_str().unwrap(), "--cwd", notes, "--", "git", "rev-parse", "--verify", "release-draft"]));
+    ok(&relic(&[
+        "validate",
+        report2.to_str().unwrap(),
+        "--cwd",
+        notes,
+        "--",
+        "git",
+        "rev-parse",
+        "--verify",
+        "release-draft",
+    ]));
 }
 
 /// The model settings file is read as a shell would `source` it, and a
@@ -891,8 +1477,19 @@ fn model_settings_come_from_the_settings_file_unless_the_environment_sets_them()
     let check = |file: &str, env: &[(&str, &str)]| {
         std::fs::write(config.path().join("relic/env"), file).unwrap();
         let mut relic = Command::new(env!("CARGO_BIN_EXE_relic"));
-        relic.args(["model", "check"]).env("XDG_CONFIG_HOME", config.path());
-        for k in ["PROFILE", "URL", "NAME", "API_KEY", "OUTPUT", "TOKEN_FIELD", "PRICE_IN", "PRICE_OUT"] {
+        relic
+            .args(["model", "check"])
+            .env("XDG_CONFIG_HOME", config.path());
+        for k in [
+            "PROFILE",
+            "URL",
+            "NAME",
+            "API_KEY",
+            "OUTPUT",
+            "TOKEN_FIELD",
+            "PRICE_IN",
+            "PRICE_OUT",
+        ] {
             relic.env_remove(format!("RELIC_MODEL_{k}"));
         }
         let out = relic.envs(env.iter().copied()).output().unwrap();
@@ -900,10 +1497,22 @@ fn model_settings_come_from_the_settings_file_unless_the_environment_sets_them()
         String::from_utf8(out.stderr).unwrap()
     };
     let stderr = check("# which preset\n\nRELIC_MODEL_PROFILE=\"bogus\"\n", &[]);
-    assert!(stderr.contains(r#"RELIC_MODEL_PROFILE "bogus" is not"#), "{stderr}");
-    let stderr = check("RELIC_MODEL_PROFILE='bogus'\n", &[("RELIC_MODEL_PROFILE", "")]);
-    assert!(stderr.contains(r#"RELIC_MODEL_PROFILE "bogus" is not"#), "{stderr}");
-    let stderr = check("RELIC_MODEL_PROFILE=bogus\n", &[("RELIC_MODEL_PROFILE", "llama_cpp")]);
+    assert!(
+        stderr.contains(r#"RELIC_MODEL_PROFILE "bogus" is not"#),
+        "{stderr}"
+    );
+    let stderr = check(
+        "RELIC_MODEL_PROFILE='bogus'\n",
+        &[("RELIC_MODEL_PROFILE", "")],
+    );
+    assert!(
+        stderr.contains(r#"RELIC_MODEL_PROFILE "bogus" is not"#),
+        "{stderr}"
+    );
+    let stderr = check(
+        "RELIC_MODEL_PROFILE=bogus\n",
+        &[("RELIC_MODEL_PROFILE", "llama_cpp")],
+    );
     assert!(stderr.contains("RELIC_MODEL_URL is required"), "{stderr}");
     let stderr = check("RELIC_MODEL_PROFILE\n", &[]);
     assert!(stderr.contains("relic/env:1: not KEY=VALUE"), "{stderr}");

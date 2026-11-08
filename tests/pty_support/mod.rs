@@ -122,7 +122,12 @@ impl Session {
     }
 
     pub fn spawn_with(db: &Path, env: &[(&str, &OsStr)], hup: Hup) -> Self {
-        Self::start(RELIC.as_ref(), &["ui".as_ref(), "--db".as_ref(), db.as_os_str()], env, hup)
+        Self::start(
+            RELIC.as_ref(),
+            &["ui".as_ref(), "--db".as_ref(), db.as_os_str()],
+            env,
+            hup,
+        )
     }
 
     /// `relic <args>` on the terminal, with the environment of [`Self::spawn`].
@@ -270,18 +275,29 @@ impl Session {
     pub fn wait_stopped(&mut self) {
         let pid = self.pid().to_string();
         while Instant::now() < self.deadline {
-            let out = std::process::Command::new("ps").args(["-o", "stat=,tpgid=", "-p", &pid]).output().unwrap();
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=,tpgid=", "-p", &pid])
+                .output()
+                .unwrap();
             let out = String::from_utf8_lossy(&out.stdout);
             let mut fields = out.split_whitespace();
-            if fields.next().is_some_and(|st| st.starts_with('T')) && fields.next() != Some(pid.as_str()) {
+            if fields.next().is_some_and(|st| st.starts_with('T'))
+                && fields.next() != Some(pid.as_str())
+            {
                 return;
             }
             if let Some(s) = self.try_exit() {
-                panic!("relic exited with {s} instead of stopping\n{}", self.with(dump));
+                panic!(
+                    "relic exited with {s} instead of stopping\n{}",
+                    self.with(dump)
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("relic did not stop before the deadline\n{}", self.with(dump));
+        panic!(
+            "relic did not stop before the deadline\n{}",
+            self.with(dump)
+        );
     }
 
     /// The child is still running after `period`.

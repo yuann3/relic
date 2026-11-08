@@ -107,7 +107,9 @@ fn run() -> Result<bool, String> {
         succeed(Command::new("strip").arg(&stripped))?;
         // strip exits 0 on a file it could not process, and can break a signature.
         identify(&stripped, build)?;
-        let bytes = std::fs::metadata(&stripped).map_err(|e| format!("stat: {e}"))?.len();
+        let bytes = std::fs::metadata(&stripped)
+            .map_err(|e| format!("stat: {e}"))?
+            .len();
         binaries.push(json!({
             "build": build,
             "version": version,
@@ -117,13 +119,22 @@ fn run() -> Result<bool, String> {
             "stripped_sha256": sha256(&stripped)?,
         }));
 
-        gates.push(gate(format!("stripped {build} binary"), "MiB", bytes as f64 / MIB, limit_mib));
+        gates.push(gate(
+            format!("stripped {build} binary"),
+            "MiB",
+            bytes as f64 / MIB,
+            limit_mib,
+        ));
 
         let ms = repeat(WARMUPS, samples, || {
             let mut cmd = Command::new(&stripped);
             timed(cmd.arg("--help"))
         })?;
-        gates.push(p95_gate(format!("warm --help, {build}"), ms, HELP_P95_LIMIT_MS));
+        gates.push(p95_gate(
+            format!("warm --help, {build}"),
+            ms,
+            HELP_P95_LIMIT_MS,
+        ));
         if build == "headless" {
             import_gates(&stripped, work.path(), samples, &mut gates)?;
         }
@@ -147,15 +158,21 @@ fn run() -> Result<bool, String> {
         "binaries": binaries,
         "gates": gates,
     });
-    writeln!(std::io::stdout(), "{}", serde_json::to_string_pretty(&report).unwrap())
-        .map_err(|e| format!("stdout: {e}"))?;
+    writeln!(
+        std::io::stdout(),
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap()
+    )
+    .map_err(|e| format!("stdout: {e}"))?;
     Ok(passed)
 }
 
 fn parse_samples(arg: &str) -> Result<usize, String> {
     match arg.parse() {
         Ok(n) if n >= MIN_SAMPLES => Ok(n),
-        _ => Err(format!("SAMPLES must be a number >= {MIN_SAMPLES}, got {arg:?}")),
+        _ => Err(format!(
+            "SAMPLES must be a number >= {MIN_SAMPLES}, got {arg:?}"
+        )),
     }
 }
 
@@ -175,7 +192,11 @@ fn identify(bin: &Path, build: &str) -> Result<String, String> {
         .output()
         .map_err(|e| format!("{}: {e}", bin.display()))?;
     let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let marker = if build == "headless" { "(headless)" } else { "(tui)" };
+    let marker = if build == "headless" {
+        "(headless)"
+    } else {
+        "(tui)"
+    };
     if out.status.success() && version.starts_with("relic ") && version.ends_with(marker) {
         Ok(version)
     } else {
@@ -188,13 +209,21 @@ fn identify(bin: &Path, build: &str) -> Result<String, String> {
 
 /// The import gates of ADR 0002, on the headless binary: peak RSS of a whole
 /// import at 1M and 2M records, and 100 records appended to a 1M store.
-fn import_gates(relic: &Path, work: &Path, samples: usize, gates: &mut Vec<Value>) -> Result<(), String> {
+fn import_gates(
+    relic: &Path,
+    work: &Path,
+    samples: usize,
+    gates: &mut Vec<Value>,
+) -> Result<(), String> {
     let io = |e: std::io::Error| format!("import fixture: {e}");
     let history = work.join("zsh_history");
     let db = work.join("import.db");
     let import = || {
         let mut cmd = Command::new(relic);
-        cmd.arg("import").arg(&history).args(["--shell", "zsh", "--db"]).arg(&db);
+        cmd.arg("import")
+            .arg(&history)
+            .args(["--shell", "zsh", "--db"])
+            .arg(&db);
         cmd
     };
     let fresh_db = || {
@@ -206,17 +235,29 @@ fn import_gates(relic: &Path, work: &Path, samples: usize, gates: &mut Vec<Value
     };
 
     // Seed 77 is the corpus every earlier 1M measurement used.
-    fs::write(&history, relic::fixture::generate_diverse_zsh_history(100_000, 77)).map_err(io)?;
+    fs::write(
+        &history,
+        relic::fixture::generate_diverse_zsh_history(100_000, 77),
+    )
+    .map_err(io)?;
     let ms = repeat(WARMUPS, samples, || {
         fresh_db();
         timed(&mut import())
     })?;
-    gates.push(p95_gate("import 100k records".into(), ms, IMPORT_100K_P95_LIMIT_MS));
+    gates.push(p95_gate(
+        "import 100k records".into(),
+        ms,
+        IMPORT_100K_P95_LIMIT_MS,
+    ));
 
     let mut peaks = Vec::new();
     // 1M last, so its store is the one measured for size and grown by the append gate.
     for (label, records) in [("2M", 2_000_000), ("1M", 1_000_000)] {
-        fs::write(&history, relic::fixture::generate_diverse_zsh_history(records, 77)).map_err(io)?;
+        fs::write(
+            &history,
+            relic::fixture::generate_diverse_zsh_history(records, 77),
+        )
+        .map_err(io)?;
         let mut ms = Vec::new();
         let mib = repeat(0, samples, || {
             fresh_db();
@@ -226,17 +267,31 @@ fn import_gates(relic: &Path, work: &Path, samples: usize, gates: &mut Vec<Value
             Ok(mib)
         })?;
         let peak = mib.iter().copied().fold(0.0, f64::max);
-        let mut g = gate(format!("import peak RSS, {label} records"), "MiB", peak, IMPORT_RSS_LIMIT_MIB);
+        let mut g = gate(
+            format!("import peak RSS, {label} records"),
+            "MiB",
+            peak,
+            IMPORT_RSS_LIMIT_MIB,
+        );
         g["statistic"] = json!("max");
         g["samples"] = json!(mib);
         gates.push(g);
         peaks.push(peak);
         if records == 1_000_000 {
             // Timed through /usr/bin/time, whose own cost is noise at this scale.
-            gates.push(p95_gate("import 1M records".into(), ms, IMPORT_1M_P95_LIMIT_MS));
+            gates.push(p95_gate(
+                "import 1M records".into(),
+                ms,
+                IMPORT_1M_P95_LIMIT_MS,
+            ));
         }
     }
-    gates.push(gate("import peak RSS, 2M over 1M".into(), "ratio", peaks[0] / peaks[1], RSS_GROWTH_LIMIT));
+    gates.push(gate(
+        "import peak RSS, 2M over 1M".into(),
+        "ratio",
+        peaks[0] / peaks[1],
+        RSS_GROWTH_LIMIT,
+    ));
 
     // The import checkpointed, so the WAL is folded in; count it anyway.
     let store_bytes: u64 = ["", "-wal", "-shm"]
@@ -259,10 +314,18 @@ fn import_gates(relic: &Path, work: &Path, samples: usize, gates: &mut Vec<Value
     let ms = repeat(WARMUPS, samples, || {
         round += 1;
         let more = relic::fixture::generate_zsh_history(100, round);
-        fs::OpenOptions::new().append(true).open(&history).and_then(|mut f| f.write_all(&more)).map_err(io)?;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&history)
+            .and_then(|mut f| f.write_all(&more))
+            .map_err(io)?;
         timed(&mut import())
     })?;
-    gates.push(p95_gate("append 100 records to a 1M store".into(), ms, APPEND_P95_LIMIT_MS));
+    gates.push(p95_gate(
+        "append 100 records to a 1M store".into(),
+        ms,
+        APPEND_P95_LIMIT_MS,
+    ));
     search_gates(relic, &db, samples, gates)
 }
 
@@ -271,18 +334,35 @@ fn import_gates(relic: &Path, work: &Path, samples: usize, gates: &mut Vec<Value
 /// the query deadline plus `DEADLINE_EPSILON_MS` (ADR 0006): with a page,
 /// with no match, stopped as too broad, or with every word ignored. Which of
 /// those is recorded, not gated; a deadline that did not hold shows as time.
-fn search_gates(relic: &Path, db: &Path, samples: usize, gates: &mut Vec<Value>) -> Result<(), String> {
+fn search_gates(
+    relic: &Path,
+    db: &Path,
+    samples: usize,
+    gates: &mut Vec<Value>,
+) -> Result<(), String> {
     let hot = |n: usize| format!("{}ta", "task/".repeat(n - 1));
     let git_400 = vec!["git"; 400];
     let (phrase_51, phrase_16) = (hot(51), hot(relic::app::MAX_WORD_TOKENS));
     // In the fixture `task` is in 93% of rows and never beside `git`.
-    let whole_words: [&[&str]; 5] = [&["git"], &["task"], &["cargo"], &["git", "commit"], &["cargo", "task"]];
+    let whole_words: [&[&str]; 5] = [
+        &["git"],
+        &["task"],
+        &["cargo"],
+        &["git", "commit"],
+        &["cargo", "task"],
+    ];
     let bounded: [(&str, Vec<&str>); 9] = [
         ("hot prefix `ta*`", vec!["--prefix", "ta"]),
         ("hot prefix `task*`", vec!["--prefix", "task"]),
-        ("lead word and hot prefix `git tas*`", vec!["--prefix", "git", "tas"]),
+        (
+            "lead word and hot prefix `git tas*`",
+            vec!["--prefix", "git", "tas"],
+        ),
         ("sparse AND `git task`", vec!["git", "task"]),
-        ("sparse AND `docker git*`", vec!["--prefix", "docker", "git"]),
+        (
+            "sparse AND `docker git*`",
+            vec!["--prefix", "docker", "git"],
+        ),
         ("`task` by rank", vec!["--rank", "task"]),
         ("400 x `git` by rank", [vec!["--rank"], git_400].concat()),
         ("one word of 51 hot tokens", vec!["--prefix", &phrase_51]),
@@ -294,7 +374,11 @@ fn search_gates(relic: &Path, db: &Path, samples: usize, gates: &mut Vec<Value>)
         let mut outcomes = std::collections::BTreeSet::new();
         let ms = repeat(WARMUPS, samples, || {
             let mut cmd = Command::new(relic);
-            cmd.arg("search").arg("--json").arg("--db").arg(db).args(args);
+            cmd.arg("search")
+                .arg("--json")
+                .arg("--db")
+                .arg(db)
+                .args(args);
             let (ms, how) = timed_search(&mut cmd)?;
             outcomes.insert(how);
             Ok(ms)
@@ -305,10 +389,18 @@ fn search_gates(relic: &Path, db: &Path, samples: usize, gates: &mut Vec<Value>)
         Ok(())
     };
     for words in whole_words {
-        measure(format!("search 1M, whole words `{}`", words.join(" ")), words, WHOLE_WORD_P95_LIMIT_MS)?;
+        measure(
+            format!("search 1M, whole words `{}`", words.join(" ")),
+            words,
+            WHOLE_WORD_P95_LIMIT_MS,
+        )?;
     }
     for (name, args) in &bounded {
-        measure(format!("search 1M within the deadline, {name}"), args, deadline_ms + DEADLINE_EPSILON_MS)?;
+        measure(
+            format!("search 1M within the deadline, {name}"),
+            args,
+            deadline_ms + DEADLINE_EPSILON_MS,
+        )?;
     }
     Ok(())
 }
@@ -317,7 +409,9 @@ fn search_gates(relic: &Path, db: &Path, samples: usize, gates: &mut Vec<Value>)
 /// page, no match, a stop at the deadline or an ignored query is a harness
 /// failure.
 fn timed_search(cmd: &mut Command) -> Result<(f64, String), String> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     let t = Instant::now();
     let out = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
     let ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -348,7 +442,9 @@ fn repeat(
 
 /// Wall time in ms of one fresh process, spawn to exit.
 fn timed(cmd: &mut Command) -> Result<f64, String> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let t = Instant::now();
     // A failing command exits fast; timing it would pass the gate.
     succeed(cmd)?;
@@ -409,8 +505,14 @@ fn succeed(cmd: &mut Command) -> Result<(), String> {
 }
 
 fn output(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let out = Command::new(cmd)
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn sha256(path: &Path) -> Result<String, String> {
@@ -434,7 +536,12 @@ fn loadavg() -> Option<String> {
     if cfg!(target_os = "macos") {
         return output("sysctl", &["-n", "vm.loadavg"]);
     }
-    Some(std::fs::read_to_string("/proc/loadavg").ok()?.trim().to_string())
+    Some(
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()?
+            .trim()
+            .to_string(),
+    )
 }
 
 /// A field the report records as null still leaves a trace on stderr.

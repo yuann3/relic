@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use crate::domain::StoredObservation;
 use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
+use crate::rlm::calls::{Calls, Job, Stop, call_all};
 use crate::rlm::evidence::{EvidenceId, HandleId, HandleRegistry};
 use crate::rlm::executor::{self, ExecError};
 use crate::rlm::finish;
-use crate::rlm::calls::{Calls, Job, Stop, call_all};
 use crate::rlm::model::egress::{PayloadAudit, Role};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, ModelBoundary, parse_output};
 use crate::rlm::protocol::*;
@@ -44,9 +44,16 @@ pub enum InvestigationStatus {
 /// to its own events (ADR 0009).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Progress {
-    RootCall { turn: u32 },
-    Op { op_id: String },
-    ChildCall { op_id: String, packet_id: String },
+    RootCall {
+        turn: u32,
+    },
+    Op {
+        op_id: String,
+    },
+    ChildCall {
+        op_id: String,
+        packet_id: String,
+    },
     /// A note to the root: a rejected child result or a too-broad search.
     Note(String),
     /// A request is about to leave: what, where and how big (ADR 0004).
@@ -54,9 +61,17 @@ pub enum Progress {
     /// A model call came back; `returned_model` is what actually answered,
     /// redacted: the provider wrote it. `usage` is the tokens it says the
     /// call took, if it says.
-    Replied { role: Role, returned_model: Option<String>, usage: Option<crate::rlm::model::Usage> },
+    Replied {
+        role: Role,
+        returned_model: Option<String>,
+        usage: Option<crate::rlm::model::Usage>,
+    },
     /// A failed call is sent again, as the retry rule allows once.
-    Retry { role: Role, attempt: u8, reason: String },
+    Retry {
+        role: Role,
+        attempt: u8,
+        reason: String,
+    },
 }
 
 /// One line for a person watching: the CLI's stderr, the TUI's steps.
@@ -69,7 +84,9 @@ impl std::fmt::Display for Progress {
         match self {
             Self::RootCall { turn } => write!(f, "root call {turn}: plan the next step"),
             Self::Op { op_id } => write!(f, "run {op_id}"),
-            Self::ChildCall { op_id, packet_id } => write!(f, "child call for {op_id}, {packet_id}"),
+            Self::ChildCall { op_id, packet_id } => {
+                write!(f, "child call for {op_id}, {packet_id}")
+            }
             Self::Note(note) => write!(f, "note: {note}"),
             Self::Egress(a) => write!(
                 f,
@@ -80,10 +97,27 @@ impl std::fmt::Display for Progress {
                 a.profile,
                 a.request_hash
             ),
-            Self::Replied { role: r, returned_model, .. } => {
-                write!(f, "{} reply from {}", role(r), returned_model.as_deref().unwrap_or("an unnamed model"))
+            Self::Replied {
+                role: r,
+                returned_model,
+                ..
+            } => {
+                write!(
+                    f,
+                    "{} reply from {}",
+                    role(r),
+                    returned_model.as_deref().unwrap_or("an unnamed model")
+                )
             }
-            Self::Retry { role: r, attempt, reason } => write!(f, "retry the {} call (attempt {attempt}): {reason}", role(r)),
+            Self::Retry {
+                role: r,
+                attempt,
+                reason,
+            } => write!(
+                f,
+                "retry the {} call (attempt {attempt}): {reason}",
+                role(r)
+            ),
         }
     }
 }
@@ -196,13 +230,23 @@ pub fn run_investigation(
     let cited = finish
         .iter()
         .flat_map(|f| {
-            let claims = f.claims.iter().flat_map(|c| c.supports.iter().chain(&c.contradicts));
+            let claims = f
+                .claims
+                .iter()
+                .flat_map(|c| c.supports.iter().chain(&c.contradicts));
             claims.chain(f.procedure.iter().flat_map(|s| &s.supports))
         })
         .filter_map(|id| Some((id.clone(), run.registry.resolve_evidence_id(id)?.1.clone())))
         .collect();
     let cost_microusd = run.model.prices().map(|_| run.ledger.cost_spent());
-    InvestigationResult { status, finish, cited, cost_microusd, turns: run.turns, child_calls: run.child_calls }
+    InvestigationResult {
+        status,
+        finish,
+        cited,
+        cost_microusd,
+        turns: run.turns,
+        child_calls: run.child_calls,
+    }
 }
 
 /// Put `skill`'s records in a handle and in every root state, as an inspect
@@ -225,11 +269,23 @@ fn seed(run: &mut Run, skill: &SkillSeed) -> Result<(), InvestigationStatus> {
     for note in &run.notes {
         (run.progress)(Progress::Note(note.clone()));
     }
-    let rows = Reservation { rows_returned: observations.len() as u64, evidence_handles: 1, ..Default::default() };
-    run.ledger.reserve(&rows).map_err(|_| InvestigationStatus::BudgetExhausted)?;
+    let rows = Reservation {
+        rows_returned: observations.len() as u64,
+        evidence_handles: 1,
+        ..Default::default()
+    };
+    run.ledger
+        .reserve(&rows)
+        .map_err(|_| InvestigationStatus::BudgetExhausted)?;
     let handle = run.registry.insert_evidence_set(observations);
-    let packet = packet(&run.registry, &handle, SEED_ITEMS, SEED_ITEM_BYTES, format!("skill_{}", skill.name))
-        .map_err(|e| InvestigationStatus::Failed(format!("skill {}: {e}", skill.name)))?;
+    let packet = packet(
+        &run.registry,
+        &handle,
+        SEED_ITEMS,
+        SEED_ITEM_BYTES,
+        format!("skill_{}", skill.name),
+    )
+    .map_err(|e| InvestigationStatus::Failed(format!("skill {}: {e}", skill.name)))?;
     run.skill = Some(serde_json::json!({
         "name": skill.name, "description": skill.description, "handle": handle, "items": packet.items,
     }));
@@ -260,7 +316,10 @@ fn packet(
                 item_id: format!("item_{idx}"),
                 evidence_id: ev.id.clone(),
                 safe_text: text[..sent].to_string(),
-                truncation: (sent < text.len()).then_some(TruncationV1 { original_bytes: text.len(), sent_bytes: sent }),
+                truncation: (sent < text.len()).then_some(TruncationV1 {
+                    original_bytes: text.len(),
+                    sent_bytes: sent,
+                }),
             }
         })
         .collect();
@@ -282,17 +341,33 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
         if let Some(skill) = &run.skill {
             state["skill"] = skill.clone();
         }
-        let job = Job { role: Role::Root, payload: state, admitted: Progress::RootCall { turn: run.turns + 1 } };
+        let job = Job {
+            role: Role::Root,
+            payload: state,
+            admitted: Progress::RootCall {
+                turn: run.turns + 1,
+            },
+        };
         let reply = match call_all(&mut run.calls(), vec![job]).map(|mut r| r.remove(0)) {
             Ok(Ok(reply)) => reply,
-            Ok(Err(e)) => return (InvestigationStatus::Failed(format!("model error: {e}")), None),
+            Ok(Err(e)) => {
+                return (
+                    InvestigationStatus::Failed(format!("model error: {e}")),
+                    None,
+                );
+            }
             Err(Stop::Cancelled) => return (InvestigationStatus::Cancelled, None),
             Err(Stop::Budget(_)) => return (InvestigationStatus::BudgetExhausted, None),
         };
         run.turns += 1;
         let action: RootActionV1 = match parse_output(&reply.body, ROOT_RESULT_MAX) {
             Ok(action) => action,
-            Err(e) => return (InvestigationStatus::Failed(format!("root action: {e}")), None),
+            Err(e) => {
+                return (
+                    InvestigationStatus::Failed(format!("root action: {e}")),
+                    None,
+                );
+            }
         };
         // A reply that lands after cancel is dropped, not acted on: a late
         // finish must not pass for a completed investigation.
@@ -304,12 +379,24 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
             RootActionKind::Plan => {
                 let validated = match validate::validate_plan(&action, state_version) {
                     Ok(v) => v,
-                    Err(e) => return (InvestigationStatus::Failed(format!("validation: {e}")), None),
+                    Err(e) => {
+                        return (
+                            InvestigationStatus::Failed(format!("validation: {e}")),
+                            None,
+                        );
+                    }
                 };
 
                 // Admission caps a plan at 8 ops.
                 let plan_ops = u16::try_from(validated.ops.len()).unwrap_or(u16::MAX);
-                if run.ledger.reserve(&Reservation { plan_ops, ..Default::default() }).is_err() {
+                if run
+                    .ledger
+                    .reserve(&Reservation {
+                        plan_ops,
+                        ..Default::default()
+                    })
+                    .is_err()
+                {
                     return (InvestigationStatus::BudgetExhausted, None);
                 }
 
@@ -319,7 +406,9 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
                     if run.cancelled() {
                         return (InvestigationStatus::Cancelled, None);
                     }
-                    (run.progress)(Progress::Op { op_id: validate::op_id(op).to_string() });
+                    (run.progress)(Progress::Op {
+                        op_id: validate::op_id(op).to_string(),
+                    });
                     let noted = run.notes.len();
                     let out = execute_op(run, op, &plan_outputs);
                     for note in &run.notes[noted..] {
@@ -333,7 +422,10 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
                         Err(CoordinatorError::Execution(ExecError::Cancelled)) => {
                             return (InvestigationStatus::Cancelled, None);
                         }
-                        Err(CoordinatorError::Budget(_) | CoordinatorError::Execution(ExecError::Budget(_))) => {
+                        Err(
+                            CoordinatorError::Budget(_)
+                            | CoordinatorError::Execution(ExecError::Budget(_)),
+                        ) => {
                             return (InvestigationStatus::BudgetExhausted, None);
                         }
                         Err(e) => return (InvestigationStatus::Failed(format!("exec: {e}")), None),
@@ -349,7 +441,10 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
 
             RootActionKind::Finish => {
                 let Some(finish) = action.finish else {
-                    return (InvestigationStatus::Failed("finish action missing finish body".into()), None);
+                    return (
+                        InvestigationStatus::Failed("finish action missing finish body".into()),
+                        None,
+                    );
                 };
                 // An answer resting on a citation that does not resolve has
                 // no evidence behind it: it abstains, saying why (ADR 0009).
@@ -377,8 +472,20 @@ fn execute_op(
     op: &Op,
     plan_outputs: &HashMap<String, HandleId>,
 ) -> Result<Option<(String, HandleId)>, CoordinatorError> {
-    let Run { store, model, registry, ledger, child_calls, last_inspection, notes, cancel, progress, deadline, concurrency, .. } =
-        run;
+    let Run {
+        store,
+        model,
+        registry,
+        ledger,
+        child_calls,
+        last_inspection,
+        notes,
+        cancel,
+        progress,
+        deadline,
+        concurrency,
+        ..
+    } = run;
     match op {
         Op::Search(s) => {
             // Reserve rows.
@@ -390,7 +497,10 @@ fn execute_op(
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let budget = crate::app::Budget { cancel: Some(Arc::clone(cancel)), ..crate::app::Budget::start() };
+            let budget = crate::app::Budget {
+                cancel: Some(Arc::clone(cancel)),
+                ..crate::app::Budget::start()
+            };
             let hid = executor::execute_search(store, s, registry, &budget, notes)
                 .map_err(CoordinatorError::Execution)?;
 
@@ -441,7 +551,10 @@ fn execute_op(
                     .map(|p| Job {
                         role: Role::Child,
                         payload: executor::child_payload(objective, p),
-                        admitted: Progress::ChildCall { op_id: a.op_id.clone(), packet_id: p.packet_id.clone() },
+                        admitted: Progress::ChildCall {
+                            op_id: a.op_id.clone(),
+                            packet_id: p.packet_id.clone(),
+                        },
                     })
                     .collect();
                 let mut calls = Calls {
@@ -457,10 +570,14 @@ fn execute_op(
                     Stop::Cancelled => ExecError::Cancelled,
                     Stop::Budget(b) => ExecError::Budget(b),
                 })?;
-                Ok(replies.into_iter().map(|r| r.map(|reply| reply.body)).collect())
+                Ok(replies
+                    .into_iter()
+                    .map(|r| r.map(|reply| reply.body))
+                    .collect())
             };
-            let hid = executor::execute_assess(a, registry, plan_outputs, &mut call_children, notes)
-                .map_err(CoordinatorError::Execution)?;
+            let hid =
+                executor::execute_assess(a, registry, plan_outputs, &mut call_children, notes)
+                    .map_err(CoordinatorError::Execution)?;
 
             Ok(Some((a.op_id.clone(), hid)))
         }
@@ -469,7 +586,13 @@ fn execute_op(
             let source_hid = executor::resolve_input(&i.input, plan_outputs)
                 .map_err(CoordinatorError::Execution)?;
             let packet_id = format!("inspect_{}", i.op_id);
-            *last_inspection = Some(packet(registry, &source_hid, i.limit as usize, i.max_item_bytes, packet_id)?);
+            *last_inspection = Some(packet(
+                registry,
+                &source_hid,
+                i.limit as usize,
+                i.max_item_bytes,
+                packet_id,
+            )?);
 
             Ok(None) // Inspect doesn't produce a handle — it produces a root observation.
         }
@@ -482,7 +605,8 @@ fn execute_op(
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let hid = executor::execute_select(k, registry, plan_outputs).map_err(CoordinatorError::Execution)?;
+            let hid = executor::execute_select(k, registry, plan_outputs)
+                .map_err(CoordinatorError::Execution)?;
 
             Ok(Some((k.op_id.clone(), hid)))
         }
@@ -492,7 +616,12 @@ fn execute_op(
 /// How many items of an assessment set got each verdict. Unassessed items
 /// are counted apart, never as support (ADR 0009).
 fn verdict_counts(slots: &[Option<ItemAssessmentV1>]) -> serde_json::Value {
-    let count = |v: Option<Verdict>| slots.iter().filter(|s| s.as_ref().map(|a| a.verdict.clone()) == v).count();
+    let count = |v: Option<Verdict>| {
+        slots
+            .iter()
+            .filter(|s| s.as_ref().map(|a| a.verdict.clone()) == v)
+            .count()
+    };
     serde_json::json!({
         "supports": count(Some(Verdict::Supports)),
         "contradicts": count(Some(Verdict::Contradicts)),
@@ -555,8 +684,8 @@ mod tests {
     use super::*;
     use crate::domain::{Observation, ObservationKind, Provenance};
     use crate::import::SourceKind;
-    use crate::store::Cursor;
     use crate::rlm::model::FakeModel;
+    use crate::store::Cursor;
 
     fn seed_corpus(store: &mut Store) -> i64 {
         // 50 commands: most generic, with "certbot renew" at ordinal 25
@@ -569,7 +698,11 @@ mod tests {
             })
             .collect();
 
-        let mut rev = store.lock_source(b"/h").unwrap().new_revision(SourceKind::Zsh).unwrap();
+        let mut rev = store
+            .lock_source(b"/h")
+            .unwrap()
+            .new_revision(SourceKind::Zsh)
+            .unwrap();
         let rev_id = rev.revision_id();
         for (i, cmd) in cmds.iter().enumerate() {
             rev.insert(&Observation {
@@ -594,7 +727,10 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         seed_corpus(&mut store);
         let text = |id| store.get_observation(id).unwrap().unwrap().safe_text;
-        assert_eq!((text(26).as_str(), text(27).as_str()), ("certbot renew --nginx -d example.com", "certbot status"));
+        assert_eq!(
+            (text(26).as_str(), text(27).as_str()),
+            ("certbot renew --nginx -d example.com", "certbot status")
+        );
         let model = Arc::new(FakeModel::new());
         model.add_root_fn(|state| {
             let handle = state["skill"]["handle"].clone();
@@ -609,41 +745,107 @@ mod tests {
                 "procedure": [{"text": "Renew", "supports": [cite]}]}})
             .to_string()
         });
-        let seed = SkillSeed { name: "certbot-renewal", description: "Renew a TLS certificate", records: &[27, 9999, 26] };
+        let seed = SkillSeed {
+            name: "certbot-renewal",
+            description: "Renew a TLS certificate",
+            records: &[27, 9999, 26],
+        };
         let mut notes = Vec::new();
-        let result = run_investigation("q", Some(&seed), &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |p| {
-            if let Progress::Note(n) = p {
-                notes.push(n);
-            }
-        });
+        let result = run_investigation(
+            "q",
+            Some(&seed),
+            &store,
+            model.clone(),
+            BudgetV1::prototype_default(),
+            &Arc::default(),
+            &mut |p| {
+                if let Progress::Note(n) = p {
+                    notes.push(n);
+                }
+            },
+        );
         assert_eq!(result.status, InvestigationStatus::Completed);
-        assert_eq!(result.cited.values().map(|o| o.id).collect::<Vec<_>>(), [26]);
-        let states: Vec<serde_json::Value> = model.root_states().iter().map(|s| serde_json::from_str(s).unwrap()).collect();
+        assert_eq!(
+            result.cited.values().map(|o| o.id).collect::<Vec<_>>(),
+            [26]
+        );
+        let states: Vec<serde_json::Value> = model
+            .root_states()
+            .iter()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
         assert!(states[0].get("last_inspection").is_none(), "{}", states[0]);
         let gone = "record #9999, which skill certbot-renewal cites, is gone: the user forgot it. Do not reconstruct it.";
-        assert_eq!((states[0]["notes"].clone(), notes), (serde_json::json!([gone]), vec![gone.to_string()]));
+        assert_eq!(
+            (states[0]["notes"].clone(), notes),
+            (serde_json::json!([gone]), vec![gone.to_string()])
+        );
         // The inspect read the skill's handle: its first record, cut to 8 bytes.
-        assert_eq!(states[1]["last_inspection"]["items"][0]["safe_text"], "certbot ");
+        assert_eq!(
+            states[1]["last_inspection"]["items"][0]["safe_text"],
+            "certbot "
+        );
         for state in &states {
             assert_eq!(state["skill"]["name"], "certbot-renewal");
             assert_eq!(state["skill"]["description"], "Renew a TLS certificate");
-            let items: Vec<&str> = state["skill"]["items"].as_array().unwrap().iter().map(|i| i["safe_text"].as_str().unwrap()).collect();
-            assert_eq!(items, ["certbot status", "certbot renew --nginx -d example.com"]);
+            let items: Vec<&str> = state["skill"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["safe_text"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                items,
+                ["certbot status", "certbot renew --nginx -d example.com"]
+            );
         }
 
         let first_state = |skill: Option<&SkillSeed>| -> serde_json::Value {
             let model = Arc::new(FakeModel::new());
-            model.add_root_response(RootActionV1 { version: 1, expected_state_version: 0, kind: RootActionKind::Finish, plan: None,
-                finish: Some(FinishV1 { status: AnswerStatus::Abstained, answer: String::new(), claims: vec![], procedure: vec![], contradictions: vec![], missing: vec![] }) });
-            run_investigation("q", skill, &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
+            model.add_root_response(RootActionV1 {
+                version: 1,
+                expected_state_version: 0,
+                kind: RootActionKind::Finish,
+                plan: None,
+                finish: Some(FinishV1 {
+                    status: AnswerStatus::Abstained,
+                    answer: String::new(),
+                    claims: vec![],
+                    procedure: vec![],
+                    contradictions: vec![],
+                    missing: vec![],
+                }),
+            });
+            run_investigation(
+                "q",
+                skill,
+                &store,
+                model.clone(),
+                BudgetV1::prototype_default(),
+                &Arc::default(),
+                &mut |_| {},
+            );
             serde_json::from_str(&model.root_states()[0]).unwrap()
         };
         let state = first_state(None);
-        assert!(state.get("skill").is_none() && state.get("last_inspection").is_none(), "{state}");
+        assert!(
+            state.get("skill").is_none() && state.get("last_inspection").is_none(),
+            "{state}"
+        );
         // A long procedure: all of it in the handle, its first 8 shown.
         let all: Vec<i64> = (1..=50).collect();
-        let state = first_state(Some(&SkillSeed { name: "long", description: "d", records: &all }));
-        assert_eq!((state["handles"][0]["count"].as_u64(), state["skill"]["items"].as_array().unwrap().len()), (Some(50), 8));
+        let state = first_state(Some(&SkillSeed {
+            name: "long",
+            description: "d",
+            records: &all,
+        }));
+        assert_eq!(
+            (
+                state["handles"][0]["count"].as_u64(),
+                state["skill"]["items"].as_array().unwrap().len()
+            ),
+            (Some(50), 8)
+        );
     }
 
     #[test]
@@ -722,14 +924,23 @@ mod tests {
         // Core assertions for the wayfinder question:
         assert_eq!(result.status, InvestigationStatus::Completed);
         assert_eq!(result.turns, 2);
-        assert!(result.child_calls >= 2, "at least 2 child calls for assess batches");
+        assert!(
+            result.child_calls >= 2,
+            "at least 2 child calls for assess batches"
+        );
         assert!(result.finish.is_some());
 
         let finish = result.finish.unwrap();
         assert_eq!(finish.status, AnswerStatus::Answered);
         let cite = &finish.claims[0].supports[0];
-        assert_eq!(result.cited[cite].safe_text, "certbot renew --nginx -d example.com");
-        assert_eq!(&finish.procedure[0].supports[..], std::slice::from_ref(cite));
+        assert_eq!(
+            result.cited[cite].safe_text,
+            "certbot renew --nginx -d example.com"
+        );
+        assert_eq!(
+            &finish.procedure[0].supports[..],
+            std::slice::from_ref(cite)
+        );
     }
 
     #[test]
@@ -741,15 +952,29 @@ mod tests {
             "status": "answered", "answer": "certbot renew did it",
             "claims": [{"text": "certbot renew ran", "supports": ["ev1_00000000deadbeef"]}]}}).to_string());
         let mut notes = Vec::new();
-        let result = run_investigation("q", None, &store, model, BudgetV1::prototype_default(), &Arc::default(), &mut |p| {
-            if let Progress::Note(n) = p {
-                notes.push(n)
-            }
-        });
+        let result = run_investigation(
+            "q",
+            None,
+            &store,
+            model,
+            BudgetV1::prototype_default(),
+            &Arc::default(),
+            &mut |p| {
+                if let Progress::Note(n) = p {
+                    notes.push(n)
+                }
+            },
+        );
         assert_eq!(result.status, InvestigationStatus::Abstained);
         let finish = result.finish.unwrap();
-        assert!(finish.claims.is_empty() && finish.answer.is_empty() && result.cited.is_empty(), "{finish:?}");
-        assert!(finish.missing[0].contains("ev1_00000000deadbeef") && notes == finish.missing, "{finish:?}");
+        assert!(
+            finish.claims.is_empty() && finish.answer.is_empty() && result.cited.is_empty(),
+            "{finish:?}"
+        );
+        assert!(
+            finish.missing[0].contains("ev1_00000000deadbeef") && notes == finish.missing,
+            "{finish:?}"
+        );
     }
 
     /// Run search `certbot` -> assess -> select `verdicts` -> inspect with
@@ -791,14 +1016,25 @@ mod tests {
                 missing: vec!["test".into()],
             }),
         });
-        let result = run_investigation("q", None, &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
+        let result = run_investigation(
+            "q",
+            None,
+            &store,
+            model.clone(),
+            BudgetV1::prototype_default(),
+            &Arc::default(),
+            &mut |_| {},
+        );
         assert_eq!(result.status, InvestigationStatus::Abstained);
         serde_json::from_str(&model.root_states()[1]).unwrap()
     }
 
     /// Judge `certbot renew` with `renew` and `certbot status` with `status`;
     /// `None` leaves an item out of the result.
-    fn judge(renew: Option<Verdict>, status: Option<Verdict>) -> impl Fn(&EvidencePacket) -> ChildResultV1 + Send {
+    fn judge(
+        renew: Option<Verdict>,
+        status: Option<Verdict>,
+    ) -> impl Fn(&EvidencePacket) -> ChildResultV1 + Send {
         move |p| ChildResultV1 {
             version: 1,
             packet_id: p.packet_id.clone(),
@@ -806,7 +1042,11 @@ mod tests {
                 .items
                 .iter()
                 .filter_map(|item| {
-                    let verdict = if item.safe_text.contains("renew") { renew.clone() } else { status.clone() };
+                    let verdict = if item.safe_text.contains("renew") {
+                        renew.clone()
+                    } else {
+                        status.clone()
+                    };
                     Some(ItemAssessmentV1 {
                         item_id: item.item_id.clone(),
                         verdict: verdict?,
@@ -820,7 +1060,12 @@ mod tests {
     }
 
     fn inspected(state: &serde_json::Value) -> Vec<&str> {
-        state["last_inspection"]["items"].as_array().unwrap().iter().map(|i| i["safe_text"].as_str().unwrap()).collect()
+        state["last_inspection"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["safe_text"].as_str().unwrap())
+            .collect()
     }
 
     #[test]
@@ -838,9 +1083,17 @@ mod tests {
     #[test]
     fn an_item_the_child_skipped_never_passes_select() {
         use Verdict::*;
-        let state = select_through(judge(Some(Contradicts), None), vec![Supports, Contradicts, Unclear, Irrelevant]);
+        let state = select_through(
+            judge(Some(Contradicts), None),
+            vec![Supports, Contradicts, Unclear, Irrelevant],
+        );
         assert_eq!(inspected(&state), ["certbot renew --nginx -d example.com"]);
-        let assessed = state["handles"].as_array().unwrap().iter().find(|h| h["kind"] == "AssessmentSet").unwrap();
+        let assessed = state["handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["kind"] == "AssessmentSet")
+            .unwrap();
         assert_eq!(
             assessed["verdicts"],
             serde_json::json!({"supports": 0, "contradicts": 1, "unclear": 0, "irrelevant": 0, "unassessed": 1})
@@ -862,11 +1115,26 @@ mod tests {
         model.add_root_raw(finish.to_string());
 
         let q = "why did mysql --password=hunter2hunter2 fail?";
-        let result = run_investigation(q, None, &store, model.clone(), BudgetV1::prototype_default(), &Arc::default(), &mut |_| {});
+        let result = run_investigation(
+            q,
+            None,
+            &store,
+            model.clone(),
+            BudgetV1::prototype_default(),
+            &Arc::default(),
+            &mut |_| {},
+        );
         let sent = model.requests();
-        assert!(sent.iter().all(|r| !r.user().contains("hunter2hunter2")), "{:?}", sent[0].user());
+        assert!(
+            sent.iter().all(|r| !r.user().contains("hunter2hunter2")),
+            "{:?}",
+            sent[0].user()
+        );
         let answer = result.finish.unwrap().answer;
-        assert!(!answer.contains("modelsaid42") && answer.contains("[REDACTED:"), "{answer}");
+        assert!(
+            !answer.contains("modelsaid42") && answer.contains("[REDACTED:"),
+            "{answer}"
+        );
     }
 
     #[test]
@@ -878,9 +1146,23 @@ mod tests {
 
         let mut events = Vec::new();
         let cancel = Arc::new(AtomicBool::new(true));
-        let result = run_investigation("q", None, &store, model.clone(), BudgetV1::prototype_default(), &cancel, &mut |p| events.push(p));
-        assert_eq!((result.status, result.turns), (InvestigationStatus::Cancelled, 0));
-        assert!(model.root_states().is_empty() && events.is_empty(), "{events:?}");
+        let result = run_investigation(
+            "q",
+            None,
+            &store,
+            model.clone(),
+            BudgetV1::prototype_default(),
+            &cancel,
+            &mut |p| events.push(p),
+        );
+        assert_eq!(
+            (result.status, result.turns),
+            (InvestigationStatus::Cancelled, 0)
+        );
+        assert!(
+            model.root_states().is_empty() && events.is_empty(),
+            "{events:?}"
+        );
     }
 
     #[test]
@@ -896,7 +1178,13 @@ mod tests {
             contradictions: vec![],
             missing: vec!["m".into()],
         };
-        let action = RootActionV1 { version: 1, expected_state_version: 0, kind: RootActionKind::Finish, plan: None, finish: Some(finish) };
+        let action = RootActionV1 {
+            version: 1,
+            expected_state_version: 0,
+            kind: RootActionKind::Finish,
+            plan: None,
+            finish: Some(finish),
+        };
         // Ctrl-C while the root call is out.
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
@@ -904,7 +1192,15 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
             serde_json::to_string(&action).unwrap()
         });
-        let result = run_investigation("q", None, &store, model.clone(), BudgetV1::prototype_default(), &cancel, &mut |_| {});
+        let result = run_investigation(
+            "q",
+            None,
+            &store,
+            model.clone(),
+            BudgetV1::prototype_default(),
+            &cancel,
+            &mut |_| {},
+        );
         assert_eq!(model.root_states().len(), 1, "the call was made");
         assert_eq!(result.status, InvestigationStatus::Cancelled);
         assert!(result.finish.is_none());
@@ -932,9 +1228,23 @@ mod tests {
 
         let mut events = Vec::new();
         // One child at a time, so there is a next one to hold back.
-        let budget = BudgetV1 { max_concurrency: 1, ..BudgetV1::prototype_default() };
-        let result = run_investigation("q", None, &store, model.clone(), budget, &cancel, &mut |p| events.push(p));
-        assert_eq!((result.status, result.child_calls), (InvestigationStatus::Cancelled, 1));
+        let budget = BudgetV1 {
+            max_concurrency: 1,
+            ..BudgetV1::prototype_default()
+        };
+        let result = run_investigation(
+            "q",
+            None,
+            &store,
+            model.clone(),
+            budget,
+            &cancel,
+            &mut |p| events.push(p),
+        );
+        assert_eq!(
+            (result.status, result.child_calls),
+            (InvestigationStatus::Cancelled, 1)
+        );
         events.retain(|e| !matches!(e, Progress::Egress(_) | Progress::Replied { .. }));
         assert_eq!(
             events,
@@ -942,7 +1252,10 @@ mod tests {
                 Progress::RootCall { turn: 1 },
                 Progress::Op { op_id: "s1".into() },
                 Progress::Op { op_id: "a1".into() },
-                Progress::ChildCall { op_id: "a1".into(), packet_id: "pkt_00".into() },
+                Progress::ChildCall {
+                    op_id: "a1".into(),
+                    packet_id: "pkt_00".into()
+                },
             ]
         );
     }
@@ -1027,7 +1340,15 @@ mod tests {
         let mut budget = BudgetV1::prototype_default();
         budget.root_calls = 0;
 
-        let result = run_investigation("test", None, &store, model.clone(), budget, &Arc::default(), &mut |_| {});
+        let result = run_investigation(
+            "test",
+            None,
+            &store,
+            model.clone(),
+            budget,
+            &Arc::default(),
+            &mut |_| {},
+        );
         assert_eq!(result.status, InvestigationStatus::BudgetExhausted);
         assert_eq!(result.turns, 0);
     }

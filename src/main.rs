@@ -39,7 +39,10 @@ fn broken_pipe(e: &(dyn std::error::Error + 'static)) -> bool {
     let kind = e
         .downcast_ref::<std::io::Error>()
         .map(std::io::Error::kind)
-        .or_else(|| e.downcast_ref::<serde_json::Error>().and_then(serde_json::Error::io_error_kind));
+        .or_else(|| {
+            e.downcast_ref::<serde_json::Error>()
+                .and_then(serde_json::Error::io_error_kind)
+        });
     kind == Some(ErrorKind::BrokenPipe)
 }
 
@@ -52,12 +55,29 @@ fn run(cmd: Command) -> Result<ExitCode> {
         Command::Version => {
             // The gate harness reads the build from here: nothing else tells a
             // headless, full or debug binary apart from outside.
-            let build = if cfg!(feature = "tui") { "tui" } else { "headless" };
-            let debug = if cfg!(debug_assertions) { ", debug" } else { "" };
-            writeln!(std::io::stdout().lock(), "relic {} ({build}{debug})", env!("CARGO_PKG_VERSION"))?;
+            let build = if cfg!(feature = "tui") {
+                "tui"
+            } else {
+                "headless"
+            };
+            let debug = if cfg!(debug_assertions) {
+                ", debug"
+            } else {
+                ""
+            };
+            writeln!(
+                std::io::stdout().lock(),
+                "relic {} ({build}{debug})",
+                env!("CARGO_PKG_VERSION")
+            )?;
         }
         Command::Search(args) => return search(args),
-        Command::Recall { question, db, json, allow_unknown_cost } => {
+        Command::Recall {
+            question,
+            db,
+            json,
+            allow_unknown_cost,
+        } => {
             return recall(&question, db, json, allow_unknown_cost);
         }
         Command::Ui { db } => ui(&existing_db(db)?)?,
@@ -67,7 +87,10 @@ fn run(cmd: Command) -> Result<ExitCode> {
             let (receipt, verdict) = chat::check(&client);
             // Terminal-safe: the receipt quotes the endpoint's error text.
             let mut out = std::io::stdout().lock();
-            receipt.serialize(&mut serde_json::Serializer::with_formatter(&mut out, TerminalSafe))?;
+            receipt.serialize(&mut serde_json::Serializer::with_formatter(
+                &mut out,
+                TerminalSafe,
+            ))?;
             writeln!(out)?;
             verdict.map_err(|e| format!("model check failed: {e}"))?;
         }
@@ -75,7 +98,10 @@ fn run(cmd: Command) -> Result<ExitCode> {
             let page = app::show(&Store::open_read_only(&existing_db(db)?)?, &ids)?;
             let mut out = std::io::stdout().lock();
             if json {
-                page.serialize(&mut serde_json::Serializer::with_formatter(&mut out, TerminalSafe))?;
+                page.serialize(&mut serde_json::Serializer::with_formatter(
+                    &mut out,
+                    TerminalSafe,
+                ))?;
                 writeln!(out)?;
             } else {
                 for r in &page.records {
@@ -87,46 +113,87 @@ fn run(cmd: Command) -> Result<ExitCode> {
             }
             if !page.missing.is_empty() {
                 let ids: Vec<String> = page.missing.iter().map(|id| format!("#{id}")).collect();
-                eprintln!("relic: no such record: {} (forgotten, or never stored)", ids.join(" "));
+                eprintln!(
+                    "relic: no such record: {} (forgotten, or never stored)",
+                    ids.join(" ")
+                );
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Command::Validate { report, cwd, db, argv } => {
+        Command::Validate {
+            report,
+            cwd,
+            db,
+            argv,
+        } => {
             let (_, digest) = relic::catalog::read_report(&std::fs::read(&report)?)?;
             let cwd = match cwd {
                 Some(dir) => dir,
                 None => std::env::current_dir()?,
             };
-            let catalog = relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
+            let catalog =
+                relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
             // Ctrl-C or a kill stops the verifier too, then Relic.
             relic::signal::install();
             let (record, said) = relic::validation::run(&argv, &cwd)?;
             let id = catalog.add_validation(&digest, &record)?;
             let ran = app::display_line(&record.command);
             if record.confirmed() {
-                eprintln!("relic: validation {id}: `{ran}` passed in {} ms; this report can be compiled", record.duration_ms);
+                eprintln!(
+                    "relic: validation {id}: `{ran}` passed in {} ms; this report can be compiled",
+                    record.duration_ms
+                );
             } else {
                 let how = match record.outcome {
                     relic::validation::Outcome::TimedOut => "ran past its time limit".into(),
-                    relic::validation::Outcome::TooLarge => "wrote more output than Relic reads".into(),
-                    _ => record.exit_code.map_or("was killed by a signal".into(), |c| format!("exited {c}")),
+                    relic::validation::Outcome::TooLarge => {
+                        "wrote more output than Relic reads".into()
+                    }
+                    _ => record
+                        .exit_code
+                        .map_or("was killed by a signal".into(), |c| format!("exited {c}")),
                 };
-                let said = said.map(|l| format!(": {}", app::display_line(&l))).unwrap_or_default();
+                let said = said
+                    .map(|l| format!(": {}", app::display_line(&l)))
+                    .unwrap_or_default();
                 eprintln!("relic: validation {id}: `{ran}` {how}{said}");
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Command::SkillCompile { report, name, description, db } => {
+        Command::SkillCompile {
+            report,
+            name,
+            description,
+            db,
+        } => {
             let db = existing_db(db)?;
             let catalog = relic::catalog::Catalog::open(&relic::catalog::dir_for(&db))?;
-            let bundle = catalog.compile(&Store::open_read_only(&db)?, &std::fs::read(&report)?, &name, &description)?;
-            eprintln!("relic: compiled {name} as {}; activate it with relic skill activate {name}", shown(&bundle.path));
+            let bundle = catalog.compile(
+                &Store::open_read_only(&db)?,
+                &std::fs::read(&report)?,
+                &name,
+                &description,
+            )?;
+            eprintln!(
+                "relic: compiled {name} as {}; activate it with relic skill activate {name}",
+                shown(&bundle.path)
+            );
         }
-        Command::SkillActivate { name, scope, claude, yes, db } => {
-            let catalog = relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
+        Command::SkillActivate {
+            name,
+            scope,
+            claude,
+            yes,
+            db,
+        } => {
+            let catalog =
+                relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
             let bundle = catalog.bundle(&name)?;
             let links = skill_links(&name, &scope, claude)?;
-            eprintln!("relic: {name} ({}) will be linked from:", &bundle.hash[..12]);
+            eprintln!(
+                "relic: {name} ({}) will be linked from:",
+                &bundle.hash[..12]
+            );
             for link in &links {
                 eprintln!("    {}", shown(link));
             }
@@ -135,14 +202,24 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
             catalog.activate(&bundle, &links)?;
-            eprintln!("relic: activated {name}; an agent already running may need a restart or skill reload to see it");
+            eprintln!(
+                "relic: activated {name}; an agent already running may need a restart or skill reload to see it"
+            );
         }
-        Command::SkillRollback { name, scope, claude, db } => {
-            let catalog = relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
+        Command::SkillRollback {
+            name,
+            scope,
+            claude,
+            db,
+        } => {
+            let catalog =
+                relic::catalog::Catalog::open(&relic::catalog::dir_for(&existing_db(db)?))?;
             let links = skill_links(&name, &scope, claude)?;
             for (link, now) in links.iter().zip(catalog.rollback(&links)?) {
                 match now {
-                    Some(hash) => eprintln!("relic: {} points at {} again", shown(link), &hash[..12]),
+                    Some(hash) => {
+                        eprintln!("relic: {} points at {} again", shown(link), &hash[..12])
+                    }
                     None => eprintln!("relic: removed {}", shown(link)),
                 }
             }
@@ -158,30 +235,43 @@ fn run(cmd: Command) -> Result<ExitCode> {
             if !scrubbed {
                 eprintln!("{SCRUB_BLOCKED}");
             }
-            let unknown: Vec<String> =
-                ids.iter().filter(|id| !forgotten.contains(id)).map(|id| format!("#{id}")).collect();
+            let unknown: Vec<String> = ids
+                .iter()
+                .filter(|id| !forgotten.contains(id))
+                .map(|id| format!("#{id}"))
+                .collect();
             if !unknown.is_empty() {
                 return Err(format!("no such record: {}", unknown.join(" ")).into());
             }
         }
         Command::Import { path, shell, db } if path.is_dir() => {
             if shell.is_some() {
-                return Err(format!("{} is a directory: a Git repository takes no --shell", shown(&path)).into());
+                return Err(format!(
+                    "{} is a directory: a Git repository takes no --shell",
+                    shown(&path)
+                )
+                .into());
             }
             let owns_dir = cli::owns_data_dir(&db);
             let db = cli::resolve_db(db)?;
             // All of Git before the store: a directory that is no repository,
             // or one git cannot read, leaves no store behind.
-            let repo = relic::source::git::read(&path).map_err(|e| format!("{}: {e}", shown(&path)))?;
+            let repo =
+                relic::source::git::read(&path).map_err(|e| format!("{}: {e}", shown(&path)))?;
             if let Some(dir) = db.parent() {
                 std::fs::create_dir_all(dir)?;
             }
             tighten(&db, owns_dir);
-            let r = match Store::open(&db).map_err(ImportError::from).and_then(|mut store| {
-                relic::import::import_git(&mut store, repo, &relic::redact::Redactor::new())
-            }) {
+            let r = match Store::open(&db)
+                .map_err(ImportError::from)
+                .and_then(|mut store| {
+                    relic::import::import_git(&mut store, repo, &relic::redact::Redactor::new())
+                }) {
                 Err(ImportError::Busy) => {
-                    eprintln!("relic: busy: another import is writing {}; try again", shown(&db));
+                    eprintln!(
+                        "relic: busy: another import is writing {}; try again",
+                        shown(&db)
+                    );
                     return Ok(ExitCode::from(2));
                 }
                 r => r?,
@@ -189,12 +279,18 @@ fn run(cmd: Command) -> Result<ExitCode> {
             store_notes(r.rescrubbed, r.scrub_blocked, r.checkpoint_blocked);
             let name = shown(&path);
             if r.lossy_records > 0 {
-                eprintln!("relic: warning: {name}: {} Git records stored lossy (cut, or not UTF-8)", r.lossy_records);
+                eprintln!(
+                    "relic: warning: {name}: {} Git records stored lossy (cut, or not UTF-8)",
+                    r.lossy_records
+                );
             }
             let (moves, refs) = (r.reflog_stored, r.refs_stored);
             match r.outcome {
                 Outcome::Unchanged => eprintln!("{name}: no new reflog entries or refs"),
-                Outcome::First => eprintln!("{name}: stored {moves} reflog entries and {refs} refs in {}", shown(&db)),
+                Outcome::First => eprintln!(
+                    "{name}: stored {moves} reflog entries and {refs} refs in {}",
+                    shown(&db)
+                ),
                 _ => eprintln!("{name}: added {moves} reflog entries and {refs} refs"),
             }
         }
@@ -213,7 +309,10 @@ fn run(cmd: Command) -> Result<ExitCode> {
             tighten(&db, owns_dir);
             let r = match import(&db, &history, shell) {
                 Err(ImportError::Busy) => {
-                    eprintln!("relic: busy: another import is writing {}; try again", shown(&db));
+                    eprintln!(
+                        "relic: busy: another import is writing {}; try again",
+                        shown(&db)
+                    );
                     return Ok(ExitCode::from(2));
                 }
                 r => r?,
@@ -227,10 +326,16 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 );
             }
             if r.lossy_records > 0 {
-                eprintln!("relic: warning: {name}: {} commands stored lossy (cut, or not decodable)", r.lossy_records);
+                eprintln!(
+                    "relic: warning: {name}: {} commands stored lossy (cut, or not decodable)",
+                    r.lossy_records
+                );
             }
             if r.dangling_meta > 0 {
-                eprintln!("relic: warning: {name}: {} dangling zsh Meta bytes", r.dangling_meta);
+                eprintln!(
+                    "relic: warning: {name}: {} dangling zsh Meta bytes",
+                    r.dangling_meta
+                );
             }
             if r.incomplete_tail {
                 eprintln!("relic: note: {name}: the last record is incomplete and was not stored");
@@ -238,14 +343,26 @@ fn run(cmd: Command) -> Result<ExitCode> {
             if let Some(warning) = &r.key_warning {
                 eprintln!("relic: note: {}", app::display_line(warning));
             }
-            unread_notes(r.kind, r.unreadable, r.unsupported.iter().map(|v| (v.as_str(), 1)));
-            let what = if r.kind == SourceKind::Claude { "records" } else { "commands" };
+            unread_notes(
+                r.kind,
+                r.unreadable,
+                r.unsupported.iter().map(|v| (v.as_str(), 1)),
+            );
+            let what = if r.kind == SourceKind::Claude {
+                "records"
+            } else {
+                "commands"
+            };
             match r.outcome {
                 Outcome::Unchanged => eprintln!("{name}: unchanged since last import"),
-                Outcome::First => eprintln!("{name}: stored {n} {} {what} in {}", r.kind, shown(&db)),
+                Outcome::First => {
+                    eprintln!("{name}: stored {n} {} {what} in {}", r.kind, shown(&db))
+                }
                 Outcome::Appended => eprintln!("{name}: added {n} new {what}"),
                 Outcome::Aligned => {
-                    eprintln!("{name}: the file was rewritten; added {n} new {what} and kept the earlier ones")
+                    eprintln!(
+                        "{name}: the file was rewritten; added {n} new {what} and kept the earlier ones"
+                    )
                 }
                 Outcome::Superseded => eprintln!(
                     "{name}: the file was rewritten beyond what relic could align; stored it whole ({n} {what}) as a new revision and kept the earlier ones"
@@ -254,7 +371,11 @@ fn run(cmd: Command) -> Result<ExitCode> {
         }
         Command::ImportSessions { kind, path, db } => return import_sessions(kind, path, db),
         Command::Hook { shell } => {
-            let hook = if shell == SourceKind::Zsh { relic::source::hook::ZSH } else { relic::source::hook::BASH };
+            let hook = if shell == SourceKind::Zsh {
+                relic::source::hook::ZSH
+            } else {
+                relic::source::hook::BASH
+            };
             std::io::stdout().lock().write_all(hook.as_bytes())?;
         }
     }
@@ -268,9 +389,15 @@ fn run(cmd: Command) -> Result<ExitCode> {
 fn skill_links(name: &str, scope: &cli::Scope, claude: bool) -> Result<Vec<PathBuf>> {
     let base = match scope {
         cli::Scope::User => home().ok_or("HOME is not set")?,
-        cli::Scope::Project(dir) => std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", shown(dir)))?,
+        cli::Scope::Project(dir) => {
+            std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", shown(dir)))?
+        }
     };
-    let dirs: &[&str] = if claude { &[".agents", ".claude"] } else { &[".agents"] };
+    let dirs: &[&str] = if claude {
+        &[".agents", ".claude"]
+    } else {
+        &[".agents"]
+    };
     let mut links = Vec::new();
     for d in dirs {
         let skills = base.join(d).join("skills");
@@ -304,21 +431,38 @@ fn confirm(question: &str) -> Result<bool> {
 /// Import every Claude Code or shell hook session under `path`, or the one
 /// session it names, each its own source, and say what they added in total.
 /// A session that fails is named and the rest still import.
-fn import_sessions(kind: SourceKind, path: Option<PathBuf>, db: Option<PathBuf>) -> Result<ExitCode> {
+fn import_sessions(
+    kind: SourceKind,
+    path: Option<PathBuf>,
+    db: Option<PathBuf>,
+) -> Result<ExitCode> {
     use std::collections::BTreeMap;
     let owns_dir = cli::owns_data_dir(&db);
     let db = cli::resolve_db(db)?;
-    let env_dir = |var| std::env::var_os(var).filter(|d| !d.is_empty()).map(PathBuf::from);
+    let env_dir = |var| {
+        std::env::var_os(var)
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+    };
     let (root, extension, what) = match (path, kind) {
         (Some(path), SourceKind::Hook) => (path, "frames", "shell hook"),
         (Some(path), _) => (path, "jsonl", "Claude Code"),
         (None, SourceKind::Hook) => {
-            let state = env_dir("XDG_STATE_HOME").or_else(|| home().map(|h| h.join(".local/state")));
-            (state.ok_or("HOME is not set")?.join("relic/hooks"), "frames", "shell hook")
+            let state =
+                env_dir("XDG_STATE_HOME").or_else(|| home().map(|h| h.join(".local/state")));
+            (
+                state.ok_or("HOME is not set")?.join("relic/hooks"),
+                "frames",
+                "shell hook",
+            )
         }
         (None, _) => {
             let config = env_dir("CLAUDE_CONFIG_DIR").or_else(|| home().map(|h| h.join(".claude")));
-            (config.ok_or("HOME is not set")?.join("projects"), "jsonl", "Claude Code")
+            (
+                config.ok_or("HOME is not set")?.join("projects"),
+                "jsonl",
+                "Claude Code",
+            )
         }
     };
     let sessions = session_files(&root, extension).map_err(|e| format!("{}: {e}", shown(&root)))?;
@@ -331,16 +475,21 @@ fn import_sessions(kind: SourceKind, path: Option<PathBuf>, db: Option<PathBuf>)
     tighten(&db, owns_dir);
     let mut store = Store::open(&db)?;
     let redactor = relic::redact::Redactor::new();
-    let (mut stored, mut grew, mut unchanged, mut unreadable, mut lossy, mut writing) = (0, 0, 0, 0, 0, 0);
+    let (mut stored, mut grew, mut unchanged, mut unreadable, mut lossy, mut writing) =
+        (0, 0, 0, 0, 0, 0);
     let (mut rescrubbed, mut scrub_blocked, mut checkpoint_blocked) = (0, false, false);
     let mut unsupported: BTreeMap<String, usize> = BTreeMap::new();
     let mut failed = Vec::new();
     for session in &sessions {
-        let r = History::open(session).and_then(|h| relic::import::import(&mut store, &h, Some(kind), &redactor));
+        let r = History::open(session)
+            .and_then(|h| relic::import::import(&mut store, &h, Some(kind), &redactor));
         let r = match r {
             Ok(r) => r,
             Err(ImportError::Busy) => {
-                eprintln!("relic: busy: another import is writing {}; try again", shown(&db));
+                eprintln!(
+                    "relic: busy: another import is writing {}; try again",
+                    shown(&db)
+                );
                 return Ok(ExitCode::from(2));
             }
             // Claude Code deletes old sessions, and so may the user.
@@ -353,7 +502,11 @@ fn import_sessions(kind: SourceKind, path: Option<PathBuf>, db: Option<PathBuf>)
         stored += r.records_stored;
         grew += usize::from(r.records_stored > 0);
         unchanged += usize::from(r.outcome == Outcome::Unchanged);
-        (unreadable, lossy, writing) = (unreadable + r.unreadable, lossy + r.lossy_records, writing + usize::from(r.incomplete_tail));
+        (unreadable, lossy, writing) = (
+            unreadable + r.unreadable,
+            lossy + r.lossy_records,
+            writing + usize::from(r.incomplete_tail),
+        );
         rescrubbed += r.rescrubbed;
         scrub_blocked |= r.scrub_blocked;
         checkpoint_blocked |= r.checkpoint_blocked;
@@ -365,14 +518,24 @@ fn import_sessions(kind: SourceKind, path: Option<PathBuf>, db: Option<PathBuf>)
         }
     }
     store_notes(rescrubbed, scrub_blocked, checkpoint_blocked);
-    unread_notes(kind, unreadable, unsupported.iter().map(|(v, n)| (v.as_str(), *n)));
+    unread_notes(
+        kind,
+        unreadable,
+        unsupported.iter().map(|(v, n)| (v.as_str(), *n)),
+    );
     if lossy > 0 && kind == SourceKind::Hook {
-        eprintln!("relic: note: {lossy} records were stored altered: a line break in a directory, or text that was not UTF-8");
+        eprintln!(
+            "relic: note: {lossy} records were stored altered: a line break in a directory, or text that was not UTF-8"
+        );
     } else if lossy > 0 {
-        eprintln!("relic: note: {lossy} records were stored cut: long outputs keep their start and end");
+        eprintln!(
+            "relic: note: {lossy} records were stored cut: long outputs keep their start and end"
+        );
     }
     if writing > 0 {
-        eprintln!("relic: note: {writing} sessions were being written; their last line waits for the next import");
+        eprintln!(
+            "relic: note: {writing} sessions were being written; their last line waits for the next import"
+        );
     }
     eprintln!(
         "{}: added {stored} records from {grew} of {} sessions; {unchanged} unchanged since last import",
@@ -386,7 +549,11 @@ fn import_sessions(kind: SourceKind, path: Option<PathBuf>, db: Option<PathBuf>)
         }
         eprintln!("relic: {}", app::display_line(why));
     }
-    Ok(if failed.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(2) })
+    Ok(if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
 }
 
 /// `path` if it is a file, else every `*.<extension>` file below it, in path
@@ -415,10 +582,16 @@ fn session_files(path: &Path, extension: &str) -> std::io::Result<Vec<PathBuf>> 
 }
 
 /// What a Claude Code or shell hook import left unread.
-fn unread_notes<'a>(kind: SourceKind, unreadable: usize, unsupported: impl Iterator<Item = (&'a str, usize)>) {
+fn unread_notes<'a>(
+    kind: SourceKind,
+    unreadable: usize,
+    unsupported: impl Iterator<Item = (&'a str, usize)>,
+) {
     use relic::source::claude::{NEWEST, OLDEST};
     if kind == SourceKind::Hook && unreadable > 0 {
-        eprintln!("relic: warning: {unreadable} shell hook frames were skipped: over 1 MiB, or not what relic hook writes");
+        eprintln!(
+            "relic: warning: {unreadable} shell hook frames were skipped: over 1 MiB, or not what relic hook writes"
+        );
     } else if unreadable > 0 {
         eprintln!(
             "relic: warning: {unreadable} Claude Code records were skipped: over 1 MiB, or not the JSON this relic knows"
@@ -436,13 +609,17 @@ fn unread_notes<'a>(kind: SourceKind, unreadable: usize, unsupported: impl Itera
 /// What an import of either kind of source did to the store as a whole.
 fn store_notes(rescrubbed: usize, scrub_blocked: bool, checkpoint_blocked: bool) {
     if rescrubbed > 0 {
-        eprintln!("relic: redaction rules changed since they were stored: re-redacted {rescrubbed} stored commands");
+        eprintln!(
+            "relic: redaction rules changed since they were stored: re-redacted {rescrubbed} stored commands"
+        );
     }
     if scrub_blocked {
         eprintln!("{SCRUB_BLOCKED}");
     }
     if checkpoint_blocked {
-        eprintln!("relic: note: WAL not checkpointed: a reader is active; the next large import retries");
+        eprintln!(
+            "relic: note: WAL not checkpointed: a reader is active; the next large import retries"
+        );
     }
 }
 
@@ -459,18 +636,26 @@ fn tighten(db: &Path, owns_dir: bool) {
         path.push(suffix);
         PathBuf::from(path)
     };
-    let dir = db.parent().filter(|_| owns_dir).map(|dir| (dir.to_path_buf(), 0o700));
+    let dir = db
+        .parent()
+        .filter(|_| owns_dir)
+        .map(|dir| (dir.to_path_buf(), 0o700));
     let files = ["", "-wal", "-shm", ".key"].map(|suffix| (side(suffix), 0o600));
     // SAFETY: getuid has no preconditions and cannot fail.
     let me = unsafe { libc::getuid() };
     for (path, mode) in dir.into_iter().chain(files) {
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
         if meta.uid() != me {
             eprintln!("relic: warning: {} is owned by another user", shown(&path));
         } else if meta.mode() & 0o077 != 0
             && let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
         {
-            eprintln!("relic: warning: could not make {} owner-only: {e}", shown(&path));
+            eprintln!(
+                "relic: warning: could not make {} owner-only: {e}",
+                shown(&path)
+            );
         }
     }
 }
@@ -486,12 +671,29 @@ fn import(
 
 fn search(args: SearchArgs) -> Result<ExitCode> {
     let store = Store::open_read_only(&existing_db(args.db)?)?;
-    let mode = if args.prefix { MatchMode::PrefixLast } else { MatchMode::Words };
-    let order = if args.rank { Order::Rank } else { Order::RecentlyImported };
+    let mode = if args.prefix {
+        MatchMode::PrefixLast
+    } else {
+        MatchMode::Words
+    };
+    let order = if args.rank {
+        Order::Rank
+    } else {
+        Order::RecentlyImported
+    };
     // fzf is for narrowing a broad page; 20 rows would defeat it.
-    let default_limit = if args.output == Output::Fzf { app::MAX_PAGE } else { 20 };
+    let default_limit = if args.output == Output::Fzf {
+        app::MAX_PAGE
+    } else {
+        20
+    };
     let limit = args.limit.unwrap_or(default_limit);
-    let req = SearchRequest { query: args.query, limit, mode, order };
+    let req = SearchRequest {
+        query: args.query,
+        limit,
+        mode,
+        order,
+    };
     let page = app::search(&store, &req, &Budget::start())?;
     // Recent commands are what a typing surface shows; to a script they would
     // pass for matches. A query that searched nothing is a usage error.
@@ -509,12 +711,19 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
             ),
             _ => "search matches words of letters or digits".into(),
         };
-        return Err(format!("nothing to search for in \"{}\": {why}", app::display_line(&page.query)).into());
+        return Err(format!(
+            "nothing to search for in \"{}\": {why}",
+            app::display_line(&page.query)
+        )
+        .into());
     }
     let mut out = std::io::stdout().lock();
     match args.output {
         Output::Json => {
-            page.serialize(&mut serde_json::Serializer::with_formatter(&mut out, TerminalSafe))?;
+            page.serialize(&mut serde_json::Serializer::with_formatter(
+                &mut out,
+                TerminalSafe,
+            ))?;
             writeln!(out)?;
         }
         Output::Text => print_page(&mut out, &page)?,
@@ -544,7 +753,12 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
             let view = app::open_evidence(&store, id, 3)?.ok_or("selected evidence vanished")?;
             for o in &view.timeline {
                 let mark = if o.id == id { ">" } else { " " };
-                writeln!(out, "{mark} {} {}", view.when(o).label(), app::display_line(&o.safe_text))?;
+                writeln!(
+                    out,
+                    "{mark} {} {}",
+                    view.when(o).label(),
+                    app::display_line(&o.safe_text)
+                )?;
             }
         }
     }
@@ -554,7 +768,12 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn recall(question: &str, db: Option<PathBuf>, json: bool, allow_unknown_cost: bool) -> Result<ExitCode> {
+fn recall(
+    question: &str,
+    db: Option<PathBuf>,
+    json: bool,
+    allow_unknown_cost: bool,
+) -> Result<ExitCode> {
     use relic::app::RecallOutcome;
     use relic::rlm::model::ModelBoundary;
     let db = existing_db(db)?;
@@ -577,12 +796,21 @@ fn recall(question: &str, db: Option<PathBuf>, json: bool, allow_unknown_cost: b
     let cancel = Arc::new(AtomicBool::new(false));
     relic::signal::interrupt_cancels(Arc::clone(&cancel));
     // Every request's size and destination is the payload audit (ADR 0004).
-    let report = app::recall(question, &store, &skills, model, &app::recall_log_path(&db), &cancel, &mut |p| {
-        eprintln!("relic: {}", app::display_line(&p.to_string()))
-    });
+    let report = app::recall(
+        question,
+        &store,
+        &skills,
+        model,
+        &app::recall_log_path(&db),
+        &cancel,
+        &mut |p| eprintln!("relic: {}", app::display_line(&p.to_string())),
+    );
     let mut out = std::io::stdout().lock();
     if json {
-        report.serialize(&mut serde_json::Serializer::with_formatter(&mut out, TerminalSafe))?;
+        report.serialize(&mut serde_json::Serializer::with_formatter(
+            &mut out,
+            TerminalSafe,
+        ))?;
         writeln!(out)?;
     } else {
         print_recall(&mut out, &report)?;
@@ -610,7 +838,12 @@ fn recall(question: &str, db: Option<PathBuf>, json: bool, allow_unknown_cost: b
 /// Model text is as hostile as history text: every line through
 /// `display_line`.
 fn print_recall(out: &mut impl Write, r: &app::RecallReport) -> Result<()> {
-    let cites = |ids: &[i64]| ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
+    let cites = |ids: &[i64]| {
+        ids.iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let outcome = match r.outcome {
         app::RecallOutcome::Answered => "answered",
         app::RecallOutcome::Partial => "partly answered",
@@ -627,16 +860,34 @@ fn print_recall(out: &mut impl Write, r: &app::RecallReport) -> Result<()> {
         writeln!(out, "claims:")?;
     }
     for c in &r.claims {
-        let against = if c.contradicts.is_empty() { String::new() } else { format!(", against {}", cites(&c.contradicts)) };
-        writeln!(out, "  - {} [{}{against}]", app::display_line(&c.text), cites(&c.supports))?;
+        let against = if c.contradicts.is_empty() {
+            String::new()
+        } else {
+            format!(", against {}", cites(&c.contradicts))
+        };
+        writeln!(
+            out,
+            "  - {} [{}{against}]",
+            app::display_line(&c.text),
+            cites(&c.supports)
+        )?;
     }
     if !r.procedure.is_empty() {
         writeln!(out, "procedure:")?;
     }
     for (i, s) in r.procedure.iter().enumerate() {
-        writeln!(out, "  {}. {} [{}]", i + 1, app::display_line(&s.text), cites(&s.supports))?;
+        writeln!(
+            out,
+            "  {}. {} [{}]",
+            i + 1,
+            app::display_line(&s.text),
+            cites(&s.supports)
+        )?;
     }
-    for (label, items) in [("contradictions", &r.contradictions), ("missing", &r.missing)] {
+    for (label, items) in [
+        ("contradictions", &r.contradictions),
+        ("missing", &r.missing),
+    ] {
         if !items.is_empty() {
             writeln!(out, "{label}:")?;
         }
@@ -648,11 +899,30 @@ fn print_recall(out: &mut impl Write, r: &app::RecallReport) -> Result<()> {
         writeln!(out, "evidence:")?;
     }
     for e in &r.evidence {
-        writeln!(out, "  #{:<6} {} {:<4}  {}", e.id, e.when().label(), e.source, app::display_line(&e.text))?;
+        writeln!(
+            out,
+            "  #{:<6} {} {:<4}  {}",
+            e.id,
+            e.when().label(),
+            e.source,
+            app::display_line(&e.text)
+        )?;
     }
-    let cost = r.cost_microusd.map_or("an unknown cost".into(), |c| format!("at most ${:.4}", c as f64 / 1e6));
-    let by = if r.models.is_empty() { String::new() } else { format!(", answered by {}", r.models.join(", ")) };
-    writeln!(out, "spent: {} root + {} child calls, {cost}{}", r.root_calls, r.child_calls, app::display_line(&by))?;
+    let cost = r.cost_microusd.map_or("an unknown cost".into(), |c| {
+        format!("at most ${:.4}", c as f64 / 1e6)
+    });
+    let by = if r.models.is_empty() {
+        String::new()
+    } else {
+        format!(", answered by {}", r.models.join(", "))
+    };
+    writeln!(
+        out,
+        "spent: {} root + {} child calls, {cost}{}",
+        r.root_calls,
+        r.child_calls,
+        app::display_line(&by)
+    )?;
     Ok(())
 }
 
@@ -674,7 +944,11 @@ fn shown(path: &Path) -> String {
 struct TerminalSafe;
 
 impl serde_json::ser::Formatter for TerminalSafe {
-    fn write_string_fragment<W: ?Sized + Write>(&mut self, w: &mut W, fragment: &str) -> std::io::Result<()> {
+    fn write_string_fragment<W: ?Sized + Write>(
+        &mut self,
+        w: &mut W,
+        fragment: &str,
+    ) -> std::io::Result<()> {
         let mut start = 0;
         for (i, c) in fragment.char_indices() {
             if app::display_char(c) == c {
@@ -692,7 +966,13 @@ impl serde_json::ser::Formatter for TerminalSafe {
 
 fn print_page(out: &mut impl Write, page: &app::SearchPage) -> Result<()> {
     for h in &page.hits {
-        writeln!(out, "{} {:<4}  {}", h.when().label(), h.source, app::display_line(&h.text))?;
+        writeln!(
+            out,
+            "{} {:<4}  {}",
+            h.when().label(),
+            h.source,
+            app::display_line(&h.text)
+        )?;
     }
     page_notes(page);
     Ok(())
@@ -717,7 +997,10 @@ fn page_notes(page: &app::SearchPage) {
         );
     }
     if page.truncated {
-        eprintln!("(more matches past {}; narrow the query or raise --limit)", page.limit);
+        eprintln!(
+            "(more matches past {}; narrow the query or raise --limit)",
+            page.limit
+        );
     }
 }
 

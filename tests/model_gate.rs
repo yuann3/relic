@@ -38,13 +38,17 @@ fn read_request(stream: &TcpStream) -> bool {
     reader.read_exact(&mut body).unwrap();
     // Only a child call's user message holds a packet.
     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let user: serde_json::Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let user: serde_json::Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
     user.get("packet").is_some()
 }
 
 fn completion(content: &serde_json::Value) -> String {
     let body = serde_json::json!({"model": "gate", "choices": [{"message": {"content": content.to_string()}, "finish_reason": "stop"}]}).to_string();
-    format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 /// Answers the root call with `plan`, or holds it if there is none. Child
@@ -66,7 +70,8 @@ fn server(plan: Option<serde_json::Value>, child_after: Duration) -> (String, Ar
                     std::thread::sleep(child_after);
                     // Every item of every packet, judged: a fenced reply
                     // would pass the strict checks if it were let in.
-                    let all = serde_json::json!({"version": 1, "packet_id": "pkt_00", "assessments": []});
+                    let all =
+                        serde_json::json!({"version": 1, "packet_id": "pkt_00", "assessments": []});
                     let _ = stream.write_all(completion(&all).as_bytes());
                 } else if let Some(plan) = plan {
                     let _ = stream.write_all(completion(&plan).as_bytes());
@@ -82,18 +87,34 @@ fn server(plan: Option<serde_json::Value>, child_after: Duration) -> (String, Ar
 /// A store with 16 commands that match `generic`.
 fn store(dir: &std::path::Path) -> std::path::PathBuf {
     let hist = dir.join("zsh_history");
-    let lines: String = (0..16).map(|i| format!(": {}:0;generic step {i}\n", 1_700_000_000 + i)).collect();
+    let lines: String = (0..16)
+        .map(|i| format!(": {}:0;generic step {i}\n", 1_700_000_000 + i))
+        .collect();
     std::fs::write(&hist, lines).unwrap();
     let db = dir.join("relic.db");
-    let out = Command::new(env!("CARGO_BIN_EXE_relic")).arg("import").arg(&hist).arg("--db").arg(&db).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+        .arg("import")
+        .arg(&hist)
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     db
 }
 
 /// Runs a recall until `said` holds for what it printed and `ready` holds,
 /// sends SIGINT, and returns the signal it died by, the time from SIGINT to exit,
 /// what it said and the last line of its recall log.
-fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> bool) -> (Option<i32>, Duration, String, serde_json::Value) {
+fn interrupt(
+    url: &str,
+    said_enough: impl Fn(&str) -> bool,
+    ready: impl Fn() -> bool,
+) -> (Option<i32>, Duration, String, serde_json::Value) {
     let dir = tempfile::tempdir().unwrap();
     let db = store(dir.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_relic"))
@@ -118,7 +139,9 @@ fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> 
     let mut said = String::new();
     let start = Instant::now();
     loop {
-        let line = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| panic!("not ready:\n{said}"));
+        let line = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("not ready:\n{said}"));
         said.push_str(&line);
         said.push('\n');
         if said_enough(&said) {
@@ -138,7 +161,10 @@ fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> 
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        assert!(sent.elapsed() < Duration::from_secs(5), "still running 5 s after SIGINT:\n{said}");
+        assert!(
+            sent.elapsed() < Duration::from_secs(5),
+            "still running 5 s after SIGINT:\n{said}"
+        );
         std::thread::sleep(Duration::from_millis(1));
     };
     let took = sent.elapsed();
@@ -156,7 +182,14 @@ fn ctrl_c_during_a_root_call_dies_by_sigint_within_250_ms() {
     // that died by the signal.
     assert_eq!(signal, Some(libc::SIGINT), "{said}");
     assert!(said.contains("recall cancelled"), "{said}");
-    assert_eq!((&last["event"], &last["outcome"]), (&serde_json::json!("finish"), &serde_json::json!("cancelled")), "{last}");
+    assert_eq!(
+        (&last["event"], &last["outcome"]),
+        (
+            &serde_json::json!("finish"),
+            &serde_json::json!("cancelled")
+        ),
+        "{last}"
+    );
     assert!(took < GATE, "{took:?} from SIGINT to exit\n{said}");
 }
 
@@ -175,7 +208,17 @@ fn ctrl_c_during_four_child_calls_dies_by_sigint_within_250_ms_and_commits_none(
     // that died by the signal.
     assert_eq!(signal, Some(libc::SIGINT), "{said}");
     assert!(said.contains("recall cancelled"), "{said}");
-    assert_eq!((&last["event"], &last["outcome"]), (&serde_json::json!("finish"), &serde_json::json!("cancelled")), "{last}");
+    assert_eq!(
+        (&last["event"], &last["outcome"]),
+        (
+            &serde_json::json!("finish"),
+            &serde_json::json!("cancelled")
+        ),
+        "{last}"
+    );
     assert!(took < GATE, "{took:?} from SIGINT to exit\n{said}");
-    assert!(!said.contains("child reply from"), "a child reply was let in after cancel:\n{said}");
+    assert!(
+        !said.contains("child reply from"),
+        "a child reply was let in after cancel:\n{said}"
+    );
 }

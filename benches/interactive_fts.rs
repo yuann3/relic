@@ -33,7 +33,11 @@ struct Query {
 }
 
 const fn q(text: &'static str, prefix: bool, class: &'static str) -> Query {
-    Query { text, prefix, class }
+    Query {
+        text,
+        prefix,
+        class,
+    }
 }
 
 /// Keystrokes on the way to "git com" and "cargo bu", plus the exact words #8
@@ -73,14 +77,38 @@ struct Schema {
 }
 
 const SCHEMAS: &[Schema] = &[
-    Schema { name: "V0 baseline", file: "baseline", options: "" },
+    Schema {
+        name: "V0 baseline",
+        file: "baseline",
+        options: "",
+    },
     // Only 1-char prefixes are slow under rowid order on the baseline, so the
     // cheapest prefix index is worth its own row.
-    Schema { name: "V3 prefix='1'", file: "prefix1", options: "prefix='1'" },
-    Schema { name: "V3 prefix='1 2 3'", file: "prefix123", options: "prefix='1 2 3'" },
-    Schema { name: "V3 prefix='2 3'", file: "prefix23", options: "prefix='2 3'" },
-    Schema { name: "V4 detail=column", file: "detail_column", options: "detail=column" },
-    Schema { name: "V4 detail=none", file: "detail_none", options: "detail=none" },
+    Schema {
+        name: "V3 prefix='1'",
+        file: "prefix1",
+        options: "prefix='1'",
+    },
+    Schema {
+        name: "V3 prefix='1 2 3'",
+        file: "prefix123",
+        options: "prefix='1 2 3'",
+    },
+    Schema {
+        name: "V3 prefix='2 3'",
+        file: "prefix23",
+        options: "prefix='2 3'",
+    },
+    Schema {
+        name: "V4 detail=column",
+        file: "detail_column",
+        options: "detail=column",
+    },
+    Schema {
+        name: "V4 detail=none",
+        file: "detail_none",
+        options: "detail=none",
+    },
     Schema {
         name: "V3+V4 prefix='1' detail=none",
         file: "prefix1_none",
@@ -139,18 +167,17 @@ fn fts_sql(order: Order, ranged: bool) -> String {
 }
 
 fn fts_params(escaped: &str, limit: usize, lower: Option<i64>) -> Vec<Value> {
-    let mut p = vec![Value::Text(escaped.to_owned()), Value::Integer(limit as i64)];
+    let mut p = vec![
+        Value::Text(escaped.to_owned()),
+        Value::Integer(limit as i64),
+    ];
     if let Some(lo) = lower {
         p.push(Value::Integer(lo));
     }
     p
 }
 
-fn fts_rowids(
-    conn: &Connection,
-    sql: &str,
-    params: &[Value],
-) -> Result<Vec<i64>, rusqlite::Error> {
+fn fts_rowids(conn: &Connection, sql: &str, params: &[Value]) -> Result<Vec<i64>, rusqlite::Error> {
     let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(params_from_iter(params), |r| r.get(0))?;
     rows.collect()
@@ -168,7 +195,11 @@ fn stats(mut ms: Vec<f64>) -> Stats {
     assert!(!ms.is_empty());
     ms.sort_by(f64::total_cmp);
     let rank = |q: f64| ms[((q * ms.len() as f64).ceil() as usize).max(1) - 1];
-    Stats { p50: rank(0.50), p95: rank(0.95), max: ms[ms.len() - 1] }
+    Stats {
+        p50: rank(0.50),
+        p95: rank(0.95),
+        max: ms[ms.len() - 1],
+    }
 }
 
 /// One discarded warm-up call, then `runs` timed calls. Every call must
@@ -214,7 +245,11 @@ fn apply_schema(conn: &Connection, options: &str) -> Result<f64, rusqlite::Error
 /// Drop `observation_fts` and rebuild it from `observation` with the shipped
 /// arguments plus `options` (empty = the shipped schema exactly).
 fn recreate_fts(conn: &Connection, options: &str) -> Result<(), rusqlite::Error> {
-    let extra = if options.is_empty() { String::new() } else { format!(",\n{options}") };
+    let extra = if options.is_empty() {
+        String::new()
+    } else {
+        format!(",\n{options}")
+    };
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS observation_fts;
          CREATE VIRTUAL TABLE observation_fts USING fts5(
@@ -242,7 +277,11 @@ fn build_variant(src: &Path, dir: &Path, schema: &Schema) -> (PathBuf, f64) {
 fn db_bytes(path: &Path) -> u64 {
     ["db", "db-wal"]
         .iter()
-        .map(|ext| fs::metadata(path.with_extension(ext)).map(|m| m.len()).unwrap_or(0))
+        .map(|ext| {
+            fs::metadata(path.with_extension(ext))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        })
         .sum()
 }
 
@@ -278,13 +317,22 @@ fn shell(cmd: &str, args: &[&str]) -> String {
     Command::new(cmd)
         .args(args)
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().replace('\n', " | "))
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .replace('\n', " | ")
+        })
         .unwrap_or_else(|e| format!("({cmd} failed: {e})"))
 }
 
 /// Length of the token that carries `*`; whole-word queries never get gated.
 fn prefix_len(q: &Query) -> Option<usize> {
-    q.prefix.then(|| q.text.split_whitespace().last().map_or(0, |t| t.chars().count()))
+    q.prefix.then(|| {
+        q.text
+            .split_whitespace()
+            .last()
+            .map_or(0, |t| t.chars().count())
+    })
 }
 
 struct Measured {
@@ -313,8 +361,23 @@ fn main() {
     let work = Path::new(work);
     fs::create_dir_all(work).unwrap();
 
-    println!("=== interactive FTS measurements{} ===", if hot_only { " (--hot)" } else { "" });
-    println!("host: {}", shell("sysctl", &["-n", "hw.model", "machdep.cpu.brand_string", "hw.ncpu", "hw.memsize"]));
+    println!(
+        "=== interactive FTS measurements{} ===",
+        if hot_only { " (--hot)" } else { "" }
+    );
+    println!(
+        "host: {}",
+        shell(
+            "sysctl",
+            &[
+                "-n",
+                "hw.model",
+                "machdep.cpu.brand_string",
+                "hw.ncpu",
+                "hw.memsize"
+            ]
+        )
+    );
     println!("os: {}", shell("sw_vers", &["-productVersion"]));
     println!("load before: {}", shell("sysctl", &["-n", "vm.loadavg"]));
     let sqlite: String = Connection::open_in_memory()
@@ -345,7 +408,9 @@ fn main() {
 
     // --- Build and size every schema variant. ---
     println!("## Size per schema (after rebuild + VACUUM)\n");
-    println!("| variant | DB MiB | ratio to source | observation MiB | obs indexes MiB | fts MiB | rebuild s |");
+    println!(
+        "| variant | DB MiB | ratio to source | observation MiB | obs indexes MiB | fts MiB | rebuild s |"
+    );
     println!("|---|---|---|---|---|---|---|");
     let mut paths = Vec::new();
     let mut ratios = Vec::new();
@@ -354,7 +419,10 @@ fn main() {
         let bytes = db_bytes(&path) as f64;
         let parts = size_breakdown(&open_read(&path));
         let part = |name: &str| {
-            parts.iter().find(|(n, _)| n == name).map_or(0.0, |(_, b)| *b as f64)
+            parts
+                .iter()
+                .find(|(n, _)| n == name)
+                .map_or(0.0, |(_, b)| *b as f64)
         };
         println!(
             "| {} | {} | {:.2}x | {} | {} | {} | {:.1} |",
@@ -374,7 +442,13 @@ fn main() {
     let objects: Vec<String> = base
         .prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC LIMIT 8")
         .unwrap()
-        .query_map([], |r| Ok(format!("{} {}", r.get::<_, String>(0)?, mib(r.get::<_, i64>(1)? as f64))))
+        .query_map([], |r| {
+            Ok(format!(
+                "{} {}",
+                r.get::<_, String>(0)?,
+                mib(r.get::<_, i64>(1)? as f64)
+            ))
+        })
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
@@ -389,7 +463,9 @@ fn main() {
         )
         .unwrap();
     println!("avg observation column bytes: {avg}");
-    let max_id: i64 = base.query_row("SELECT max(id) FROM observation", [], |r| r.get(0)).unwrap();
+    let max_id: i64 = base
+        .query_row("SELECT max(id) FROM observation", [], |r| r.get(0))
+        .unwrap();
     // The fixture writes one command per second, so 1M rows span only ~11.6
     // days and "last 30 days" would be everything. The newest 10% of rowids
     // stands in for a recency window.
@@ -431,7 +507,12 @@ fn main() {
         .collect();
 
     println!("\n## Query plans on the baseline schema\n");
-    for (order, ranged) in [(Order::Rank, false), (Order::RowidDesc, false), (Order::Rank, true), (Order::RowidDesc, true)] {
+    for (order, ranged) in [
+        (Order::Rank, false),
+        (Order::RowidDesc, false),
+        (Order::Rank, true),
+        (Order::RowidDesc, true),
+    ] {
         let sql = format!("EXPLAIN QUERY PLAN {}", fts_sql(order, ranged));
         let mut stmt = base.prepare(&sql).unwrap();
         let params = fts_params("\"git\"", 201, ranged.then_some(lower));
@@ -440,7 +521,12 @@ fn main() {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        println!("- {} {}: {}", order.label(), if ranged { "+ rowid range" } else { "" }, plan.join("; "));
+        println!(
+            "- {} {}: {}",
+            order.label(),
+            if ranged { "+ rowid range" } else { "" },
+            plan.join("; ")
+        );
     }
     drop(base);
 
@@ -454,13 +540,25 @@ fn main() {
                 for (qi, q) in QUERIES.iter().enumerate() {
                     for page in PAGES {
                         // The TUI asks for one extra row to detect truncation.
-                        let params = fts_params(&escape(q.text, q.prefix), page + 1, ranged.then_some(lower));
+                        let params = fts_params(
+                            &escape(q.text, q.prefix),
+                            page + 1,
+                            ranged.then_some(lower),
+                        );
                         let mut rows = Vec::new();
                         let (stats, _) = measure(runs, || {
                             rows = fts_rowids(&conn, &sql, &params).expect("fts query");
                             rows.len()
                         });
-                        results.push(Measured { schema: si, order, ranged, query: qi, page, stats, rows });
+                        results.push(Measured {
+                            schema: si,
+                            order,
+                            ranged,
+                            query: qi,
+                            page,
+                            stats,
+                            rows,
+                        });
                     }
                 }
             }
@@ -471,7 +569,13 @@ fn main() {
     let find = |si: usize, order: Order, ranged: bool, qi: usize, page: usize| {
         results
             .iter()
-            .find(|m| m.schema == si && m.order == order && m.ranged == ranged && m.query == qi && m.page == page)
+            .find(|m| {
+                m.schema == si
+                    && m.order == order
+                    && m.ranged == ranged
+                    && m.query == qi
+                    && m.page == page
+            })
             .unwrap()
     };
 
@@ -481,20 +585,32 @@ fn main() {
             println!(
                 "\n## {}{}\n",
                 schema.name,
-                if ranged { " + V5 newest-10% rowid range" } else { "" }
+                if ranged {
+                    " + V5 newest-10% rowid range"
+                } else {
+                    ""
+                }
             );
-            println!("| query | class | matches | rank p200 | rank p50 | rowid DESC p200 | rowid DESC p50 | same rows as baseline |");
+            println!(
+                "| query | class | matches | rank p200 | rank p50 | rowid DESC p200 | rowid DESC p50 | same rows as baseline |"
+            );
             println!("|---|---|---|---|---|---|---|---|");
             for (qi, q) in QUERIES.iter().enumerate() {
                 let same = [Order::Rank, Order::RowidDesc]
                     .iter()
                     .flat_map(|&o| PAGES.iter().map(move |&p| (o, p)))
-                    .all(|(o, p)| find(si, o, ranged, qi, p).rows == find(0, o, ranged, qi, p).rows);
+                    .all(|(o, p)| {
+                        find(si, o, ranged, qi, p).rows == find(0, o, ranged, qi, p).rows
+                    });
                 println!(
                     "| `{}` | {} | {} | {} | {} | {} | {} | {} |",
                     escape(q.text, q.prefix),
                     q.class,
-                    if ranged { recent_matches[qi] } else { matches[qi] },
+                    if ranged {
+                        recent_matches[qi]
+                    } else {
+                        matches[qi]
+                    },
                     cell(find(si, Order::Rank, ranged, qi, 200).stats),
                     cell(find(si, Order::Rank, ranged, qi, 50).stats),
                     cell(find(si, Order::RowidDesc, ranged, qi, 200).stats),
@@ -507,7 +623,9 @@ fn main() {
 
     // --- Summary: worst p95 per config at page 200, under each V1 gate. ---
     println!("\n## Summary: worst p95 (ms) at page 200 over the query set\n");
-    println!("| variant | order | V5 range | ratio | all queries | prefix >= 2 chars | prefix >= 3 chars | queries > 20 ms p95 (all) |");
+    println!(
+        "| variant | order | V5 range | ratio | all queries | prefix >= 2 chars | prefix >= 3 chars | queries > 20 ms p95 (all) |"
+    );
     println!("|---|---|---|---|---|---|---|---|");
     for (si, schema) in SCHEMAS.iter().enumerate() {
         for order in [Order::Rank, Order::RowidDesc] {
@@ -535,7 +653,11 @@ fn main() {
                     worst(1),
                     worst(2),
                     worst(3),
-                    if slow.is_empty() { "none".to_owned() } else { slow.join(" ") }
+                    if slow.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        slow.join(" ")
+                    }
                 );
             }
         }
@@ -543,11 +665,19 @@ fn main() {
 
     // --- V1: what a minimum prefix length removes. ---
     println!("\n## V1: queries skipped by a minimum prefix length (baseline, rank, page 200)\n");
-    println!("| query | prefix chars | matches | baseline rank p95 | runs at min 2 | runs at min 3 |");
+    println!(
+        "| query | prefix chars | matches | baseline rank p95 | runs at min 2 | runs at min 3 |"
+    );
     println!("|---|---|---|---|---|---|");
     for (qi, q) in QUERIES.iter().enumerate() {
         let n = prefix_len(q);
-        let runs_at = |min: usize| if n.is_none_or(|n| n >= min) { "yes" } else { "skipped" };
+        let runs_at = |min: usize| {
+            if n.is_none_or(|n| n >= min) {
+                "yes"
+            } else {
+                "skipped"
+            }
+        };
         println!(
             "| `{}` | {} | {} | {:.2} | {} | {} |",
             escape(q.text, q.prefix),
@@ -565,7 +695,10 @@ fn main() {
         ("\"src/main.rs\"", "phrase (tokenizer splits a word)"),
         ("\"task-12\"*", "phrase with prefix last token"),
         ("\"git\" \"commit\"", "two-token AND"),
-        ("NEAR(\"git\" \"commit\", 1)", "NEAR (not user-reachable; Relic escapes it)"),
+        (
+            "NEAR(\"git\" \"commit\", 1)",
+            "NEAR (not user-reachable; Relic escapes it)",
+        ),
         ("safe_text : \"git\"", "column filter (not user-reachable)"),
     ];
     print!("| probe | kind |");
@@ -609,10 +742,18 @@ fn main() {
 fn end_to_end(path: &Path, name: &str, with_store: bool, runs: usize) {
     let conn = open_read(path);
     let page = 200;
-    let e2e_queries = [("g", true), ("gi", true), ("git", true), ("cargo", false), ("git com", true)];
+    let e2e_queries = [
+        ("g", true),
+        ("gi", true),
+        ("git", true),
+        ("cargo", false),
+        ("git com", true),
+    ];
 
     println!("### {name}\n");
-    let mut header = "| query | order | FTS only | FTS + N+1 lookups | JOIN on FTS subquery | naive JOIN |".to_owned();
+    let mut header =
+        "| query | order | FTS only | FTS + N+1 lookups | JOIN on FTS subquery | naive JOIN |"
+            .to_owned();
     let mut sep = "|---|---|---|---|---|---|".to_owned();
     if with_store {
         header.push_str(" app::search (real Store) |");
@@ -686,7 +827,10 @@ fn end_to_end(path: &Path, name: &str, with_store: bool, runs: usize) {
             };
             let (joined, n3) = measure(runs, || run_join(&sub_join));
             let (naive, n4) = measure(runs, || run_join(&naive_join));
-            assert!(n == n2 && n == n3 && n == n4, "e2e shapes disagree on row count");
+            assert!(
+                n == n2 && n == n3 && n == n4,
+                "e2e shapes disagree on row count"
+            );
 
             let mut line = format!(
                 "| `{escaped}` | {} | {} | {} | {} | {} |",
@@ -700,12 +844,21 @@ fn end_to_end(path: &Path, name: &str, with_store: bool, runs: usize) {
                 let req = SearchRequest {
                     query: text.to_owned(),
                     limit: page,
-                    mode: if prefix { MatchMode::PrefixLast } else { MatchMode::Words },
+                    mode: if prefix {
+                        MatchMode::PrefixLast
+                    } else {
+                        MatchMode::Words
+                    },
                     order: app::Order::Rank,
                 };
                 // Measured to the end: the bench wants the cost, not the cut-off.
-                let far = || app::Budget { deadline: Instant::now() + std::time::Duration::from_secs(600), cancel: None };
-                let (s, _) = measure(runs, || app::search(store, &req, &far()).unwrap().hits.len());
+                let far = || app::Budget {
+                    deadline: Instant::now() + std::time::Duration::from_secs(600),
+                    cancel: None,
+                };
+                let (s, _) = measure(runs, || {
+                    app::search(store, &req, &far()).unwrap().hits.len()
+                });
                 line.push_str(&format!(" {} |", cell(s)));
             } else if store.is_some() {
                 line.push_str(" n/a |");
@@ -773,20 +926,60 @@ struct HotSchema {
     corpus: Corpus,
 }
 
-const fn hs(name: &'static str, file: &'static str, options: &'static str, corpus: Corpus) -> HotSchema {
-    HotSchema { name, file, options, corpus }
+const fn hs(
+    name: &'static str,
+    file: &'static str,
+    options: &'static str,
+    corpus: Corpus,
+) -> HotSchema {
+    HotSchema {
+        name,
+        file,
+        options,
+        corpus,
+    }
 }
 
 /// The first schema of each corpus is that corpus's reference.
 const HOT_SCHEMAS: &[HotSchema] = &[
     hs("baseline", "hot_baseline", "", Corpus::Fixture),
     hs("prefix='2'", "hot_prefix2", "prefix='2'", Corpus::Fixture),
-    hs("prefix='2 3'", "hot_prefix23", "prefix='2 3'", Corpus::Fixture),
-    hs("prefix='2 3 4'", "hot_prefix234", "prefix='2 3 4'", Corpus::Fixture),
-    hs("prefix='1 2 3 4'", "hot_prefix1234", "prefix='1 2 3 4'", Corpus::Fixture),
-    hs("taskid baseline", "hot_taskid_baseline", "", Corpus::LongHot),
-    hs("taskid prefix='2'", "hot_taskid_prefix2", "prefix='2'", Corpus::LongHot),
-    hs("taskid prefix='2 3 4'", "hot_taskid_prefix234", "prefix='2 3 4'", Corpus::LongHot),
+    hs(
+        "prefix='2 3'",
+        "hot_prefix23",
+        "prefix='2 3'",
+        Corpus::Fixture,
+    ),
+    hs(
+        "prefix='2 3 4'",
+        "hot_prefix234",
+        "prefix='2 3 4'",
+        Corpus::Fixture,
+    ),
+    hs(
+        "prefix='1 2 3 4'",
+        "hot_prefix1234",
+        "prefix='1 2 3 4'",
+        Corpus::Fixture,
+    ),
+    hs(
+        "taskid baseline",
+        "hot_taskid_baseline",
+        "",
+        Corpus::LongHot,
+    ),
+    hs(
+        "taskid prefix='2'",
+        "hot_taskid_prefix2",
+        "prefix='2'",
+        Corpus::LongHot,
+    ),
+    hs(
+        "taskid prefix='2 3 4'",
+        "hot_taskid_prefix234",
+        "prefix='2 3 4'",
+        Corpus::LongHot,
+    ),
 ];
 
 /// A keystroke-shaped query with an owned text, so it can be generated from
@@ -799,7 +992,11 @@ struct Keystroke {
 
 impl Keystroke {
     fn new(text: impl Into<String>, prefix: bool, class: &'static str) -> Self {
-        Keystroke { text: text.into(), prefix, class }
+        Keystroke {
+            text: text.into(),
+            prefix,
+            class,
+        }
     }
 
     fn escaped(&self) -> String {
@@ -822,7 +1019,8 @@ impl Keystroke {
 
     /// Whether the TUI sends it to FTS under its `MIN_PREFIX_CHARS` gate.
     fn sent_by_tui(&self) -> bool {
-        self.prefix_chars().is_none_or(|n| n >= app::MIN_PREFIX_CHARS)
+        self.prefix_chars()
+            .is_none_or(|n| n >= app::MIN_PREFIX_CHARS)
     }
 }
 
@@ -834,7 +1032,9 @@ fn vocabulary(conn: &Connection) -> Vec<(String, i64)> {
              USING fts5vocab(main, observation_fts, 'row');",
     )
     .unwrap();
-    let mut stmt = conn.prepare("SELECT term, doc FROM temp.hot_vocab ORDER BY term").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT term, doc FROM temp.hot_vocab ORDER BY term")
+        .unwrap();
     stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
         .collect::<Result<_, _>>()
@@ -844,7 +1044,10 @@ fn vocabulary(conn: &Connection) -> Vec<(String, i64)> {
 /// The terms a prefix token expands to (byte-wise, like FTS5).
 fn expansion<'a>(vocab: &'a [(String, i64)], prefix: &str) -> &'a [(String, i64)] {
     let start = vocab.partition_point(|(t, _)| t.as_str() < prefix);
-    let len = vocab[start..].iter().take_while(|(t, _)| t.starts_with(prefix)).count();
+    let len = vocab[start..]
+        .iter()
+        .take_while(|(t, _)| t.starts_with(prefix))
+        .count();
     &vocab[start..start + len]
 }
 
@@ -866,16 +1069,26 @@ fn hot_keystrokes(hot: &[(String, i64)]) -> Vec<Keystroke> {
     let mut out = Vec::new();
     for (token, _) in hot {
         let chars: Vec<char> = token.chars().collect();
-        let prefixes: Vec<String> = (2..=chars.len()).map(|n| chars[..n].iter().collect()).collect();
+        let prefixes: Vec<String> = (2..=chars.len())
+            .map(|n| chars[..n].iter().collect())
+            .collect();
         for p in &prefixes {
             out.push(Keystroke::new(p.as_str(), true, "hot prefix"));
         }
         out.push(Keystroke::new(token.as_str(), false, "hot word"));
         for lead in HOT_LEADS.iter().filter(|&&l| l != token) {
             for p in &prefixes {
-                out.push(Keystroke::new(format!("{lead} {p}"), true, "lead + hot prefix"));
+                out.push(Keystroke::new(
+                    format!("{lead} {p}"),
+                    true,
+                    "lead + hot prefix",
+                ));
             }
-            out.push(Keystroke::new(format!("{lead} {token}"), false, "lead + hot word"));
+            out.push(Keystroke::new(
+                format!("{lead} {token}"),
+                false,
+                "lead + hot word",
+            ));
         }
     }
     out
@@ -884,7 +1097,11 @@ fn hot_keystrokes(hot: &[(String, i64)]) -> Vec<Keystroke> {
 /// `head AND (last_expr)`, with each head word quoted whole.
 fn with_last(k: &Keystroke, last_expr: &str) -> String {
     let head = escape(&k.head().join(" "), false);
-    if head.is_empty() { format!("({last_expr})") } else { format!("{head} AND ({last_expr})") }
+    if head.is_empty() {
+        format!("({last_expr})")
+    } else {
+        format!("{head} AND ({last_expr})")
+    }
 }
 
 fn quote(term: &str) -> String {
@@ -900,8 +1117,16 @@ fn word_or_prefix(k: &Keystroke) -> String {
 /// Rewrite: the prefix replaced by an OR of the terms it expands to. `None`
 /// when nothing matches the prefix (the result is then empty).
 fn or_of_terms(k: &Keystroke, terms: &[String]) -> Option<String> {
-    (!terms.is_empty())
-        .then(|| with_last(k, &terms.iter().map(|t| quote(t)).collect::<Vec<_>>().join(" OR ")))
+    (!terms.is_empty()).then(|| {
+        with_last(
+            k,
+            &terms
+                .iter()
+                .map(|t| quote(t))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
+    })
 }
 
 /// Exclusive upper bound for a term range scan over `prefix*`.
@@ -924,8 +1149,12 @@ fn scan_terms(conn: &Connection, prefix: &str) -> Vec<String> {
 fn page_rows(conn: &Connection, expr: Option<&str>, lower: Option<i64>) -> Vec<i64> {
     match expr {
         None => Vec::new(),
-        Some(e) => fts_rowids(conn, &fts_sql(Order::RowidDesc, lower.is_some()), &fts_params(e, HOT_PAGE + 1, lower))
-            .expect("fts query"),
+        Some(e) => fts_rowids(
+            conn,
+            &fts_sql(Order::RowidDesc, lower.is_some()),
+            &fts_params(e, HOT_PAGE + 1, lower),
+        )
+        .expect("fts query"),
     }
 }
 
@@ -956,7 +1185,8 @@ fn build_hot_variant(src: &Path, dir: &Path, schema: &HotSchema) -> PathBuf {
             )
             .unwrap();
             recreate_fts(&conn, schema.options).unwrap();
-            conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
         }
     }
     dst
@@ -967,7 +1197,10 @@ fn p95(s: Stats) -> String {
 }
 
 fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
-    println!("\n# Hot-token prefixes: rowid DESC, page {HOT_PAGE} (limit {}), p95 ms\n", HOT_PAGE + 1);
+    println!(
+        "\n# Hot-token prefixes: rowid DESC, page {HOT_PAGE} (limit {}), p95 ms\n",
+        HOT_PAGE + 1
+    );
     println!("## Size per hot-study schema (after rebuild + VACUUM)\n");
     println!("| variant | corpus | DB MiB | ratio to source | fts MiB |");
     println!("|---|---|---|---|---|");
@@ -983,7 +1216,11 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
         println!(
             "| {} | {} | {} | {:.2}x | {} |",
             schema.name,
-            if schema.corpus == Corpus::Fixture { "fixture" } else { "taskid" },
+            if schema.corpus == Corpus::Fixture {
+                "fixture"
+            } else {
+                "taskid"
+            },
             mib(bytes),
             bytes / source_bytes,
             mib(fts)
@@ -994,15 +1231,18 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
     eprintln!("built hot variants");
 
     for corpus in [Corpus::Fixture, Corpus::LongHot] {
-        let variants: Vec<usize> =
-            (0..HOT_SCHEMAS.len()).filter(|&i| HOT_SCHEMAS[i].corpus == corpus).collect();
+        let variants: Vec<usize> = (0..HOT_SCHEMAS.len())
+            .filter(|&i| HOT_SCHEMAS[i].corpus == corpus)
+            .collect();
         let base = open_read(&paths[variants[0]]);
         let mut vocab = Vec::new();
         let (vocab_load, _) = measure(runs.min(10), || {
             vocab = vocabulary(&base);
             vocab.len()
         });
-        let records: i64 = base.query_row("SELECT count(*) FROM observation", [], |r| r.get(0)).unwrap();
+        let records: i64 = base
+            .query_row("SELECT count(*) FROM observation", [], |r| r.get(0))
+            .unwrap();
 
         println!("\n## {}\n", corpus.label());
         println!(
@@ -1011,7 +1251,10 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
             cell(vocab_load),
             runs.min(10)
         );
-        println!("### Top 10 tokens by document frequency (fts5vocab 'row', {} distinct terms)\n", vocab.len());
+        println!(
+            "### Top 10 tokens by document frequency (fts5vocab 'row', {} distinct terms)\n",
+            vocab.len()
+        );
         println!("| # | token | chars | rows containing it | share of rows |");
         println!("|---|---|---|---|---|");
         let mut by_doc: Vec<(String, i64)> = vocab.clone();
@@ -1028,9 +1271,15 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
         // Keystroke set: the #10 set (fixture only), then the hot set.
         let mut keys: Vec<Keystroke> = Vec::new();
         if corpus == Corpus::Fixture {
-            keys.extend(QUERIES.iter().map(|q| Keystroke::new(q.text, q.prefix, q.class)));
+            keys.extend(
+                QUERIES
+                    .iter()
+                    .map(|q| Keystroke::new(q.text, q.prefix, q.class)),
+            );
         }
-        keys.extend(hot_keystrokes(&by_doc[..corpus.hot_tokens().min(by_doc.len())]));
+        keys.extend(hot_keystrokes(
+            &by_doc[..corpus.hot_tokens().min(by_doc.len())],
+        ));
         let mut seen = HashSet::new();
         keys.retain(|k| seen.insert(k.escaped()));
 
@@ -1077,7 +1326,8 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
                 "| `{}` | {} | {} | {terms} | {postings} | {matches} |",
                 k.escaped(),
                 k.class,
-                k.prefix_chars().map_or("word".to_owned(), |n| n.to_string()),
+                k.prefix_chars()
+                    .map_or("word".to_owned(), |n| n.to_string()),
             );
             for row in &timed {
                 let (s, rows) = &row[ki];
@@ -1100,7 +1350,9 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
                 .fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
             let all = row.iter().map(|(s, _)| s.p95).fold(0.0, f64::max);
             let over = |ms: f64| sent().filter(|&(ki, _)| row[ki].0.p95 > ms).count();
-            let differ = (0..keys.len()).filter(|&ki| row[ki].1 != timed[0][ki].1).count();
+            let differ = (0..keys.len())
+                .filter(|&ki| row[ki].1 != timed[0][ki].1)
+                .count();
             println!(
                 "| {} | {:.2}x | {:.2} | `{}` | {:.2} | {} of {} | {} | {differ} |",
                 HOT_SCHEMAS[vi].name,
@@ -1116,7 +1368,9 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
 
         // Hybrid: a prefix whose length has no prefix index becomes an OR of
         // its expanded whole terms from the in-memory term list.
-        println!("\n### Hybrid: prefix index for short prefixes, OR of expanded terms above it (p95 ms)\n");
+        println!(
+            "\n### Hybrid: prefix index for short prefixes, OR of expanded terms above it (p95 ms)\n"
+        );
         println!(
             "| schema | OR rewrite for `*` tokens of | worst p95, keystrokes the TUI sends | that query | 2nd worst | most terms in one OR | sent keystrokes > {GATE_MS} ms | rows differ from plain |"
         );
@@ -1133,8 +1387,10 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
             let mut differ = 0;
             for (ki, k) in keys.iter().enumerate().filter(|(_, k)| k.sent_by_tui()) {
                 let expr = if k.prefix_chars().is_some_and(|n| n >= min_or) {
-                    let terms: Vec<String> =
-                        expansion(&vocab, &k.last().to_lowercase()).iter().map(|(t, _)| t.clone()).collect();
+                    let terms: Vec<String> = expansion(&vocab, &k.last().to_lowercase())
+                        .iter()
+                        .map(|(t, _)| t.clone())
+                        .collect();
                     widest = widest.max(terms.len());
                     or_of_terms(k, &terms)
                 } else {
@@ -1174,7 +1430,11 @@ fn rewrites(conn: &Connection, vocab: &[(String, i64)], keys: &[Keystroke], runs
         .filter(|k| k.prefix && (k.class.starts_with("hot") || k.class.starts_with("lead")))
         .map(|k| Keystroke::new(k.text.as_str(), true, k.class))
         .collect();
-    probes.extend(WIDE_PROBES.iter().map(|p| Keystroke::new(*p, true, "wide probe")));
+    probes.extend(
+        WIDE_PROBES
+            .iter()
+            .map(|p| Keystroke::new(*p, true, "wide probe")),
+    );
 
     println!("\n### Query rewrites on the baseline schema (p95 ms)\n");
     println!(
@@ -1191,7 +1451,10 @@ fn rewrites(conn: &Connection, vocab: &[(String, i64)], keys: &[Keystroke], runs
     for k in &probes {
         let (terms, postings) = touched(vocab, k);
         let last = k.last().to_lowercase();
-        let expanded: Vec<String> = expansion(vocab, &last).iter().map(|(t, _)| t.clone()).collect();
+        let expanded: Vec<String> = expansion(vocab, &last)
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect();
         let plain_rows = page_rows(conn, Some(&k.escaped()), None);
 
         let (plain, _) = measure(runs, || page_rows(conn, Some(&k.escaped()), None).len());
@@ -1204,7 +1467,10 @@ fn rewrites(conn: &Connection, vocab: &[(String, i64)], keys: &[Keystroke], runs
         let (exact, _) = measure(runs, || exact_first(conn, k).len());
         let exact_same = exact_first(conn, k) == plain_rows;
         let (scan, n) = measure(runs, || scan_terms(conn, &last).len());
-        assert_eq!(n, terms, "vocab scan disagrees with the in-memory vocabulary for {last:?}");
+        assert_eq!(
+            n, terms,
+            "vocab scan disagrees with the in-memory vocabulary for {last:?}"
+        );
         let or_expr = or_of_terms(k, &expanded);
         let (or_s, _) = measure(runs, || page_rows(conn, or_expr.as_deref(), None).len());
         let (both, _) = measure(runs, || {
@@ -1275,8 +1541,16 @@ mod tests {
         db
     }
 
-    fn rowid_desc(conn: &Connection, query: &str, prefix: bool) -> Result<Vec<i64>, rusqlite::Error> {
-        fts_rowids(conn, &fts_sql(Order::RowidDesc, false), &fts_params(&escape(query, prefix), 100, None))
+    fn rowid_desc(
+        conn: &Connection,
+        query: &str,
+        prefix: bool,
+    ) -> Result<Vec<i64>, rusqlite::Error> {
+        fts_rowids(
+            conn,
+            &fts_sql(Order::RowidDesc, false),
+            &fts_params(&escape(query, prefix), 100, None),
+        )
     }
 
     /// The bench's queries must return exactly what Store returns, in the
@@ -1287,13 +1561,22 @@ mod tests {
         let db = fixture_db(dir.path());
         let store = Store::open(&db).unwrap();
         let conn = open_read(&db);
-        let ids = |hits: Vec<relic::domain::SearchHit>| hits.iter().map(|h| h.id).collect::<Vec<_>>();
+        let ids =
+            |hits: Vec<relic::domain::SearchHit>| hits.iter().map(|h| h.id).collect::<Vec<_>>();
         for query in ["g", "gi", "gi pu", "git c", "git pu", "src/main.rs", "\""] {
             let recent = ids(store.search_prefix(query, 100).unwrap());
-            assert_eq!(rowid_desc(&conn, query, true).unwrap_or_default(), recent, "{query:?}");
+            assert_eq!(
+                rowid_desc(&conn, query, true).unwrap_or_default(),
+                recent,
+                "{query:?}"
+            );
             let ranked = ids(store.search_ranked(query, false, 100).unwrap());
-            let got = fts_rowids(&conn, &fts_sql(Order::Rank, false), &fts_params(&escape(query, false), 100, None))
-                .unwrap_or_default();
+            let got = fts_rowids(
+                &conn,
+                &fts_sql(Order::Rank, false),
+                &fts_params(&escape(query, false), 100, None),
+            )
+            .unwrap_or_default();
             assert_eq!(got, ranked, "{query:?}");
         }
     }
@@ -1310,7 +1593,11 @@ mod tests {
 
         apply_schema(&conn, "prefix='1 2 3'").unwrap();
         let sql: String = conn
-            .query_row("SELECT sql FROM sqlite_master WHERE name = 'observation_fts'", [], |r| r.get(0))
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'observation_fts'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(sql.contains("prefix='1 2 3'"), "{sql}");
         let after: Vec<_> = ["g", "gi", "git c", "src/main.rs"]
@@ -1338,8 +1625,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = open_read(&fixture_db(dir.path()));
         let all = rowid_desc(&conn, "git", false).unwrap();
-        let recent = fts_rowids(&conn, &fts_sql(Order::RowidDesc, true), &fts_params("\"git\"", 100, Some(all[1])))
-            .unwrap();
+        let recent = fts_rowids(
+            &conn,
+            &fts_sql(Order::RowidDesc, true),
+            &fts_params("\"git\"", 100, Some(all[1])),
+        )
+        .unwrap();
         assert_eq!(recent, all[..1]);
     }
 
@@ -1354,22 +1645,50 @@ mod tests {
     #[test]
     fn hot_keystrokes_cover_every_prefix_length() {
         let texts = |hot: &[(String, i64)]| -> Vec<(String, bool)> {
-            hot_keystrokes(hot).into_iter().map(|k| (k.text, k.prefix)).collect()
+            hot_keystrokes(hot)
+                .into_iter()
+                .map(|k| (k.text, k.prefix))
+                .collect()
         };
         let task = texts(&[("task".to_owned(), 9)]);
-        for want in [("ta", true), ("tas", true), ("task", true), ("task", false), ("git ta", true), ("cargo tas", true), ("cargo task", false)] {
-            assert!(task.contains(&(want.0.to_owned(), want.1)), "{want:?} missing from {task:?}");
+        for want in [
+            ("ta", true),
+            ("tas", true),
+            ("task", true),
+            ("task", false),
+            ("git ta", true),
+            ("cargo tas", true),
+            ("cargo task", false),
+        ] {
+            assert!(
+                task.contains(&(want.0.to_owned(), want.1)),
+                "{want:?} missing from {task:?}"
+            );
         }
-        assert!(!task.iter().any(|(t, _)| t == "t"), "1-char prefixes are gated, not hot keystrokes");
+        assert!(
+            !task.iter().any(|(t, _)| t == "t"),
+            "1-char prefixes are gated, not hot keystrokes"
+        );
         // A hot token that is itself a lead word is not paired with itself.
-        assert!(!texts(&[("git".to_owned(), 9)]).iter().any(|(t, _)| t.starts_with("git gi")));
+        assert!(
+            !texts(&[("git".to_owned(), 9)])
+                .iter()
+                .any(|(t, _)| t.starts_with("git gi"))
+        );
     }
 
     #[test]
     fn expansion_is_the_bytewise_term_range() {
-        let vocab: Vec<(String, i64)> =
-            ["ta", "table", "tag", "task", "tasks", "tb", "z"].iter().map(|t| (t.to_string(), 1)).collect();
-        let terms = |p: &str| expansion(&vocab, p).iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>();
+        let vocab: Vec<(String, i64)> = ["ta", "table", "tag", "task", "tasks", "tb", "z"]
+            .iter()
+            .map(|t| (t.to_string(), 1))
+            .collect();
+        let terms = |p: &str| {
+            expansion(&vocab, p)
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(terms("ta"), ["ta", "table", "tag", "task", "tasks"]);
         assert_eq!(terms("task"), ["task", "tasks"]);
         assert!(terms("q").is_empty());
@@ -1409,8 +1728,16 @@ mod tests {
             assert_eq!(exact_first(&conn, &k), plain, "exact-first {text}");
             let terms = scan_terms(&conn, k.last());
             assert_eq!(terms.len(), touched(&vocab, &k).0, "{text}");
-            assert_eq!(page_rows(&conn, or_of_terms(&k, &terms).as_deref(), None), plain, "terms {text}");
-            assert_eq!(page_rows(&conn, Some(&word_or_prefix(&k)), None), plain, "word OR prefix {text}");
+            assert_eq!(
+                page_rows(&conn, or_of_terms(&k, &terms).as_deref(), None),
+                plain,
+                "terms {text}"
+            );
+            assert_eq!(
+                page_rows(&conn, Some(&word_or_prefix(&k)), None),
+                plain,
+                "word OR prefix {text}"
+            );
         }
         // The exact-first bound is exercised: `task` alone fills a page.
         let words = page_rows(&conn, Some("\"task\""), None);

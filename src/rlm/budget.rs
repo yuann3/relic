@@ -115,7 +115,11 @@ impl BudgetLedger {
         if self.consumed.output_tokens + res.output_tokens > self.limits.reserved_output_tokens {
             return Err(BudgetExhausted::OutputTokens);
         }
-        if self.limits.max_cost_microusd.is_some_and(|max| self.consumed.cost_microusd + res.cost_microusd > max) {
+        if self
+            .limits
+            .max_cost_microusd
+            .is_some_and(|max| self.consumed.cost_microusd + res.cost_microusd > max)
+        {
             return Err(BudgetExhausted::Cost);
         }
 
@@ -165,11 +169,14 @@ impl BudgetLedger {
             evidence_handles: self.limits.evidence_handles - self.consumed.evidence_handles,
             local_materialized_bytes: self.limits.local_materialized_bytes
                 - self.consumed.local_materialized_bytes,
-            model_egress_bytes: self.limits.model_egress_bytes
-                - self.consumed.model_egress_bytes,
+            model_egress_bytes: self.limits.model_egress_bytes - self.consumed.model_egress_bytes,
             estimated_input_tokens: self.limits.estimated_input_tokens,
-            reserved_output_tokens: self.limits.reserved_output_tokens - self.consumed.output_tokens,
-            max_cost_microusd: self.limits.max_cost_microusd.map(|max| max - self.consumed.cost_microusd),
+            reserved_output_tokens: self.limits.reserved_output_tokens
+                - self.consumed.output_tokens,
+            max_cost_microusd: self
+                .limits
+                .max_cost_microusd
+                .map(|max| max - self.consumed.cost_microusd),
         }
     }
 }
@@ -227,64 +234,139 @@ mod tests {
     fn root_calls_fence_blocks() {
         let mut ledger = BudgetLedger::new(small_budget());
         // Consume 3
-        ledger.reserve(&Reservation { root_calls: 3, ..Default::default() }).unwrap();
+        ledger
+            .reserve(&Reservation {
+                root_calls: 3,
+                ..Default::default()
+            })
+            .unwrap();
         // Try to consume 2 more (only 1 remaining)
-        let err = ledger.reserve(&Reservation { root_calls: 2, ..Default::default() }).unwrap_err();
+        let err = ledger
+            .reserve(&Reservation {
+                root_calls: 2,
+                ..Default::default()
+            })
+            .unwrap_err();
         assert_eq!(err, BudgetExhausted::RootCalls);
     }
 
     #[test]
     fn child_calls_fence_blocks() {
         let mut ledger = BudgetLedger::new(small_budget());
-        ledger.reserve(&Reservation { child_calls: 7, ..Default::default() }).unwrap();
-        let err = ledger.reserve(&Reservation { child_calls: 2, ..Default::default() }).unwrap_err();
+        ledger
+            .reserve(&Reservation {
+                child_calls: 7,
+                ..Default::default()
+            })
+            .unwrap();
+        let err = ledger
+            .reserve(&Reservation {
+                child_calls: 2,
+                ..Default::default()
+            })
+            .unwrap_err();
         assert_eq!(err, BudgetExhausted::ChildCalls);
     }
 
     #[test]
     fn plan_ops_fence_blocks() {
         let mut ledger = BudgetLedger::new(small_budget());
-        ledger.reserve(&Reservation { plan_ops: 8, ..Default::default() }).unwrap();
-        let err = ledger.reserve(&Reservation { plan_ops: 1, ..Default::default() }).unwrap_err();
+        ledger
+            .reserve(&Reservation {
+                plan_ops: 8,
+                ..Default::default()
+            })
+            .unwrap();
+        let err = ledger
+            .reserve(&Reservation {
+                plan_ops: 1,
+                ..Default::default()
+            })
+            .unwrap_err();
         assert_eq!(err, BudgetExhausted::PlanOps);
     }
 
     #[test]
     fn rows_returned_fence_blocks() {
         let mut ledger = BudgetLedger::new(small_budget());
-        ledger.reserve(&Reservation { rows_returned: 90, ..Default::default() }).unwrap();
-        let err = ledger.reserve(&Reservation { rows_returned: 20, ..Default::default() }).unwrap_err();
+        ledger
+            .reserve(&Reservation {
+                rows_returned: 90,
+                ..Default::default()
+            })
+            .unwrap();
+        let err = ledger
+            .reserve(&Reservation {
+                rows_returned: 20,
+                ..Default::default()
+            })
+            .unwrap_err();
         assert_eq!(err, BudgetExhausted::RowsReturned);
     }
 
     #[test]
     fn evidence_handles_fence_blocks() {
         let mut ledger = BudgetLedger::new(small_budget());
-        ledger.reserve(&Reservation { evidence_handles: 10, ..Default::default() }).unwrap();
-        let err = ledger.reserve(&Reservation { evidence_handles: 1, ..Default::default() }).unwrap_err();
+        ledger
+            .reserve(&Reservation {
+                evidence_handles: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let err = ledger
+            .reserve(&Reservation {
+                evidence_handles: 1,
+                ..Default::default()
+            })
+            .unwrap_err();
         assert_eq!(err, BudgetExhausted::EvidenceHandles);
     }
 
     #[test]
     fn materialized_bytes_fence_blocks() {
         let mut ledger = BudgetLedger::new(small_budget());
-        ledger.reserve(&Reservation { local_materialized_bytes: 4000, ..Default::default() }).unwrap();
-        let err = ledger.reserve(&Reservation { local_materialized_bytes: 200, ..Default::default() }).unwrap_err();
+        ledger
+            .reserve(&Reservation {
+                local_materialized_bytes: 4000,
+                ..Default::default()
+            })
+            .unwrap();
+        let err = ledger
+            .reserve(&Reservation {
+                local_materialized_bytes: 200,
+                ..Default::default()
+            })
+            .unwrap_err();
         assert_eq!(err, BudgetExhausted::LocalMaterializedBytes);
     }
 
     #[test]
     fn model_egress_fence_blocks() {
         let mut ledger = BudgetLedger::new(small_budget());
-        ledger.reserve(&Reservation { model_egress_bytes: 2000, ..Default::default() }).unwrap();
-        let err = ledger.reserve(&Reservation { model_egress_bytes: 100, ..Default::default() }).unwrap_err();
+        ledger
+            .reserve(&Reservation {
+                model_egress_bytes: 2000,
+                ..Default::default()
+            })
+            .unwrap();
+        let err = ledger
+            .reserve(&Reservation {
+                model_egress_bytes: 100,
+                ..Default::default()
+            })
+            .unwrap_err();
         assert_eq!(err, BudgetExhausted::ModelEgressBytes);
     }
 
     #[test]
     fn release_rows_restores_budget() {
         let mut ledger = BudgetLedger::new(small_budget());
-        ledger.reserve(&Reservation { rows_returned: 80, ..Default::default() }).unwrap();
+        ledger
+            .reserve(&Reservation {
+                rows_returned: 80,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(ledger.remaining().rows_returned, 20);
 
         // Operator only used 30, release 50

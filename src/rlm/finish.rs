@@ -12,9 +12,15 @@ pub enum FinishValidationError {
 impl std::fmt::Display for FinishValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnresolvableCitation(id) => write!(f, "it cites {id}, which this investigation never showed it"),
-            Self::UncitedClaim { claim_text } => write!(f, "the claim \"{claim_text}\" cites no record"),
-            Self::UncitedProcedureStep { step_text } => write!(f, "the step \"{step_text}\" cites no record"),
+            Self::UnresolvableCitation(id) => {
+                write!(f, "it cites {id}, which this investigation never showed it")
+            }
+            Self::UncitedClaim { claim_text } => {
+                write!(f, "the claim \"{claim_text}\" cites no record")
+            }
+            Self::UncitedProcedureStep { step_text } => {
+                write!(f, "the step \"{step_text}\" cites no record")
+            }
             Self::AnsweredWithoutClaims => f.write_str("it answered without any claim"),
         }
     }
@@ -97,7 +103,6 @@ mod tests {
     use super::*;
     use crate::domain::{ObservationKind, StoredObservation};
     use crate::rlm::evidence::HandleRegistry;
-
 
     fn make_obs(id: i64, text: &str) -> StoredObservation {
         StoredObservation {

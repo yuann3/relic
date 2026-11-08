@@ -73,7 +73,10 @@ pub fn interrupt_cancels(cancel: Arc<AtomicBool>) {
         let mut old: libc::sigaction = std::mem::zeroed();
         libc::sigaction(libc::SIGINT, std::ptr::null(), &mut old);
         if old.sa_sigaction != libc::SIG_IGN {
-            libc::signal(libc::SIGINT, on_interrupt as *const () as libc::sighandler_t);
+            libc::signal(
+                libc::SIGINT,
+                on_interrupt as *const () as libc::sighandler_t,
+            );
         }
     }
 }
@@ -108,7 +111,10 @@ extern "C" fn on_interrupt(_: libc::c_int) {
 /// interrupted rather than raced. Blocking inside the new thread would leave
 /// a window where a signal could land on it; one that arrives while the
 /// caller has them blocked stays pending and reaches it on the restore.
-pub fn spawn<F, T>(builder: std::thread::Builder, f: F) -> std::io::Result<std::thread::JoinHandle<T>>
+pub fn spawn<F, T>(
+    builder: std::thread::Builder,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<T>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -201,7 +207,10 @@ fn stop_child() {
             return;
         }
         libc::kill(pid, libc::SIGTERM);
-        let tick = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
+        let tick = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
         for _ in 0..GRACE_MS / 10 {
             if libc::waitpid(pid, &mut st, libc::WNOHANG) != 0 {
                 return;
@@ -230,7 +239,10 @@ mod tests {
         unsafe {
             let mut cur: libc::sigset_t = std::mem::zeroed();
             libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut cur);
-            FATAL.iter().map(|&s| libc::sigismember(&cur, s) == 1).collect()
+            FATAL
+                .iter()
+                .map(|&s| libc::sigismember(&cur, s) == 1)
+                .collect()
         }
     }
 
@@ -238,7 +250,10 @@ mod tests {
     fn spawned_threads_block_fatal_signals_and_the_caller_still_takes_them() {
         let before = blocked();
         assert_eq!(before, [false; 4], "the test thread starts unblocked");
-        let child = spawn(std::thread::Builder::new(), blocked).unwrap().join().unwrap();
+        let child = spawn(std::thread::Builder::new(), blocked)
+            .unwrap()
+            .join()
+            .unwrap();
         assert_eq!(child, [true; 4]);
         // Left blocked, Ctrl-C would stay pending on the main thread forever.
         assert_eq!(blocked(), before);

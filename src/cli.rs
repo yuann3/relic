@@ -141,20 +141,65 @@ pub enum Command {
     Help,
     Version,
     Search(SearchArgs),
-    Recall { question: String, db: Option<PathBuf>, json: bool, allow_unknown_cost: bool },
-    Ui { db: Option<PathBuf> },
-    Import { path: PathBuf, shell: Option<SourceKind>, db: Option<PathBuf> },
+    Recall {
+        question: String,
+        db: Option<PathBuf>,
+        json: bool,
+        allow_unknown_cost: bool,
+    },
+    Ui {
+        db: Option<PathBuf>,
+    },
+    Import {
+        path: PathBuf,
+        shell: Option<SourceKind>,
+        db: Option<PathBuf>,
+    },
     /// Every Claude Code (`kind` Claude) or shell hook (`kind` Hook) session
     /// under `path`, or one session file.
-    ImportSessions { kind: SourceKind, path: Option<PathBuf>, db: Option<PathBuf> },
+    ImportSessions {
+        kind: SourceKind,
+        path: Option<PathBuf>,
+        db: Option<PathBuf>,
+    },
     /// Print the hook for `shell`, zsh or bash.
-    Hook { shell: SourceKind },
-    Forget { ids: Vec<i64>, db: Option<PathBuf> },
-    Show { ids: Vec<i64>, db: Option<PathBuf>, json: bool },
-    Validate { report: PathBuf, cwd: Option<PathBuf>, db: Option<PathBuf>, argv: Vec<String> },
-    SkillCompile { report: PathBuf, name: String, description: String, db: Option<PathBuf> },
-    SkillActivate { name: String, scope: Scope, claude: bool, yes: bool, db: Option<PathBuf> },
-    SkillRollback { name: String, scope: Scope, claude: bool, db: Option<PathBuf> },
+    Hook {
+        shell: SourceKind,
+    },
+    Forget {
+        ids: Vec<i64>,
+        db: Option<PathBuf>,
+    },
+    Show {
+        ids: Vec<i64>,
+        db: Option<PathBuf>,
+        json: bool,
+    },
+    Validate {
+        report: PathBuf,
+        cwd: Option<PathBuf>,
+        db: Option<PathBuf>,
+        argv: Vec<String>,
+    },
+    SkillCompile {
+        report: PathBuf,
+        name: String,
+        description: String,
+        db: Option<PathBuf>,
+    },
+    SkillActivate {
+        name: String,
+        scope: Scope,
+        claude: bool,
+        yes: bool,
+        db: Option<PathBuf>,
+    },
+    SkillRollback {
+        name: String,
+        scope: Scope,
+        claude: bool,
+        db: Option<PathBuf>,
+    },
     ModelCheck,
 }
 
@@ -185,7 +230,8 @@ pub enum Output {
 
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut args = args.into_iter().map(|a| {
-        a.into_string().map_err(|a| format!("argument is not valid UTF-8: {a:?}"))
+        a.into_string()
+            .map_err(|a| format!("argument is not valid UTF-8: {a:?}"))
     });
     let Some(sub) = args.next().transpose()? else {
         return Ok(Command::Help);
@@ -212,7 +258,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             if words.is_empty() {
                 return Err("recall needs a question".into());
             }
-            Ok(Command::Recall { question: words.join(" "), db, json, allow_unknown_cost })
+            Ok(Command::Recall {
+                question: words.join(" "),
+                db,
+                json,
+                allow_unknown_cost,
+            })
         }
         "ui" => {
             let mut db = None;
@@ -247,21 +298,40 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             }
             if let Some(kind) = sessions {
                 if shell.is_some() {
-                    return Err(format!("--{} and --shell cannot be combined", if kind == SourceKind::Hook { "hooks" } else { "claude" }));
+                    return Err(format!(
+                        "--{} and --shell cannot be combined",
+                        if kind == SourceKind::Hook {
+                            "hooks"
+                        } else {
+                            "claude"
+                        }
+                    ));
                 }
                 return Ok(Command::ImportSessions { kind, path, db });
             }
             let path = path.ok_or("import needs a history file")?;
             Ok(Command::Import { path, shell, db })
         }
-        "hook" => match (args.next().transpose()?.as_deref(), args.next().transpose()?) {
-            (Some("zsh"), None) => Ok(Command::Hook { shell: SourceKind::Zsh }),
-            (Some("bash"), None) => Ok(Command::Hook { shell: SourceKind::Bash }),
+        "hook" => match (
+            args.next().transpose()?.as_deref(),
+            args.next().transpose()?,
+        ) {
+            (Some("zsh"), None) => Ok(Command::Hook {
+                shell: SourceKind::Zsh,
+            }),
+            (Some("bash"), None) => Ok(Command::Hook {
+                shell: SourceKind::Bash,
+            }),
             (Some("-h" | "--help"), _) => Ok(Command::Help),
             _ => Err("hook needs a shell: zsh or bash".into()),
         },
-        "model" => match (args.next().transpose()?.as_deref(), args.next().transpose()?.as_deref()) {
-            (Some("-h" | "--help"), _) | (Some("check"), Some("-h" | "--help")) => Ok(Command::Help),
+        "model" => match (
+            args.next().transpose()?.as_deref(),
+            args.next().transpose()?.as_deref(),
+        ) {
+            (Some("-h" | "--help"), _) | (Some("check"), Some("-h" | "--help")) => {
+                Ok(Command::Help)
+            }
             (Some("check"), None) => Ok(Command::ModelCheck),
             (Some("check"), Some(a)) => Err(format!("unexpected argument for model check: {a}")),
             (Some(sub), _) => Err(format!("unknown model command: {sub}; try model check")),
@@ -286,7 +356,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             if ids.is_empty() {
                 return Err(format!("{sub} needs at least one record id"));
             }
-            Ok(if sub == "show" { Command::Show { ids, db, json } } else { Command::Forget { ids, db } })
+            Ok(if sub == "show" {
+                Command::Show { ids, db, json }
+            } else {
+                Command::Forget { ids, db }
+            })
         }
         "validate" => {
             let (mut report, mut cwd, mut db, mut argv) = (None, None, None, Vec::new());
@@ -299,14 +373,23 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     "--cwd" => cwd = Some(value(&mut args, "--cwd")?.into()),
                     f if f.starts_with("--") => return Err(format!("unknown option: {f}")),
                     _ if report.is_none() => report = Some(PathBuf::from(a)),
-                    _ => return Err(format!("unexpected argument for validate: {a}; put the verifier after --")),
+                    _ => {
+                        return Err(format!(
+                            "unexpected argument for validate: {a}; put the verifier after --"
+                        ));
+                    }
                 }
             }
             let report = report.ok_or("validate needs a recall --json report")?;
             if argv.is_empty() {
                 return Err("validate needs a verifier after --".into());
             }
-            Ok(Command::Validate { report, cwd, db, argv })
+            Ok(Command::Validate {
+                report,
+                cwd,
+                db,
+                argv,
+            })
         }
         "skill" => parse_skill(args),
         other => Err(format!("unknown command: {other}")),
@@ -314,7 +397,10 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
 }
 
 fn parse_skill(mut args: impl Iterator<Item = Result<String, String>>) -> Result<Command, String> {
-    let sub = args.next().transpose()?.ok_or("skill needs a command: compile, activate or rollback")?;
+    let sub = args
+        .next()
+        .transpose()?
+        .ok_or("skill needs a command: compile, activate or rollback")?;
     if !matches!(sub.as_str(), "compile" | "activate" | "rollback") {
         return Ok(match sub.as_str() {
             "-h" | "--help" => Command::Help,
@@ -328,9 +414,13 @@ fn parse_skill(mut args: impl Iterator<Item = Result<String, String>>) -> Result
             "-h" | "--help" => return Ok(Command::Help),
             "--db" => db = Some(value(&mut args, "--db")?.into()),
             "--name" if sub == "compile" => name = Some(value(&mut args, "--name")?),
-            "--description" if sub == "compile" => description = Some(value(&mut args, "--description")?),
+            "--description" if sub == "compile" => {
+                description = Some(value(&mut args, "--description")?)
+            }
             "--user" if sub != "compile" => user = true,
-            "--project" if sub != "compile" => project = Some(PathBuf::from(value(&mut args, "--project")?)),
+            "--project" if sub != "compile" => {
+                project = Some(PathBuf::from(value(&mut args, "--project")?))
+            }
             "--claude" if sub != "compile" => claude = true,
             "--yes" if sub == "activate" => yes = true,
             f if f.starts_with("--") => return Err(format!("unknown option for skill {sub}: {f}")),
@@ -339,10 +429,18 @@ fn parse_skill(mut args: impl Iterator<Item = Result<String, String>>) -> Result
         }
     }
     if sub == "compile" {
-        let report = target.ok_or("skill compile needs a recall --json report")?.into();
+        let report = target
+            .ok_or("skill compile needs a recall --json report")?
+            .into();
         let name = name.ok_or("skill compile needs --name")?;
-        let description = description.ok_or("skill compile needs --description: when an agent should use it")?;
-        return Ok(Command::SkillCompile { report, name, description, db });
+        let description =
+            description.ok_or("skill compile needs --description: when an agent should use it")?;
+        return Ok(Command::SkillCompile {
+            report,
+            name,
+            description,
+            db,
+        });
     }
     let name = target.ok_or_else(|| format!("skill {sub} needs a skill name"))?;
     let scope = match (user, project) {
@@ -351,15 +449,24 @@ fn parse_skill(mut args: impl Iterator<Item = Result<String, String>>) -> Result
         _ => return Err(format!("skill {sub} needs one of --user or --project DIR")),
     };
     Ok(if sub == "activate" {
-        Command::SkillActivate { name, scope, claude, yes, db }
+        Command::SkillActivate {
+            name,
+            scope,
+            claude,
+            yes,
+            db,
+        }
     } else {
-        Command::SkillRollback { name, scope, claude, db }
+        Command::SkillRollback {
+            name,
+            scope,
+            claude,
+            db,
+        }
     })
 }
 
-fn parse_search(
-    mut args: impl Iterator<Item = Result<String, String>>,
-) -> Result<Command, String> {
+fn parse_search(mut args: impl Iterator<Item = Result<String, String>>) -> Result<Command, String> {
     let (mut words, mut db, mut limit, mut prefix) = (Vec::new(), None, None, false);
     let (mut json, mut fzf, mut rank) = (false, false, false);
     let mut options_done = false;
@@ -395,14 +502,23 @@ fn parse_search(
         (false, true) => Output::Fzf,
         (false, false) => Output::Text,
     };
-    Ok(Command::Search(SearchArgs { query: words.join(" "), db, limit, prefix, rank, output }))
+    Ok(Command::Search(SearchArgs {
+        query: words.join(" "),
+        db,
+        limit,
+        prefix,
+        rank,
+        output,
+    }))
 }
 
 fn value(
     args: &mut impl Iterator<Item = Result<String, String>>,
     flag: &str,
 ) -> Result<String, String> {
-    args.next().transpose()?.ok_or_else(|| format!("{flag} needs a value"))
+    args.next()
+        .transpose()?
+        .ok_or_else(|| format!("{flag} needs a value"))
 }
 
 /// Whether the database sits in Relic's own data directory, which Relic may
@@ -484,7 +600,9 @@ mod tests {
 
     #[test]
     fn search_joins_words_and_reads_options() {
-        let s = search(&["search", "certbot", "--limit", "5", "renew", "--json", "--db", "x.db"]);
+        let s = search(&[
+            "search", "certbot", "--limit", "5", "renew", "--json", "--db", "x.db",
+        ]);
         assert_eq!(s.query, "certbot renew");
         assert_eq!(s.limit, Some(5));
         assert_eq!(search(&["search", "x"]).limit, None);
@@ -496,7 +614,10 @@ mod tests {
 
     #[test]
     fn double_dash_lets_a_query_start_with_dashes() {
-        assert_eq!(search(&["search", "--", "--force", "push"]).query, "--force push");
+        assert_eq!(
+            search(&["search", "--", "--force", "push"]).query,
+            "--force push"
+        );
     }
 
     #[test]
@@ -514,36 +635,87 @@ mod tests {
         let cmd = p(&["import", "h.txt", "--shell", "bash"]).unwrap();
         assert_eq!(
             cmd,
-            Command::Import { path: "h.txt".into(), shell: Some(SourceKind::Bash), db: None }
+            Command::Import {
+                path: "h.txt".into(),
+                shell: Some(SourceKind::Bash),
+                db: None
+            }
         );
-        assert!(matches!(p(&["import", "h"]).unwrap(), Command::Import { shell: None, .. }));
+        assert!(matches!(
+            p(&["import", "h"]).unwrap(),
+            Command::Import { shell: None, .. }
+        ));
         assert!(p(&["import"]).is_err());
         assert!(p(&["import", "h", "--shell", "fish"]).is_err());
-        let sessions = |kind, path: Option<&str>| Command::ImportSessions { kind, path: path.map(Into::into), db: None };
-        assert_eq!(p(&["import", "--claude"]).unwrap(), sessions(SourceKind::Claude, None));
-        assert_eq!(p(&["import", "d", "--claude"]).unwrap(), sessions(SourceKind::Claude, Some("d")));
-        assert_eq!(p(&["import", "--hooks", "d"]).unwrap(), sessions(SourceKind::Hook, Some("d")));
+        let sessions = |kind, path: Option<&str>| Command::ImportSessions {
+            kind,
+            path: path.map(Into::into),
+            db: None,
+        };
+        assert_eq!(
+            p(&["import", "--claude"]).unwrap(),
+            sessions(SourceKind::Claude, None)
+        );
+        assert_eq!(
+            p(&["import", "d", "--claude"]).unwrap(),
+            sessions(SourceKind::Claude, Some("d"))
+        );
+        assert_eq!(
+            p(&["import", "--hooks", "d"]).unwrap(),
+            sessions(SourceKind::Hook, Some("d"))
+        );
         assert!(p(&["import", "--claude", "--shell", "zsh"]).is_err());
         assert!(p(&["import", "--hooks", "--shell", "zsh"]).is_err());
-        assert_eq!(p(&["hook", "bash"]).unwrap(), Command::Hook { shell: SourceKind::Bash });
-        assert!(p(&["hook"]).is_err() && p(&["hook", "fish"]).is_err() && p(&["hook", "zsh", "x"]).is_err());
-        assert_eq!(p(&["forget", "#42", "7"]).unwrap(), Command::Forget { ids: vec![42, 7], db: None });
+        assert_eq!(
+            p(&["hook", "bash"]).unwrap(),
+            Command::Hook {
+                shell: SourceKind::Bash
+            }
+        );
+        assert!(
+            p(&["hook"]).is_err()
+                && p(&["hook", "fish"]).is_err()
+                && p(&["hook", "zsh", "x"]).is_err()
+        );
+        assert_eq!(
+            p(&["forget", "#42", "7"]).unwrap(),
+            Command::Forget {
+                ids: vec![42, 7],
+                db: None
+            }
+        );
         assert!(p(&["forget"]).is_err());
         assert_eq!(p(&["model", "check"]).unwrap(), Command::ModelCheck);
         assert_eq!(p(&["model", "check", "--help"]).unwrap(), Command::Help);
-        assert!(p(&["model"]).is_err() && p(&["model", "chek"]).is_err() && p(&["model", "check", "x"]).is_err());
+        assert!(
+            p(&["model"]).is_err()
+                && p(&["model", "chek"]).is_err()
+                && p(&["model", "check", "x"]).is_err()
+        );
         assert!(p(&["forget", "all"]).is_err());
         assert_eq!(
             p(&["recall", "how", "--json", "did", "--", "--db", "x"]).unwrap(),
-            Command::Recall { question: "how did --db x".into(), db: None, json: true, allow_unknown_cost: false }
+            Command::Recall {
+                question: "how did --db x".into(),
+                db: None,
+                json: true,
+                allow_unknown_cost: false
+            }
         );
-        assert!(p(&["recall"]).is_err() && p(&["recall", "--json"]).is_err() && p(&["recall", "x", "--fzf"]).is_err());
+        assert!(
+            p(&["recall"]).is_err()
+                && p(&["recall", "--json"]).is_err()
+                && p(&["recall", "x", "--fzf"]).is_err()
+        );
     }
 
     #[test]
     fn a_verifier_keeps_its_own_flags_and_a_skill_always_names_where_it_goes() {
         assert_eq!(
-            p(&["validate", "r.json", "--cwd", "/w", "--", "git", "--help", "--db", "x"]).unwrap(),
+            p(&[
+                "validate", "r.json", "--cwd", "/w", "--", "git", "--help", "--db", "x"
+            ])
+            .unwrap(),
             Command::Validate {
                 report: "r.json".into(),
                 cwd: Some("/w".into()),
@@ -553,16 +725,46 @@ mod tests {
         );
         assert!(p(&["validate", "r.json"]).is_err() && p(&["validate", "r.json", "git"]).is_err());
         assert_eq!(
-            p(&["skill", "activate", "git-x", "--project", "/p", "--claude", "--yes"]).unwrap(),
-            Command::SkillActivate { name: "git-x".into(), scope: Scope::Project("/p".into()), claude: true, yes: true, db: None }
+            p(&[
+                "skill",
+                "activate",
+                "git-x",
+                "--project",
+                "/p",
+                "--claude",
+                "--yes"
+            ])
+            .unwrap(),
+            Command::SkillActivate {
+                name: "git-x".into(),
+                scope: Scope::Project("/p".into()),
+                claude: true,
+                yes: true,
+                db: None
+            }
         );
-        assert!(matches!(p(&["skill", "rollback", "git-x", "--user"]).unwrap(), Command::SkillRollback { scope: Scope::User, .. }));
+        assert!(matches!(
+            p(&["skill", "rollback", "git-x", "--user"]).unwrap(),
+            Command::SkillRollback {
+                scope: Scope::User,
+                ..
+            }
+        ));
         for bad in [
             &["skill", "activate", "git-x"][..],
             &["skill", "activate", "git-x", "--user", "--project", "/p"],
             &["skill", "rollback", "git-x", "--user", "--yes"],
             &["skill", "compile", "r.json", "--name", "git-x"],
-            &["skill", "compile", "r.json", "--name", "n", "--description", "d", "--user"],
+            &[
+                "skill",
+                "compile",
+                "r.json",
+                "--name",
+                "n",
+                "--description",
+                "d",
+                "--user",
+            ],
         ] {
             assert!(p(bad).is_err(), "{bad:?}");
         }
@@ -571,13 +773,28 @@ mod tests {
     #[test]
     fn db_resolution_order() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| OsString::from(v))
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(v))
+            }
         };
-        let all = env(&[("RELIC_DB", "/r.db"), ("XDG_DATA_HOME", "/x"), ("HOME", "/h")]);
-        assert_eq!(resolve_db_from(Some("/e.db".into()), all).unwrap(), PathBuf::from("/e.db"));
+        let all = env(&[
+            ("RELIC_DB", "/r.db"),
+            ("XDG_DATA_HOME", "/x"),
+            ("HOME", "/h"),
+        ]);
+        assert_eq!(
+            resolve_db_from(Some("/e.db".into()), all).unwrap(),
+            PathBuf::from("/e.db")
+        );
         assert_eq!(resolve_db_from(None, all).unwrap(), PathBuf::from("/r.db"));
         let xdg = env(&[("RELIC_DB", ""), ("XDG_DATA_HOME", "/x"), ("HOME", "/h")]);
-        assert_eq!(resolve_db_from(None, xdg).unwrap(), PathBuf::from("/x/relic/relic.db"));
+        assert_eq!(
+            resolve_db_from(None, xdg).unwrap(),
+            PathBuf::from("/x/relic/relic.db")
+        );
         let home = env(&[("HOME", "/h")]);
         assert_eq!(
             resolve_db_from(None, home).unwrap(),
@@ -585,7 +802,10 @@ mod tests {
         );
         assert!(resolve_db_from(None, env(&[])).is_err());
         let relative = env(&[("XDG_DATA_HOME", "rel"), ("HOME", "/h")]);
-        assert_eq!(resolve_db_from(None, relative).unwrap(), PathBuf::from("/h/.local/share/relic/relic.db"));
+        assert_eq!(
+            resolve_db_from(None, relative).unwrap(),
+            PathBuf::from("/h/.local/share/relic/relic.db")
+        );
         assert!(resolve_db_from(None, env(&[("XDG_DATA_HOME", "rel")])).is_err());
     }
 }

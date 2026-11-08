@@ -88,30 +88,65 @@ pub fn generate_diverse_zsh_history(count: usize, seed: u64) -> Vec<u8> {
     let mut rng = SimpleRng::new(seed);
 
     let prefixes = [
-        "git", "cargo", "docker", "kubectl", "npm", "pip", "ssh",
-        "curl", "make", "cd", "ls", "cat", "grep", "find", "sed",
-        "awk", "tar", "chmod", "chown", "mv", "cp", "rm", "mkdir",
+        "git", "cargo", "docker", "kubectl", "npm", "pip", "ssh", "curl", "make", "cd", "ls",
+        "cat", "grep", "find", "sed", "awk", "tar", "chmod", "chown", "mv", "cp", "rm", "mkdir",
         "python3", "node", "go", "rustc", "gcc", "vim", "code",
     ];
 
     let git_subcmds = [
-        "commit", "push", "pull", "checkout", "branch", "merge",
-        "rebase", "stash", "log", "diff", "status", "add", "reset",
-        "cherry-pick", "tag", "fetch", "clone", "bisect",
+        "commit",
+        "push",
+        "pull",
+        "checkout",
+        "branch",
+        "merge",
+        "rebase",
+        "stash",
+        "log",
+        "diff",
+        "status",
+        "add",
+        "reset",
+        "cherry-pick",
+        "tag",
+        "fetch",
+        "clone",
+        "bisect",
     ];
 
     let paths = [
-        "src/main.rs", "src/lib.rs", "tests/integration.rs",
-        "config/prod.toml", "docs/README.md", "Cargo.toml",
-        "/tmp/output.log", "/var/log/app.log", "~/.config/relic",
-        "pkg/server/handler.go", "internal/db/migrations",
-        "frontend/src/App.tsx", "backend/api/routes.py",
+        "src/main.rs",
+        "src/lib.rs",
+        "tests/integration.rs",
+        "config/prod.toml",
+        "docs/README.md",
+        "Cargo.toml",
+        "/tmp/output.log",
+        "/var/log/app.log",
+        "~/.config/relic",
+        "pkg/server/handler.go",
+        "internal/db/migrations",
+        "frontend/src/App.tsx",
+        "backend/api/routes.py",
     ];
 
     let flags = [
-        "--release", "--verbose", "-v", "--force", "-f", "--dry-run",
-        "--all", "-a", "--recursive", "-r", "--quiet", "-q",
-        "--no-cache", "--watch", "--json", "--format=table",
+        "--release",
+        "--verbose",
+        "-v",
+        "--force",
+        "-f",
+        "--dry-run",
+        "--all",
+        "-a",
+        "--recursive",
+        "-r",
+        "--quiet",
+        "-q",
+        "--no-cache",
+        "--watch",
+        "--json",
+        "--format=table",
     ];
 
     let base_ts: u64 = 1_700_000_000;
@@ -192,6 +227,9 @@ mod tests {
     #[test]
     fn generate_bash_correct_count() {
         let data = generate_bash_history(1000, 42);
-        assert_eq!(crate::source::bash::Parser::new(&data[..], true).count(), 1000);
+        assert_eq!(
+            crate::source::bash::Parser::new(&data[..], true).count(),
+            1000
+        );
     }
 }

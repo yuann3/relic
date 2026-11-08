@@ -77,7 +77,10 @@ pub fn root_schema() -> Value {
     ]});
     let cited = |extra: Value| {
         let mut props = json!({"text": {"type": "string"}, "supports": strings()});
-        props.as_object_mut().expect("object").extend(extra.as_object().expect("object").clone());
+        props
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
         object(props)
     };
     let finish = object(json!({
@@ -98,7 +101,9 @@ pub fn root_schema() -> Value {
 }
 
 pub fn child_schema() -> Value {
-    let claim = object(json!({"text": {"type": "string"}, "supports": strings(), "contradicts": strings()}));
+    let claim = object(
+        json!({"text": {"type": "string"}, "supports": strings(), "contradicts": strings()}),
+    );
     let assessment = object(json!({
         "item_id": {"type": "string"},
         "verdict": verdict(),
@@ -124,14 +129,20 @@ mod tests {
         match schema {
             Value::Object(o) => {
                 if let Some(Value::Object(props)) = o.get("properties") {
-                    let mut required: Vec<&str> = o["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+                    let mut required: Vec<&str> = o["required"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect();
                     let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
                     required.sort();
                     keys.sort();
                     assert_eq!(required, keys, "{path}");
                     assert_eq!(o["additionalProperties"], false, "{path}");
                 }
-                o.iter().for_each(|(k, v)| assert_strict(v, &format!("{path}.{k}")));
+                o.iter()
+                    .for_each(|(k, v)| assert_strict(v, &format!("{path}.{k}")));
             }
             Value::Array(a) => a.iter().for_each(|v| assert_strict(v, path)),
             _ => {}
@@ -158,8 +169,21 @@ mod tests {
             "procedure": [{"text": "p", "supports": ["ev1_a"]}], "contradictions": [], "missing": []}});
         let child = json!({"version": 1, "packet_id": "pkt_00", "assessments": [{"item_id": "item_0", "verdict": "unclear",
             "confidence": "medium", "claims": [{"text": "t", "supports": [], "contradicts": []}], "missing": []}]});
-        assert_eq!(serde_json::from_value::<RootActionV1>(plan).unwrap().plan.unwrap().ops.len(), 5);
-        assert!(serde_json::from_value::<RootActionV1>(finish).unwrap().finish.is_some());
+        assert_eq!(
+            serde_json::from_value::<RootActionV1>(plan)
+                .unwrap()
+                .plan
+                .unwrap()
+                .ops
+                .len(),
+            5
+        );
+        assert!(
+            serde_json::from_value::<RootActionV1>(finish)
+                .unwrap()
+                .finish
+                .is_some()
+        );
         serde_json::from_value::<ChildResultV1>(child).unwrap();
     }
 }

@@ -4,7 +4,9 @@ pub use schema::SCHEMA_VERSION;
 
 use crate::domain::{Observation, ObservationKind, Provenance, SearchHit, StoredObservation};
 use crate::import::SourceKind;
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use std::path::{Path, PathBuf};
 
 /// SQLite VM steps between polls of `Store::interruptible`'s check. FTS5 reads
@@ -23,7 +25,10 @@ pub enum StoreError {
     /// build, which ADR 0005 discards.
     NotRelic(PathBuf),
     /// A store written under another schema version.
-    Version { path: PathBuf, found: i64 },
+    Version {
+        path: PathBuf,
+        found: i64,
+    },
     /// An empty file: a store a first import has not finished creating, or
     /// nothing yet. Only a writer may fill it.
     NoStoreYet(PathBuf),
@@ -168,7 +173,11 @@ impl<'a> SourceLock<'a> {
         let Self { tx, locator, .. } = self;
         let parser_contract = parser_contract(kind);
         let known: Option<i64> = tx
-            .query_row("SELECT id FROM source WHERE private_locator = ?1", [locator], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM source WHERE private_locator = ?1",
+                [locator],
+                |r| r.get(0),
+            )
             .optional()?;
         let source_id = match known {
             Some(id) => id,
@@ -193,24 +202,37 @@ impl<'a> SourceLock<'a> {
             "INSERT INTO source_revision (source_id, dev, ino, size, mtime_ns, ctime_ns,
                 stable_len, provenance, parser_contract, redaction_revision, imported_at_ms)
              VALUES (?1, 0, 0, 0, 0, 0, 0, 0, ?2, ?3, ?4)",
-            rusqlite::params![source_id, parser_contract, crate::redact::REDACTION_REVISION, now_ms],
+            rusqlite::params![
+                source_id,
+                parser_contract,
+                crate::redact::REDACTION_REVISION,
+                now_ms
+            ],
         )?;
         let revision_id = tx.last_insert_rowid();
-        Ok(RevisionTx { tx, revision_id, next_ordinal: 0 })
+        Ok(RevisionTx {
+            tx,
+            revision_id,
+            next_ordinal: 0,
+        })
     }
 
     /// The last `n` records of the newest revision, oldest first: the
     /// `(observed_at_ms, safe_text)` a rewritten file is aligned by. Read
     /// from the rows themselves, so no hash of them is stored (ADR 0008).
     pub fn anchor(&self, n: usize) -> Result<Vec<(Option<i64>, String)>, StoreError> {
-        let Some(newest) = &self.newest else { return Ok(vec![]) };
+        let Some(newest) = &self.newest else {
+            return Ok(vec![]);
+        };
         let mut records = self
             .tx
             .prepare(
                 "SELECT observed_at_ms, safe_text FROM observation
                  WHERE revision_id = ?1 ORDER BY ordinal DESC LIMIT ?2",
             )?
-            .query_map(rusqlite::params![newest.revision_id, n as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(rusqlite::params![newest.revision_id, n as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         records.reverse();
         Ok(records)
@@ -224,11 +246,14 @@ impl<'a> SourceLock<'a> {
              JOIN source_revision sr ON sr.id = o.revision_id JOIN source s ON s.id = sr.source_id
              WHERE s.private_locator = ?1",
         )?;
-        let rows = stmt.query_map([self.locator], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = stmt.query_map([self.locator], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             let (kind, at, text) = row?;
-            let kind = ObservationKind::from_i64(kind).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, kind))?;
+            let kind = ObservationKind::from_i64(kind)
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, kind))?;
             out.push((kind, at, text));
         }
         Ok(out)
@@ -237,14 +262,20 @@ impl<'a> SourceLock<'a> {
     /// Reopen the newest revision to append records after its last one. A
     /// source with no revision yet gets its first.
     pub fn append(self, kind: SourceKind) -> Result<RevisionTx<'a>, StoreError> {
-        let Some(newest) = &self.newest else { return self.new_revision(kind) };
+        let Some(newest) = &self.newest else {
+            return self.new_revision(kind);
+        };
         let revision_id = newest.revision_id;
         let next_ordinal = self.tx.query_row(
             "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM observation WHERE revision_id = ?1",
             [revision_id],
             |r| r.get(0),
         )?;
-        Ok(RevisionTx { tx: self.tx, revision_id, next_ordinal })
+        Ok(RevisionTx {
+            tx: self.tx,
+            revision_id,
+            next_ordinal,
+        })
     }
 }
 
@@ -324,7 +355,10 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         schema::initialize(&conn, path)?;
-        Ok(Self { conn, key_path: Some(key_path(path)) })
+        Ok(Self {
+            conn,
+            key_path: Some(key_path(path)),
+        })
     }
 
     /// Open an existing store to read it. Nothing here writes to the file:
@@ -337,14 +371,19 @@ impl Store {
         // next import. Refuse both before SQLite touches anything.
         // SQLite puts them beside what a symlink points at, not beside the link.
         let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let dir = real.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let dir = real
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         for needed in [real.as_path(), dir] {
             if !writable(needed) {
                 return Err(StoreError::Unwritable(needed.to_path_buf()));
             }
         }
-        let conn =
-            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         conn.busy_timeout(schema::BUSY_TIMEOUT)?;
         // The first read is where a reader meets a store that another relic
         // is recovering after a crashed write: measured on bundled SQLite
@@ -352,7 +391,9 @@ impl Store {
         // One retry, said out loud, and no loop (ADR 0005).
         let is_store = match schema::is_store(&conn, path) {
             Err(StoreError::Busy) => {
-                eprintln!("relic: note: the store was busy, as it is while another relic recovers it; trying once more");
+                eprintln!(
+                    "relic: note: the store was busy, as it is while another relic recovers it; trying once more"
+                );
                 schema::is_store(&conn, path)?
             }
             is_store => is_store?,
@@ -361,20 +402,30 @@ impl Store {
             return Err(StoreError::NoStoreYet(path.to_path_buf()));
         }
         schema::configure_reader(&conn)?;
-        Ok(Self { conn, key_path: Some(key_path(path)) })
+        Ok(Self {
+            conn,
+            key_path: Some(key_path(path)),
+        })
     }
 
     /// Open an in-memory store (for tests).
     pub fn open_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         schema::initialize(&conn, Path::new(":memory:"))?;
-        Ok(Self { conn, key_path: None })
+        Ok(Self {
+            conn,
+            key_path: None,
+        })
     }
 
     /// Run `f` while polling `stop`. Once `stop` returns true the running
     /// statement fails with an error `is_interrupt` recognises. FTS5 does a
     /// query's work inside SQLite, so this is the only way to give up on one.
-    pub fn interruptible<T>(&self, stop: impl FnMut() -> bool + Send + 'static, f: impl FnOnce(&Self) -> T) -> T {
+    pub fn interruptible<T>(
+        &self,
+        stop: impl FnMut() -> bool + Send + 'static,
+        f: impl FnOnce(&Self) -> T,
+    ) -> T {
         self.conn.progress_handler(PROGRESS_STEPS, Some(stop));
         let out = f(self);
         self.conn.progress_handler(0, None::<fn() -> bool>);
@@ -398,7 +449,8 @@ impl Store {
 
     /// Return the stored schema version.
     pub fn schema_version(&self) -> Result<i64, rusqlite::Error> {
-        self.conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        self.conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
     }
 
     /// Take the write lock and read the newest revision of the source at
@@ -406,19 +458,29 @@ impl Store {
     /// second importer waits here, then fails with `Busy`, instead of deciding
     /// on a revision that another importer is about to replace.
     pub fn lock_source<'a>(&'a mut self, locator: &'a [u8]) -> Result<SourceLock<'a>, StoreError> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stored_kind = tx
-            .query_row("SELECT kind FROM source WHERE private_locator = ?1", [locator], |r| {
-                r.get::<_, i64>(0)
-            })
+            .query_row(
+                "SELECT kind FROM source WHERE private_locator = ?1",
+                [locator],
+                |r| r.get::<_, i64>(0),
+            )
             .optional()?
             .map(|kind| {
-                [SourceKind::Zsh, SourceKind::Bash, SourceKind::Git, SourceKind::Claude, SourceKind::Hook]
-                    .into_iter()
-                    .find(|k| kind_int(*k) == kind)
-                    // Guessing a shell here could delete the source's records
-                    // on the next `--shell`.
-                    .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, kind))
+                [
+                    SourceKind::Zsh,
+                    SourceKind::Bash,
+                    SourceKind::Git,
+                    SourceKind::Claude,
+                    SourceKind::Hook,
+                ]
+                .into_iter()
+                .find(|k| kind_int(*k) == kind)
+                // Guessing a shell here could delete the source's records
+                // on the next `--shell`.
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, kind))
             })
             .transpose()?;
         let newest = tx
@@ -447,7 +509,12 @@ impl Store {
                 },
             )
             .optional()?;
-        Ok(SourceLock { tx, locator, stored_kind, newest })
+        Ok(SourceLock {
+            tx,
+            locator,
+            stored_kind,
+            newest,
+        })
     }
 
     /// Which fields the revision's source file encodes.
@@ -461,7 +528,8 @@ impl Store {
 
     /// Count total observations in the store.
     pub fn observation_count(&self) -> Result<i64, rusqlite::Error> {
-        self.conn.query_row("SELECT COUNT(*) FROM observation", [], |row| row.get(0))
+        self.conn
+            .query_row("SELECT COUNT(*) FROM observation", [], |row| row.get(0))
     }
 
     /// Re-redact every revision stored under another redaction revision.
@@ -472,8 +540,14 @@ impl Store {
     /// The rewrite is one transaction. Scrubbing the freed pages and the WAL
     /// comes after it; the second value is false when that could not finish,
     /// in which case the next rescrub or forget tries again.
-    pub fn rescrub(&mut self, current: &str, redact: impl Fn(&str) -> String) -> Result<(usize, bool), StoreError> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    pub fn rescrub(
+        &mut self,
+        current: &str,
+        redact: impl Fn(&str) -> String,
+    ) -> Result<(usize, bool), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stale: Vec<i64> = tx
             .prepare("SELECT id FROM source_revision WHERE redaction_revision <> ?1 ORDER BY id")?
             .query_map([current], |r| r.get(0))?
@@ -518,7 +592,15 @@ impl Store {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )?;
                 for Row(ordinal, kind, observed_at_ms, safe_text, flags, locator) in &page {
-                    insert.execute(rusqlite::params![new, ordinal, kind, observed_at_ms, redact(safe_text), flags, locator])?;
+                    insert.execute(rusqlite::params![
+                        new,
+                        ordinal,
+                        kind,
+                        observed_at_ms,
+                        redact(safe_text),
+                        flags,
+                        locator
+                    ])?;
                 }
                 rewritten += page.len();
             }
@@ -526,7 +608,10 @@ impl Store {
             tx.execute("DELETE FROM source_revision WHERE id = ?1", [old])?;
         }
         // Every row changed, so the index is rebuilt whole from what is left.
-        tx.execute("INSERT INTO observation_fts (observation_fts) VALUES ('rebuild')", [])?;
+        tx.execute(
+            "INSERT INTO observation_fts (observation_fts) VALUES ('rebuild')",
+            [],
+        )?;
         tx.commit()?;
         // Every row was rewritten, so half the file is free pages: compact it.
         Ok((rewritten, self.scrub_free_space(true)?))
@@ -535,7 +620,9 @@ impl Store {
     /// Delete these observations for good and say which of them existed, and
     /// whether their bytes are off the disk too (see `rescrub`).
     pub fn forget(&mut self, ids: &[i64]) -> Result<(Vec<i64>, bool), StoreError> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut forgotten = Vec::new();
         for id in ids {
             // The index entry goes first and by its text: see `replace_kind`.
@@ -578,7 +665,8 @@ impl Store {
         if !self.checkpoint()? {
             return Ok(false);
         }
-        self.conn.execute("DELETE FROM schema_meta WHERE key = 'scrub_pending'", [])?;
+        self.conn
+            .execute("DELETE FROM schema_meta WHERE key = 'scrub_pending'", [])?;
         // Clearing the note went through the WAL as well.
         Ok(self.checkpoint()?)
     }
@@ -587,7 +675,9 @@ impl Store {
     /// reader's open snapshot blocked it: SQLite reports that in the pragma's
     /// result row, not as an error, after waiting out busy_timeout.
     pub fn checkpoint(&self) -> Result<bool, rusqlite::Error> {
-        let busy: i64 = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
         Ok(busy == 0)
     }
 
@@ -603,7 +693,11 @@ impl Store {
     /// `search` where the last word is a prefix, so partially typed input
     /// ("gi") finds completed words ("git"). A prefix merges all its postings
     /// before the first row; see docs/research/interactive-fts-measurements.md.
-    pub fn search_prefix(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
+    pub fn search_prefix(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, rusqlite::Error> {
         self.search_fts(&escape_fts_query(query, true), limit, false)
     }
 
@@ -620,9 +714,9 @@ impl Store {
 
     /// The newest observations, unfiltered.
     pub fn recent(&self, limit: usize) -> Result<Vec<SearchHit>, rusqlite::Error> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT id, 0.0 FROM observation ORDER BY id DESC LIMIT ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id, 0.0 FROM observation ORDER BY id DESC LIMIT ?1")?;
         let ids = stmt
             .query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -773,17 +867,26 @@ fn key_path(db: &Path) -> PathBuf {
 
 fn writable(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
     // SAFETY: `path` is a NUL-terminated string that outlives the call.
     unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
 }
 
 fn scrub_pending(tx: &Transaction<'_>) -> Result<bool, rusqlite::Error> {
-    tx.query_row("SELECT EXISTS (SELECT 1 FROM schema_meta WHERE key = 'scrub_pending')", [], |r| r.get(0))
+    tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM schema_meta WHERE key = 'scrub_pending')",
+        [],
+        |r| r.get(0),
+    )
 }
 
 fn mark_scrub_pending(tx: &Transaction<'_>) -> Result<usize, rusqlite::Error> {
-    tx.execute("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('scrub_pending', '1')", [])
+    tx.execute(
+        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('scrub_pending', '1')",
+        [],
+    )
 }
 
 fn kind_int(kind: SourceKind) -> i64 {
@@ -825,7 +928,9 @@ fn escape_fts_query(query: &str, last_prefix: bool) -> String {
         .join(" ")
 }
 
-fn row_to_stored_observation(row: &rusqlite::Row<'_>) -> Result<StoredObservation, rusqlite::Error> {
+fn row_to_stored_observation(
+    row: &rusqlite::Row<'_>,
+) -> Result<StoredObservation, rusqlite::Error> {
     let kind_val: i64 = row.get(3)?;
     Ok(StoredObservation {
         id: row.get(0)?,
@@ -854,7 +959,11 @@ mod tests {
     }
 
     fn begin<'a>(store: &'a mut Store, locator: &'a [u8]) -> RevisionTx<'a> {
-        store.lock_source(locator).unwrap().new_revision(SourceKind::Zsh).unwrap()
+        store
+            .lock_source(locator)
+            .unwrap()
+            .new_revision(SourceKind::Zsh)
+            .unwrap()
     }
 
     fn newest(store: &mut Store) -> Option<NewestRevision> {
@@ -921,7 +1030,10 @@ mod tests {
         let ids = insert(&mut store, &[obs]);
         assert_eq!(ids.len(), 1);
 
-        let stored = store.get_observation(ids[0]).unwrap().expect("should exist");
+        let stored = store
+            .get_observation(ids[0])
+            .unwrap()
+            .expect("should exist");
         assert_eq!(stored.safe_text, "cargo build --release");
         assert_eq!(stored.kind, ObservationKind::ZshCommand);
         assert_eq!(stored.ordinal, 0);
@@ -957,11 +1069,14 @@ mod tests {
     fn search_finds_matching_observations() {
         let mut store = Store::open_memory().unwrap();
 
-        insert(&mut store, &[
-            make_observation(0, "cargo build --release"),
-            make_observation(1, "git push origin main"),
-            make_observation(2, "cargo test --lib"),
-        ]);
+        insert(
+            &mut store,
+            &[
+                make_observation(0, "cargo build --release"),
+                make_observation(1, "git push origin main"),
+                make_observation(2, "cargo test --lib"),
+            ],
+        );
 
         let hits = store.search("cargo", 10).unwrap();
         assert_eq!(hits.len(), 2);
@@ -995,9 +1110,7 @@ mod tests {
     fn search_no_match_returns_empty() {
         let mut store = Store::open_memory().unwrap();
 
-        insert(&mut store, &[
-            make_observation(0, "cargo build"),
-        ]);
+        insert(&mut store, &[make_observation(0, "cargo build")]);
 
         let hits = store.search("nonexistent_term", 10).unwrap();
         assert!(hits.is_empty());
@@ -1006,10 +1119,13 @@ mod tests {
     #[test]
     fn recent_prefix_matches_partial_last_word() {
         let mut store = Store::open_memory().unwrap();
-        insert(&mut store, &[
-            make_observation(0, "git push origin main"),
-            make_observation(1, "cargo build"),
-        ]);
+        insert(
+            &mut store,
+            &[
+                make_observation(0, "git push origin main"),
+                make_observation(1, "cargo build"),
+            ],
+        );
 
         assert!(store.search("gi", 10).unwrap().is_empty());
         let hits = store.search_prefix("gi", 10).unwrap();
@@ -1034,40 +1150,66 @@ mod tests {
     fn recent_prefix_orders_newest_first() {
         let mut store = Store::open_memory().unwrap();
         // BM25 would put the shortest row first; recency must not.
-        insert(&mut store, &[
-            make_observation(0, "git"),
-            make_observation(1, "git commit -m one two three four"),
-            make_observation(2, "ls"),
-            make_observation(3, "git push origin main --force"),
-        ]);
+        insert(
+            &mut store,
+            &[
+                make_observation(0, "git"),
+                make_observation(1, "git commit -m one two three four"),
+                make_observation(2, "ls"),
+                make_observation(3, "git push origin main --force"),
+            ],
+        );
 
-        let texts = |hits: Vec<SearchHit>| hits.into_iter().map(|h| h.safe_text).collect::<Vec<_>>();
+        let texts =
+            |hits: Vec<SearchHit>| hits.into_iter().map(|h| h.safe_text).collect::<Vec<_>>();
         assert_eq!(
             texts(store.search_prefix("gi", 10).unwrap()),
-            ["git push origin main --force", "git commit -m one two three four", "git"]
+            [
+                "git push origin main --force",
+                "git commit -m one two three four",
+                "git"
+            ]
         );
-        assert_eq!(texts(store.search_ranked("git", false, 1).unwrap()), ["git"]);
-        assert_eq!(texts(store.recent(2).unwrap()), ["git push origin main --force", "ls"]);
+        assert_eq!(
+            texts(store.search_ranked("git", false, 1).unwrap()),
+            ["git"]
+        );
+        assert_eq!(
+            texts(store.recent(2).unwrap()),
+            ["git push origin main --force", "ls"]
+        );
     }
 
     #[test]
     fn untimed_hits_are_bounded_by_the_next_timed_command() {
         let mut store = Store::open_memory().unwrap();
-        let untimed = |o, t| Observation { observed_at_ms: None, ..make_observation(o, t) };
-        insert(&mut store, &[
-            untimed(0, "ssh old-host"),
-            untimed(1, "brew install gh"),
-            make_observation(2, "cd Developer"),
-            make_observation(3, "ssh new-host"),
-            untimed(4, "ssh trailing"),
-        ]);
+        let untimed = |o, t| Observation {
+            observed_at_ms: None,
+            ..make_observation(o, t)
+        };
+        insert(
+            &mut store,
+            &[
+                untimed(0, "ssh old-host"),
+                untimed(1, "brew install gh"),
+                make_observation(2, "cd Developer"),
+                make_observation(3, "ssh new-host"),
+                untimed(4, "ssh trailing"),
+            ],
+        );
 
         let hits = store.search("ssh", 10).unwrap();
         let by_text = |t: &str| hits.iter().find(|h| h.safe_text == t).unwrap();
         let first_timed = 1_700_000_000_002;
-        assert_eq!(by_text("ssh old-host").observed_before_ms, Some(first_timed));
+        assert_eq!(
+            by_text("ssh old-host").observed_before_ms,
+            Some(first_timed)
+        );
         // A timed hit carries its own time, not a bound.
-        assert_eq!(by_text("ssh new-host").observed_at_ms, Some(1_700_000_000_003));
+        assert_eq!(
+            by_text("ssh new-host").observed_at_ms,
+            Some(1_700_000_000_003)
+        );
         assert_eq!(by_text("ssh new-host").observed_before_ms, None);
         // Nothing timed follows the last line: no bound to infer.
         assert_eq!(by_text("ssh trailing").observed_before_ms, None);
@@ -1076,13 +1218,16 @@ mod tests {
     #[test]
     fn bound_lookup_uses_the_partial_index() {
         let store = Store::open_memory().unwrap();
-        let plan: String = store.conn.query_row(
-            "EXPLAIN QUERY PLAN SELECT observed_at_ms FROM observation
+        let plan: String = store
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT observed_at_ms FROM observation
              WHERE revision_id = 1 AND ordinal > 5 AND observed_at_ms IS NOT NULL
              ORDER BY ordinal LIMIT 1",
-            [],
-            |r| r.get(3),
-        ).unwrap();
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
         // A scan over a fully untimed bash history would cost O(rows) per hit.
         assert!(plan.contains("observation_timed"), "{plan}");
     }
@@ -1092,9 +1237,10 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
 
         // Insert text that contains FTS operator-like chars.
-        insert(&mut store, &[
-            make_observation(0, "git log --oneline OR --graph"),
-        ]);
+        insert(
+            &mut store,
+            &[make_observation(0, "git log --oneline OR --graph")],
+        );
 
         // Searching for "OR" as a literal word should not break.
         let hits = store.search("OR", 10).unwrap();
@@ -1102,7 +1248,10 @@ mod tests {
     }
 
     fn count(store: &Store, table: &str) -> i64 {
-        store.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+        store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
     }
 
     #[test]
@@ -1112,7 +1261,12 @@ mod tests {
         rev.insert(&make_observation(0, "cargo build")).unwrap();
         drop(rev);
 
-        for table in ["source", "source_revision", "observation", "observation_fts_docsize"] {
+        for table in [
+            "source",
+            "source_revision",
+            "observation",
+            "observation_fts_docsize",
+        ] {
             assert_eq!(count(&store, table), 0, "{table}");
         }
         assert!(store.search("cargo", 10).unwrap().is_empty());
@@ -1127,29 +1281,55 @@ mod tests {
         assert!(lock.anchor(16).unwrap().is_empty());
         drop(lock.append(SourceKind::Zsh).unwrap());
         assert_eq!(newest(&mut store), None);
-        insert(&mut store, &[make_observation(0, "one"), make_observation(1, "two")]);
+        insert(
+            &mut store,
+            &[make_observation(0, "one"), make_observation(1, "two")],
+        );
         let first = newest(&mut store).unwrap();
 
-        let mut rev = store.lock_source(b"/h").unwrap().append(SourceKind::Zsh).unwrap();
+        let mut rev = store
+            .lock_source(b"/h")
+            .unwrap()
+            .append(SourceKind::Zsh)
+            .unwrap();
         rev.insert(&make_observation(2, "abandoned")).unwrap();
         drop(rev);
         assert_eq!(newest(&mut store).unwrap(), first);
         assert!(store.search("abandoned", 10).unwrap().is_empty());
 
         let cursor = Cursor {
-            stat: StatHint { dev: 1, ino: 2, size: 30, mtime_ns: 4, ctime_ns: 5 },
+            stat: StatHint {
+                dev: 1,
+                ino: 2,
+                size: 30,
+                mtime_ns: 4,
+                ctime_ns: 5,
+            },
             stable_len: 30,
             boundary_guard: Some([7; 32]),
         };
-        let mut rev = store.lock_source(b"/h").unwrap().append(SourceKind::Zsh).unwrap();
+        let mut rev = store
+            .lock_source(b"/h")
+            .unwrap()
+            .append(SourceKind::Zsh)
+            .unwrap();
         let id = rev.insert(&make_observation(2, "three")).unwrap();
         rev.commit(&cursor, Provenance::OBSERVED_AT).unwrap();
 
         let lock = store.lock_source(b"/h").unwrap();
-        let texts = |n| lock.anchor(n).unwrap().into_iter().map(|(_, text)| text).collect::<Vec<_>>();
+        let texts = |n| {
+            lock.anchor(n)
+                .unwrap()
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(texts(2), ["two", "three"]);
         assert_eq!(texts(16), ["one", "two", "three"]);
-        assert_eq!(lock.anchor(1).unwrap(), [(Some(1_700_000_000_002), "three".to_string())]);
+        assert_eq!(
+            lock.anchor(1).unwrap(),
+            [(Some(1_700_000_000_002), "three".to_string())]
+        );
         drop(lock);
 
         let three = store.get_observation(id).unwrap().unwrap();
@@ -1157,7 +1337,10 @@ mod tests {
         assert_eq!(store.search("three", 10).unwrap().len(), 1);
         assert_eq!(
             newest(&mut store).unwrap(),
-            NewestRevision { revision_id: first.revision_id, cursor }
+            NewestRevision {
+                revision_id: first.revision_id,
+                cursor
+            }
         );
         // The append adds to what the revision already claimed.
         assert_eq!(
@@ -1171,9 +1354,15 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         insert(&mut store, &[make_observation(0, "one")]);
         insert(&mut store, &[make_observation(0, "two")]);
-        let mut other = store.lock_source(b"/other").unwrap().new_revision(SourceKind::Bash).unwrap();
+        let mut other = store
+            .lock_source(b"/other")
+            .unwrap()
+            .new_revision(SourceKind::Bash)
+            .unwrap();
         other.insert(&make_observation(0, "three")).unwrap();
-        other.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
+        other
+            .commit(&Cursor::default(), Provenance::COMMAND)
+            .unwrap();
 
         assert_eq!(count(&store, "source"), 2);
         assert_eq!(count(&store, "source_revision"), 3);
@@ -1196,21 +1385,33 @@ mod tests {
         let mut store = Store::open(&db).unwrap();
         // Readers get past an open import only because of the WAL: a rollback
         // journal would block them once the import spills its page cache.
-        let mode: String = store.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(mode, "wal");
         insert(&mut store, &[make_observation(0, "needle committed")]);
 
         let mut writing = begin(&mut store, b"/other");
-        writing.insert(&make_observation(0, "needle pending")).unwrap();
+        writing
+            .insert(&make_observation(0, "needle pending"))
+            .unwrap();
 
         // Opened while the write lock is held: a writing open would be Busy here.
         let reader = Store::open_read_only(&db).unwrap();
         let found = |reader: &Store| -> Vec<String> {
-            reader.search("needle", 10).unwrap().into_iter().map(|h| h.safe_text).collect()
+            reader
+                .search("needle", 10)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.safe_text)
+                .collect()
         };
         assert_eq!(found(&reader), ["needle committed"]);
 
-        writing.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
+        writing
+            .commit(&Cursor::default(), Provenance::COMMAND)
+            .unwrap();
         assert_eq!(found(&reader), ["needle pending", "needle committed"]);
     }
 
@@ -1230,7 +1431,10 @@ mod tests {
     /// and a store a pre-release relic wrote (relic's tables, no version).
     fn not_relics(dir: &Path) -> Vec<PathBuf> {
         let foreign = dir.join("notes.db");
-        Connection::open(&foreign).unwrap().execute_batch("CREATE TABLE notes(x)").unwrap();
+        Connection::open(&foreign)
+            .unwrap()
+            .execute_batch("CREATE TABLE notes(x)")
+            .unwrap();
         let empty = dir.join("empty.db");
         std::fs::write(&empty, b"").unwrap();
         let text = dir.join("text.db");
@@ -1243,7 +1447,10 @@ mod tests {
             .unwrap();
         // A version is no identity: plenty of programs stamp 1.
         let stamped = dir.join("stamped.db");
-        Connection::open(&stamped).unwrap().execute_batch("CREATE TABLE notes(x); PRAGMA user_version = 1").unwrap();
+        Connection::open(&stamped)
+            .unwrap()
+            .execute_batch("CREATE TABLE notes(x); PRAGMA user_version = 1")
+            .unwrap();
         vec![foreign, empty, text, prototype, stamped]
     }
 
@@ -1256,12 +1463,22 @@ mod tests {
             // An empty file may be a store an import is creating right now:
             // "move it away" would be the wrong advice.
             if path.ends_with("empty.db") {
-                assert!(matches!(&err, StoreError::NoStoreYet(p) if *p == path), "{err}");
+                assert!(
+                    matches!(&err, StoreError::NoStoreYet(p) if *p == path),
+                    "{err}"
+                );
             } else {
-                assert!(matches!(&err, StoreError::NotRelic(p) if *p == path), "{err}");
+                assert!(
+                    matches!(&err, StoreError::NotRelic(p) if *p == path),
+                    "{err}"
+                );
             }
             assert!(err.to_string().contains("relic import"), "no hint: {err}");
-            assert!(std::fs::read(&path).unwrap() == before, "{} changed", path.display());
+            assert!(
+                std::fs::read(&path).unwrap() == before,
+                "{} changed",
+                path.display()
+            );
             // The pre-release store is in WAL mode, and reading even its
             // header creates the -wal and -shm.
             if !path.ends_with("prototype.db") {
@@ -1280,8 +1497,15 @@ mod tests {
             }
             let before = std::fs::read(&path).unwrap();
             let err = Store::open(&path).err().expect("must refuse");
-            assert!(matches!(&err, StoreError::NotRelic(p) if *p == path), "{err}");
-            assert!(std::fs::read(&path).unwrap() == before, "{} changed", path.display());
+            assert!(
+                matches!(&err, StoreError::NotRelic(p) if *p == path),
+                "{err}"
+            );
+            assert!(
+                std::fs::read(&path).unwrap() == before,
+                "{} changed",
+                path.display()
+            );
         }
     }
 
@@ -1290,10 +1514,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("relic.db");
         drop(Store::open(&db).unwrap());
-        Connection::open(&db).unwrap().execute_batch("PRAGMA user_version = 99").unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 99")
+            .unwrap();
         for open in [Store::open, Store::open_read_only] {
             let err = open(&db).err().expect("must refuse");
-            assert!(matches!(err, StoreError::Version { found: 99, .. }), "{err}");
+            assert!(
+                matches!(err, StoreError::Version { found: 99, .. }),
+                "{err}"
+            );
         }
     }
 
@@ -1308,16 +1538,23 @@ mod tests {
 
         let reader = Store::open_read_only(&db).unwrap();
         assert_eq!(reader.search("cargo", 10).unwrap().len(), 1);
-        let err = reader.conn.execute("DELETE FROM observation", []).unwrap_err();
+        let err = reader
+            .conn
+            .execute("DELETE FROM observation", [])
+            .unwrap_err();
         assert_eq!(err.sqlite_error_code(), Some(ErrorCode::ReadOnly), "{err}");
         drop(reader);
-        assert!(std::fs::read(&db).unwrap() == before, "the search wrote to the database");
+        assert!(
+            std::fs::read(&db).unwrap() == before,
+            "the search wrote to the database"
+        );
     }
 
     #[test]
     fn a_reader_refuses_what_it_cannot_write_beside_and_leaves_no_side_file() {
         use std::os::unix::fs::PermissionsExt;
-        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let mode =
+            |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
@@ -1330,33 +1567,57 @@ mod tests {
 
         mode(&db, 0o444);
         let err = Store::open_read_only(&db).err().expect("read-only file");
-        assert!(matches!(&err, StoreError::Unwritable(p) if *p == db.canonicalize().unwrap()), "{err}");
+        assert!(
+            matches!(&err, StoreError::Unwritable(p) if *p == db.canonicalize().unwrap()),
+            "{err}"
+        );
         mode(&db, 0o644);
 
         mode(&sub, 0o555);
-        let err = Store::open_read_only(&db).err().expect("read-only directory");
+        let err = Store::open_read_only(&db)
+            .err()
+            .expect("read-only directory");
         mode(&sub, 0o755);
         let real_sub = sub.canonicalize().unwrap();
-        assert!(matches!(&err, StoreError::Unwritable(p) if *p == real_sub), "{err}");
+        assert!(
+            matches!(&err, StoreError::Unwritable(p) if *p == real_sub),
+            "{err}"
+        );
         assert_eq!(side_files(&db), clean);
 
         // Through a symlink it is the target's directory that counts.
         let link = dir.path().join("link.db");
         std::os::unix::fs::symlink(&db, &link).unwrap();
         mode(&sub, 0o555);
-        let err = Store::open_read_only(&link).err().expect("link into a read-only directory");
+        let err = Store::open_read_only(&link)
+            .err()
+            .expect("link into a read-only directory");
         mode(&sub, 0o755);
-        assert!(matches!(&err, StoreError::Unwritable(p) if *p == real_sub), "{err}");
-        assert_eq!(Store::open_read_only(&link).unwrap().search("cargo", 10).unwrap().len(), 1);
+        assert!(
+            matches!(&err, StoreError::Unwritable(p) if *p == real_sub),
+            "{err}"
+        );
+        assert_eq!(
+            Store::open_read_only(&link)
+                .unwrap()
+                .search("cargo", 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn interruptible_stops_a_running_search_and_only_that_one() {
         let mut store = Store::open_memory().unwrap();
-        let batch: Vec<Observation> = (0..2_000).map(|i| make_observation(i, &format!("git commit {i}"))).collect();
+        let batch: Vec<Observation> = (0..2_000)
+            .map(|i| make_observation(i, &format!("git commit {i}")))
+            .collect();
         insert(&mut store, &batch);
 
-        let err = store.interruptible(|| true, |s| s.search_ranked("git", false, 10)).unwrap_err();
+        let err = store
+            .interruptible(|| true, |s| s.search_ranked("git", false, 10))
+            .unwrap_err();
         assert!(is_interrupt(&err), "{err}");
         // The handler goes away with the call.
         assert_eq!(store.search_ranked("git", false, 10).unwrap().len(), 10);
@@ -1371,11 +1632,21 @@ mod tests {
             polls.store(0, std::sync::atomic::Ordering::Relaxed);
             move || polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= nth
         };
-        assert_eq!(store.interruptible(count(usize::MAX), |s| s.search("git", limit)).unwrap().len(), limit);
+        assert_eq!(
+            store
+                .interruptible(count(usize::MAX), |s| s.search("git", limit))
+                .unwrap()
+                .len(),
+            limit
+        );
         let total = polls.load(std::sync::atomic::Ordering::Relaxed);
         for nth in 0..total {
             match store.interruptible(count(nth), |s| s.search("git", limit)) {
-                Ok(hits) => assert_eq!(hits.len(), limit, "poll {nth} of {total}: a short page passed off as whole"),
+                Ok(hits) => assert_eq!(
+                    hits.len(),
+                    limit,
+                    "poll {nth} of {total}: a short page passed off as whole"
+                ),
                 Err(e) => assert!(is_interrupt(&e), "{e}"),
             }
         }
@@ -1384,13 +1655,21 @@ mod tests {
     #[test]
     fn rank_ties_come_most_recently_imported_first() {
         let mut store = Store::open_memory().unwrap();
-        let ids = insert(&mut store, &[
-            make_observation(0, "git push"),
-            make_observation(1, "ls"),
-            make_observation(2, "git push"),
-            make_observation(3, "git push"),
-        ]);
-        let got: Vec<i64> = store.search_ranked("push", false, 10).unwrap().iter().map(|h| h.id).collect();
+        let ids = insert(
+            &mut store,
+            &[
+                make_observation(0, "git push"),
+                make_observation(1, "ls"),
+                make_observation(2, "git push"),
+                make_observation(3, "git push"),
+            ],
+        );
+        let got: Vec<i64> = store
+            .search_ranked("push", false, 10)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
         assert_eq!(got, [ids[3], ids[2], ids[0]]);
     }
 
@@ -1412,8 +1691,15 @@ mod tests {
 
     fn store_with(db: &std::path::Path, texts: &[&str]) -> (Store, Vec<i64>) {
         let mut store = Store::open(db).unwrap();
-        let mut rev = store.lock_source(b"/h").unwrap().new_revision(SourceKind::Zsh).unwrap();
-        let ids = texts.iter().map(|t| rev.insert(&make_observation(0, t)).unwrap()).collect();
+        let mut rev = store
+            .lock_source(b"/h")
+            .unwrap()
+            .new_revision(SourceKind::Zsh)
+            .unwrap();
+        let ids = texts
+            .iter()
+            .map(|t| rev.insert(&make_observation(0, t)).unwrap())
+            .collect();
         rev.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
         (store, ids)
     }
@@ -1426,23 +1712,40 @@ mod tests {
         assert!(holds(&on_disk(&db), "LEAKEDCANARY7"));
 
         // Stored under the current revision: nothing to do.
-        assert_eq!(store.rescrub(crate::redact::REDACTION_REVISION, str::to_string).unwrap(), (0, true));
+        assert_eq!(
+            store
+                .rescrub(crate::redact::REDACTION_REVISION, str::to_string)
+                .unwrap(),
+            (0, true)
+        );
         assert!(store.get_observation(old_ids[0]).unwrap().is_some());
 
         let rewritten = store
-            .rescrub("r-next", |text| text.replace("LEAKEDCANARY7", "[REDACTED:secret]"))
+            .rescrub("r-next", |text| {
+                text.replace("LEAKEDCANARY7", "[REDACTED:secret]")
+            })
             .unwrap();
         assert_eq!(rewritten, (2, true));
 
         let on_disk = on_disk(&db);
-        assert!(!holds(&on_disk, "LEAKEDCANARY7"), "old text survives in the db, WAL or shm");
-        assert!(!holds(&on_disk, "leakedcanary7"), "old term survives in the search index");
+        assert!(
+            !holds(&on_disk, "LEAKEDCANARY7"),
+            "old text survives in the db, WAL or shm"
+        );
+        assert!(
+            !holds(&on_disk, "leakedcanary7"),
+            "old term survives in the search index"
+        );
         assert!(store.search("LEAKEDCANARY7", 10).unwrap().is_empty());
         let hits = store.search("deploy", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].safe_text, "deploy [REDACTED:secret] now");
         // A citation made before the rescrub is stale, never a different row.
-        assert!(old_ids.iter().all(|id| store.get_observation(*id).unwrap().is_none()));
+        assert!(
+            old_ids
+                .iter()
+                .all(|id| store.get_observation(*id).unwrap().is_none())
+        );
         assert!(hits[0].id > old_ids[1]);
 
         let revisions: Vec<String> = store
@@ -1454,10 +1757,32 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(revisions, ["r-next"]);
-        store.conn.execute("INSERT INTO observation_fts (observation_fts) VALUES ('integrity-check')", []).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO observation_fts (observation_fts) VALUES ('integrity-check')",
+                [],
+            )
+            .unwrap();
         // The order within the revision is what it was.
-        let kept = store.get_neighbors(store.get_observation(hits[0].id).unwrap().unwrap().revision_id, 0, 0, 5).unwrap();
-        assert_eq!(kept.iter().map(|o| o.safe_text.as_str()).collect::<Vec<_>>(), ["deploy [REDACTED:secret] now", "ls -la"]);
+        let kept = store
+            .get_neighbors(
+                store
+                    .get_observation(hits[0].id)
+                    .unwrap()
+                    .unwrap()
+                    .revision_id,
+                0,
+                0,
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|o| o.safe_text.as_str())
+                .collect::<Vec<_>>(),
+            ["deploy [REDACTED:secret] now", "ls -la"]
+        );
     }
 
     #[test]
@@ -1474,10 +1799,20 @@ mod tests {
         assert!(store.search("LEAKEDCANARY8", 10).unwrap().is_empty());
         assert!(store.get_observation(ids[2]).unwrap().is_none());
         assert_eq!(store.search("echo", 10).unwrap().len(), 2);
-        store.conn.execute("INSERT INTO observation_fts (observation_fts) VALUES ('integrity-check')", []).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO observation_fts (observation_fts) VALUES ('integrity-check')",
+                [],
+            )
+            .unwrap();
 
         // The forgotten row had the highest id; the next row must not take it.
-        let mut rev = store.lock_source(b"/h").unwrap().append(SourceKind::Zsh).unwrap();
+        let mut rev = store
+            .lock_source(b"/h")
+            .unwrap()
+            .append(SourceKind::Zsh)
+            .unwrap();
         let next = rev.insert(&make_observation(0, "echo three")).unwrap();
         rev.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
         assert!(next > ids[2]);
@@ -1492,10 +1827,17 @@ mod tests {
         // A reader mid-query, as the TUI is while it is open.
         let reader = rusqlite::Connection::open(&db).unwrap();
         reader.execute_batch("BEGIN").unwrap();
-        reader.query_row("SELECT COUNT(*) FROM observation", [], |r| r.get::<_, i64>(0)).unwrap();
+        reader
+            .query_row("SELECT COUNT(*) FROM observation", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
 
         assert_eq!(store.forget(&[ids[1]]).unwrap(), (vec![ids[1]], false));
-        assert!(holds(&on_disk(&db), "LEAKEDCANARY6"), "the reader's snapshot should still pin the old pages");
+        assert!(
+            holds(&on_disk(&db), "LEAKEDCANARY6"),
+            "the reader's snapshot should still pin the old pages"
+        );
 
         // Still blocked: the same forget again has nothing to delete and
         // must not claim the bytes are gone.
@@ -1506,13 +1848,21 @@ mod tests {
         assert_eq!(store.forget(&[ids[1]]).unwrap(), (vec![], true));
         assert!(!holds(&on_disk(&db), "LEAKEDCANARY6"));
         // An import would have finished it too, and now finds nothing owed.
-        assert_eq!(store.rescrub(crate::redact::REDACTION_REVISION, str::to_string).unwrap(), (0, true));
+        assert_eq!(
+            store
+                .rescrub(crate::redact::REDACTION_REVISION, str::to_string)
+                .unwrap(),
+            (0, true)
+        );
         // And only once.
         let pending: i64 = store
             .conn
-            .query_row("SELECT COUNT(*) FROM schema_meta WHERE key = 'scrub_pending'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM schema_meta WHERE key = 'scrub_pending'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(pending, 0);
     }
-
 }

@@ -47,7 +47,11 @@ impl std::fmt::Display for IntegrityError {
 impl std::error::Error for IntegrityError {}
 
 /// Create the evidence handle `id` for a stored observation.
-pub fn create_evidence_handle(obs: &StoredObservation, investigation_id: InvestigationId, id: EvidenceId) -> EvidenceHandleV1 {
+pub fn create_evidence_handle(
+    obs: &StoredObservation,
+    investigation_id: InvestigationId,
+    id: EvidenceId,
+) -> EvidenceHandleV1 {
     let content_hash = content_hash(obs.safe_text.as_bytes());
 
     EvidenceHandleV1 {
@@ -189,7 +193,11 @@ impl HandleRegistry {
         let evidence_handles: Vec<EvidenceHandleV1> = observations
             .iter()
             .map(|obs| {
-                let id = self.evidence_ids.entry(obs.id).or_insert_with(random_evidence_id).clone();
+                let id = self
+                    .evidence_ids
+                    .entry(obs.id)
+                    .or_insert_with(random_evidence_id)
+                    .clone();
                 create_evidence_handle(obs, self.investigation_id, id)
             })
             .collect();
@@ -202,12 +210,15 @@ impl HandleRegistry {
             count,
         };
 
-        self.entries.insert(id.clone(), RegistryEntry {
-            handle,
-            observations,
-            evidence_handles,
-            assessments,
-        });
+        self.entries.insert(
+            id.clone(),
+            RegistryEntry {
+                handle,
+                observations,
+                evidence_handles,
+                assessments,
+            },
+        );
 
         id
     }
@@ -219,21 +230,30 @@ impl HandleRegistry {
 
     /// Get the observations for a handle.
     pub fn get_observations(&self, handle_id: &str) -> Option<&[StoredObservation]> {
-        self.entries.get(handle_id).map(|e| e.observations.as_slice())
+        self.entries
+            .get(handle_id)
+            .map(|e| e.observations.as_slice())
     }
 
     /// Get the evidence handles for a result handle.
     pub fn get_evidence_handles(&self, handle_id: &str) -> Option<&[EvidenceHandleV1]> {
-        self.entries.get(handle_id).map(|e| e.evidence_handles.as_slice())
+        self.entries
+            .get(handle_id)
+            .map(|e| e.evidence_handles.as_slice())
     }
 
     /// The verdicts of an assessment set, aligned with its observations.
     pub fn get_assessments(&self, handle_id: &str) -> Option<&[Option<ItemAssessmentV1>]> {
-        self.entries.get(handle_id).map(|e| e.assessments.as_slice())
+        self.entries
+            .get(handle_id)
+            .map(|e| e.assessments.as_slice())
     }
 
     /// Check if a specific evidence ID exists in any handle of this investigation.
-    pub fn resolve_evidence_id(&self, evidence_id: &str) -> Option<(&EvidenceHandleV1, &StoredObservation)> {
+    pub fn resolve_evidence_id(
+        &self,
+        evidence_id: &str,
+    ) -> Option<(&EvidenceHandleV1, &StoredObservation)> {
         for entry in self.entries.values() {
             for (i, eh) in entry.evidence_handles.iter().enumerate() {
                 if eh.id == evidence_id {
@@ -297,7 +317,6 @@ mod tests {
             locator: vec![],
         }
     }
-
 
     #[test]
     fn create_and_verify_handle() {
@@ -418,15 +437,28 @@ mod tests {
 
     #[test]
     fn evidence_ids_are_shared_within_an_investigation_and_differ_across_them() {
-        let obs = || vec![make_stored(1, 10, 0, "cargo build"), make_stored(2, 10, 1, "cargo test")];
+        let obs = || {
+            vec![
+                make_stored(1, 10, 0, "cargo build"),
+                make_stored(2, 10, 1, "cargo test"),
+            ]
+        };
         let ids = |reg: &mut HandleRegistry| {
             let hid = reg.insert_evidence_set(obs());
-            reg.get_evidence_handles(&hid).unwrap().iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            reg.get_evidence_handles(&hid)
+                .unwrap()
+                .iter()
+                .map(|h| h.id.clone())
+                .collect::<Vec<_>>()
         };
         let (mut first, mut second) = (HandleRegistry::new(64), HandleRegistry::new(64));
         let a = ids(&mut first);
         assert_ne!(a[0], a[1]);
-        assert_eq!(ids(&mut first), a, "a second set over the same records cites them alike");
+        assert_eq!(
+            ids(&mut first),
+            a,
+            "a second set over the same records cites them alike"
+        );
         let b = ids(&mut second);
         assert!(a.iter().all(|id| !b.contains(id)), "{a:?} {b:?}");
         assert!(second.resolve_evidence_id(&a[0]).is_none());
@@ -437,7 +469,10 @@ mod tests {
     fn registry_summaries() {
         let mut reg = HandleRegistry::new(64);
         reg.insert_evidence_set(vec![make_stored(1, 10, 0, "cmd1")]);
-        reg.insert_evidence_set(vec![make_stored(2, 10, 1, "cmd2"), make_stored(3, 10, 2, "cmd3")]);
+        reg.insert_evidence_set(vec![
+            make_stored(2, 10, 1, "cmd2"),
+            make_stored(3, 10, 2, "cmd3"),
+        ]);
 
         let summaries = reg.summaries();
         assert_eq!(summaries.len(), 2);

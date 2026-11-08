@@ -39,7 +39,9 @@ impl FakeFzf {
         // to exec with ETXTBSY. Once sh has exited, no writer is left.
         let written = Command::new("/bin/sh")
             .args(["-c", "printf %s \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
-            .arg(format!("#!/bin/sh\nD='{d}'\necho $$ >> \"$D/pids\"\n{script}"))
+            .arg(format!(
+                "#!/bin/sh\nD='{d}'\necho $$ >> \"$D/pids\"\n{script}"
+            ))
             .arg(&path)
             .status()
             .unwrap();
@@ -96,5 +98,6 @@ pub fn page(ids: &[i64]) -> SearchPage {
 pub fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || tx.send(f()));
-    rx.recv_timeout(limit).expect("timed out: picker deadlocked")
+    rx.recv_timeout(limit)
+        .expect("timed out: picker deadlocked")
 }

@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 
 use super::model::{Focus, Modal, RecallState, RecallStatus, StepState, UiModel};
 use crate::app::{MIN_PREFIX_CHARS, RecallOutcome, When, display_line, source_label};
-use crate::rlm::protocol::BudgetV1;
 use crate::domain::{ObservationKind, Provenance};
+use crate::rlm::protocol::BudgetV1;
 
 /// Below this the panes cannot show a usable row, so say so instead.
 pub const MIN_WIDTH: u16 = 40;
@@ -24,7 +24,6 @@ const ROW_CHARS: usize = 1024;
 /// Bytes of a command the evidence pane wraps, for the same reason. The
 /// rest is counted on screen, not silently dropped.
 const EVIDENCE_BYTES: usize = 16 * 1024;
-
 
 struct Theme {
     title: Style,
@@ -93,7 +92,8 @@ fn ascii_for(symbol: &str) -> char {
 fn workspace(frame: &mut Frame, m: &UiModel) {
     let t = Theme::new(m.mono);
     let area = frame.area();
-    m.too_small.set(area.width < MIN_WIDTH || area.height < MIN_HEIGHT);
+    m.too_small
+        .set(area.width < MIN_WIDTH || area.height < MIN_HEIGHT);
     if m.too_small.get() {
         let msg = format!(
             "terminal too small ({}x{}); relic needs at least {MIN_WIDTH}x{MIN_HEIGHT}. Ctrl-C twice quits.",
@@ -183,7 +183,10 @@ fn query_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let block = pane(t, "Query · local index · offline".into(), focused);
     let inner = block.inner(area);
     // Room after the prompt, keeping a cell for the cursor.
-    let shown = tail(&display_line(&m.query), usize::from(inner.width).saturating_sub(3));
+    let shown = tail(
+        &display_line(&m.query),
+        usize::from(inner.width).saturating_sub(3),
+    );
     let mut spans = vec![Span::styled("> ", t.title), Span::raw(shown.clone())];
     if m.query.is_empty() {
         spans.push(Span::styled("type to search your history", t.dim));
@@ -197,7 +200,10 @@ fn query_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
 
 /// The start of `text` a list row can show, neutralized.
 fn row_text(text: &str) -> String {
-    text.chars().take(ROW_CHARS).map(crate::app::display_char).collect()
+    text.chars()
+        .take(ROW_CHARS)
+        .map(crate::app::display_char)
+        .collect()
 }
 
 /// The end of `text` that fits in `room` columns, behind '…' when cut:
@@ -238,7 +244,11 @@ fn results(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
                 ),
                 None if p.words_dropped > 0 => {
                     let s = if p.words_dropped == 1 { "" } else { "s" };
-                    format!("Results {} · {} word{s} ignored", p.hits.len(), p.words_dropped)
+                    format!(
+                        "Results {} · {} word{s} ignored",
+                        p.hits.len(),
+                        p.words_dropped
+                    )
                 }
                 // "+" for a full page: the label must survive a narrow pane,
                 // and the status line spells out "(more exist)".
@@ -356,7 +366,11 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             Span::raw(value),
         ])
     };
-    let from = if matches!(o.kind, ObservationKind::GitReflog | ObservationKind::GitRef) { "git" } else { "file" };
+    let from = if matches!(o.kind, ObservationKind::GitReflog | ObservationKind::GitRef) {
+        "git"
+    } else {
+        "file"
+    };
     let provenance = match (o.kind, m.evidence.view.as_ref().map(|v| v.provenance)) {
         // Git keeps no time for where a ref points; Relic's clock is no
         // source's.
@@ -428,7 +442,10 @@ fn recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let (word, style) = recall_word(r, t);
     let budget = BudgetV1::prototype_default();
     let block = pane(t, "Recall".into(), m.focus == Focus::Recall);
-    let mut lines = vec![Line::from(vec![Span::raw("status: "), Span::styled(word, style)])];
+    let mut lines = vec![Line::from(vec![
+        Span::raw("status: "),
+        Span::styled(word, style),
+    ])];
     if r.status == RecallStatus::Idle {
         lines.push(Line::styled("r asks before starting a recall", t.dim));
     } else {
@@ -477,7 +494,12 @@ fn recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
 
 /// A finished recall: its answer, then each claim and step with its cites.
 fn report_lines(lines: &mut Vec<Line<'static>>, r: &crate::app::RecallReport, t: &Theme) {
-    let cites = |ids: &[i64]| ids.iter().map(|c| format!("#{c}")).collect::<Vec<_>>().join(", ");
+    let cites = |ids: &[i64]| {
+        ids.iter()
+            .map(|c| format!("#{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     if let Some(e) = &r.error {
         lines.push(Line::styled(format!("error: {}", display_line(e)), t.bad));
     }
@@ -490,7 +512,10 @@ fn report_lines(lines: &mut Vec<Line<'static>>, r: &crate::app::RecallReport, t:
         spans.extend(safe_spans(&display_line(&c.text), t));
         spans.push(Span::styled(format!(" [{}]", cites(&c.supports)), t.dim));
         if !c.contradicts.is_empty() {
-            spans.push(Span::styled(format!(" against [{}]", cites(&c.contradicts)), t.bad));
+            spans.push(Span::styled(
+                format!(" against [{}]", cites(&c.contradicts)),
+                t.bad,
+            ));
         }
         lines.push(Line::from(spans));
     }
@@ -503,16 +528,24 @@ fn report_lines(lines: &mut Vec<Line<'static>>, r: &crate::app::RecallReport, t:
         spans.push(Span::styled(format!(" [{}]", cites(&s.supports)), t.dim));
         lines.push(Line::from(spans));
     }
-    for (label, items) in [("contradictions:", &r.contradictions), ("missing:", &r.missing)] {
+    for (label, items) in [
+        ("contradictions:", &r.contradictions),
+        ("missing:", &r.missing),
+    ] {
         if !items.is_empty() {
             lines.push(Line::styled(label, t.title));
         }
         for m in items {
-            lines.push(Line::from([vec![Span::raw("- ")], safe_spans(&display_line(m), t)].concat()));
+            lines.push(Line::from(
+                [vec![Span::raw("- ")], safe_spans(&display_line(m), t)].concat(),
+            ));
         }
     }
     if !r.evidence.is_empty() {
-        lines.push(Line::styled("Enter here opens the first cited record", t.dim));
+        lines.push(Line::styled(
+            "Enter here opens the first cited record",
+            t.dim,
+        ));
     }
 }
 
@@ -522,7 +555,10 @@ fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         (Some(_), _, _, _) => Span::styled("search: failed", t.bad),
         (None, true, _, _) => Span::styled("search: running", t.busy),
         (None, false, Some(_), _) if s.too_broad => Span::styled(
-            format!("search: too broad, stopped after {} ms", crate::app::QUERY_DEADLINE.as_millis()),
+            format!(
+                "search: too broad, stopped after {} ms",
+                crate::app::QUERY_DEADLINE.as_millis()
+            ),
             t.bad,
         ),
         (None, false, Some(p), Some(lat)) => Span::raw(format!(
@@ -535,7 +571,9 @@ fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     };
     let (word, style) = recall_word(&m.recall, t);
     let recall = match m.recall.status {
-        RecallStatus::Running | RecallStatus::Idle => Span::styled(format!("recall: {word}"), style),
+        RecallStatus::Running | RecallStatus::Idle => {
+            Span::styled(format!("recall: {word}"), style)
+        }
         RecallStatus::Cancelled | RecallStatus::Finished => Span::raw(format!("recall: {word}")),
     };
     let mut first = vec![search, Span::raw(" · "), recall];
@@ -547,9 +585,7 @@ fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         Focus::Query => {
             "↑/↓ select · Enter open · Tab pane, then ? help · ^F fzf · ^R recall · Esc quit"
         }
-        _ => {
-            "j/k move · Enter open · Tab pane · / search · f fzf · r recall · ? help · q quit"
-        }
+        _ => "j/k move · Enter open · Tab pane · / search · f fzf · r recall · ? help · q quit",
     };
     let [a, b] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
     frame.render_widget(Line::from(first), a);
@@ -596,7 +632,10 @@ fn confirm_recall(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
             b.child_calls,
             recall_cap(&b, m.recall_priced)
         )),
-        Line::styled("It sends the query and the commands it finds, redacted, to", t.dim),
+        Line::styled(
+            "It sends the query and the commands it finds, redacted, to",
+            t.dim,
+        ),
         Line::styled(display_line(to), t.dim),
         Line::raw(""),
         Line::raw("Start? y/n"),
@@ -623,7 +662,6 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
         height: h,
     }
 }
-
 
 /// Splits out redaction markers so they read differently from the command
 /// around them while still showing (and copying as) the literal marker.
@@ -757,7 +795,11 @@ mod tests {
         // Plain lines written before share_history began stamping them.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("zsh_history");
-        std::fs::write(&path, "ccd --resume\nbrew install gh\n: 1791017948:0;cd Developer\n").unwrap();
+        std::fs::write(
+            &path,
+            "ccd --resume\nbrew install gh\n: 1791017948:0;cd Developer\n",
+        )
+        .unwrap();
         let mut store = Store::open_memory().unwrap();
         import_file(&mut store, &path, SourceKind::Zsh, &Redactor::new()).unwrap();
 
@@ -766,7 +808,10 @@ mod tests {
         // Bounded and exact dates share a column; the marker sits left of it.
         assert!(s.contains("hit ≤10-03 08:59 ccd --resume"), "{s}");
         assert!(s.contains("     10-03 08:59 cd Developer"), "{s}");
-        assert!(s.contains("no later than 2026-10-03") && s.contains("(inferred from history order)"), "{s}");
+        assert!(
+            s.contains("no later than 2026-10-03") && s.contains("(inferred from history order)"),
+            "{s}"
+        );
         assert!(!s.contains("unknown time"), "{s}");
     }
 
@@ -794,18 +839,35 @@ mod tests {
                 .arg(dir.path())
                 .args(args)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+                .envs([
+                    ("GIT_AUTHOR_NAME", "t"),
+                    ("GIT_AUTHOR_EMAIL", "t@t"),
+                    ("GIT_COMMITTER_NAME", "t"),
+                    ("GIT_COMMITTER_EMAIL", "t@t"),
+                ])
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "-q", "-b", "main"]);
         git(&["commit", "-q", "--allow-empty", "-m", "wired"]);
         let mut store = Store::open_memory().unwrap();
-        crate::import::import_git(&mut store, crate::source::git::read(dir.path()).unwrap(), &Redactor::new()).unwrap();
+        crate::import::import_git(
+            &mut store,
+            crate::source::git::read(dir.path()).unwrap(),
+            &Redactor::new(),
+        )
+        .unwrap();
         // Refs are stored after the reflog, so the newest hit is the ref.
         let s = text(&render(&typed(&store, "wired", false), 160, 40));
-        assert!(s.contains("provenance: text from git, time of import"), "{s}");
+        assert!(
+            s.contains("provenance: text from git, time of import"),
+            "{s}"
+        );
         let s = text(&render(&typed(&store, "reflog wired", false), 160, 40));
         assert!(s.contains("provenance: text, time from git"), "{s}");
     }
@@ -823,7 +885,11 @@ mod tests {
     fn results_say_when_words_were_ignored_and_keep_the_order_label_on_a_full_page() {
         let store = store_with(NGINX);
         let long = vec!["x"; crate::app::MAX_WORD_TOKENS + 1].join("/");
-        let s = text(&render(&typed(&store, &format!("certbot {long} "), false), 120, 40));
+        let s = text(&render(
+            &typed(&store, &format!("certbot {long} "), false),
+            120,
+            40,
+        ));
         assert!(s.contains("[ Results 1 · 1 word ignored ]"), "{s}");
 
         let mut m = typed(&store, "certbot re", false);
@@ -840,10 +906,20 @@ mod tests {
         update(&mut m, UiAction::Key(Key::Char('n')));
         let generation = m.search.generation;
         let result = Err(crate::app::SearchError::TooBroad);
-        update(&mut m, UiAction::SearchDone { generation, result, elapsed: Duration::from_millis(100) });
+        update(
+            &mut m,
+            UiAction::SearchDone {
+                generation,
+                result,
+                elapsed: Duration::from_millis(100),
+            },
+        );
         let s = text(&render(&m, 120, 40));
         assert!(s.contains("> certbot ren"), "{s}");
-        assert!(s.contains("[ Results 1 · still for \"certbot re\" ]"), "{s}");
+        assert!(
+            s.contains("[ Results 1 · still for \"certbot re\" ]"),
+            "{s}"
+        );
         assert!(s.contains("search: too broad, stopped after 100 ms"), "{s}");
     }
 
@@ -898,7 +974,11 @@ mod tests {
         }
         let s = screen(&m);
         assert_eq!(row_of(&s, ">  2023"), Some(bottom - 3), "{s}");
-        assert_eq!(row_of(&s, "row-34"), Some(bottom), "the rows stayed put:\n{s}");
+        assert_eq!(
+            row_of(&s, "row-34"),
+            Some(bottom),
+            "the rows stayed put:\n{s}"
+        );
     }
 
     /// At 80 columns the hints end in how to quit, and a long query keeps
@@ -906,15 +986,22 @@ mod tests {
     #[test]
     fn hints_fit_80_columns_and_a_long_query_shows_its_end() {
         let store = store_with(NGINX);
-        let long = "certbot renew --deploy-hook 'systemctl reload nginx' --cert-name example.com zz";
+        let long =
+            "certbot renew --deploy-hook 'systemctl reload nginx' --cert-name example.com zz";
         let mut m = typed(&store, long, false);
         let s = text(&render(&m, 80, 24));
         let lines: Vec<&str> = s.lines().collect();
-        assert!(lines[1].contains("…") && lines[1].contains("example.com zz"), "{s}");
+        assert!(
+            lines[1].contains("…") && lines[1].contains("example.com zz"),
+            "{s}"
+        );
         assert!(lines[23].trim_end().ends_with("Esc quit"), "{s}");
         drive(&mut m, &store, UiAction::Key(Key::Tab));
         let s = text(&render(&m, 80, 24));
-        assert!(s.lines().last().unwrap().trim_end().ends_with("q quit"), "{s}");
+        assert!(
+            s.lines().last().unwrap().trim_end().ends_with("q quit"),
+            "{s}"
+        );
         // A query that fits is shown whole, with no '…'.
         let s = text(&render(&typed(&store, "certb", false), 80, 24));
         assert!(s.contains("> certb") && !s.contains('…'), "{s}");
@@ -989,7 +1076,10 @@ mod tests {
         }
         let s = text(&render(&m, 120, 40));
         let left_out = long.len() - EVIDENCE_BYTES;
-        assert!(s.contains(&format!("… {left_out} more bytes not shown")), "{s}");
+        assert!(
+            s.contains(&format!("… {left_out} more bytes not shown")),
+            "{s}"
+        );
     }
 
     /// In a non-UTF-8 locale every cell is ASCII, and the frame keeps its
@@ -1002,7 +1092,10 @@ mod tests {
         let s = text(&render(&m, 120, 30));
         assert!(s.is_ascii(), "{s}");
         let first = s.lines().next().unwrap();
-        assert!(first.starts_with("+[ Query - local index - offline ]---") && first.ends_with('+'), "{s}");
+        assert!(
+            first.starts_with("+[ Query - local index - offline ]---") && first.ends_with('+'),
+            "{s}"
+        );
         // A wide glyph keeps its two columns, so the rows stay aligned.
         assert!(s.contains("echo ??  caf?"), "{s}");
     }
@@ -1181,8 +1274,14 @@ mod tests {
         assert!(s.contains("16 child calls, cost unknown"), "{s}");
         m.recall_priced = true;
         let s = text(&render(&m, 120, 40));
-        assert!(s.contains("Recall asks a model: up to 8 root + 16 child calls, $1.00 · 180s."), "{s}");
-        assert!(s.contains("Start? y/n") && s.contains("https://api.example.com (openai)"), "{s}");
+        assert!(
+            s.contains("Recall asks a model: up to 8 root + 16 child calls, $1.00 · 180s."),
+            "{s}"
+        );
+        assert!(
+            s.contains("Start? y/n") && s.contains("https://api.example.com (openai)"),
+            "{s}"
+        );
 
         drive(&mut m, &store, UiAction::Key(Key::Esc));
         drive(&mut m, &store, UiAction::Key(Key::Tab));
@@ -1234,10 +1333,22 @@ mod tests {
 
         // Longer than the pane is wide: the claim must wrap, not be cut.
         let mut report = crate::ui::model::answered(&[cite]);
-        report.claims[0].text = "you renewed the certificate with certbot after the reload; claim-end".into();
-        report.procedure = vec![crate::app::CitedText { text: "certbot renew".into(), supports: vec![cite], contradicts: vec![] }];
+        report.claims[0].text =
+            "you renewed the certificate with certbot after the reload; claim-end".into();
+        report.procedure = vec![crate::app::CitedText {
+            text: "certbot renew".into(),
+            supports: vec![cite],
+            contradicts: vec![],
+        }];
         report.missing = vec!["when it expires".into()];
-        drive(&mut m, &store, UiAction::Recall { op, event: RecallEvent::Finished(Box::new(report)) });
+        drive(
+            &mut m,
+            &store,
+            UiAction::Recall {
+                op,
+                event: RecallEvent::Finished(Box::new(report)),
+            },
+        );
         let s = text(&render(&m, 120, 40));
         for want in [
             "with certbot",
@@ -1252,12 +1363,18 @@ mod tests {
         // At 120x26 the pane is shorter than its text: it follows the end,
         // so the finding is in view, and k scrolls back to the start.
         let s = text(&render(&m, 120, 26));
-        assert!(s.contains("claim-end") && !s.contains("status: answered"), "{s}");
+        assert!(
+            s.contains("claim-end") && !s.contains("status: answered"),
+            "{s}"
+        );
         for _ in 0..20 {
             drive(&mut m, &store, UiAction::Key(Key::Char('k')));
         }
         let s = text(&render(&m, 120, 26));
-        assert!(s.contains("status: answered") && !s.contains("claim-end"), "{s}");
+        assert!(
+            s.contains("status: answered") && !s.contains("claim-end"),
+            "{s}"
+        );
     }
 
     #[test]

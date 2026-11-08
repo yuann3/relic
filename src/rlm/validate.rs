@@ -31,18 +31,54 @@ pub enum Op {
 pub enum ValidationError {
     EmptyPlan,
     NotExecuted(&'static str),
-    TooManyOps { count: usize, max: usize },
+    TooManyOps {
+        count: usize,
+        max: usize,
+    },
     DuplicateOpId(String),
-    UnknownInputRef { op_id: String, ref_id: String },
-    ForwardReference { op_id: String, ref_id: String },
-    WrongInputKind { op_id: String, expected: HandleKind, got: HandleKind },
-    StaleStateVersion { expected: u32, got: u32 },
-    SearchTooManyTerms { op_id: String, count: usize, max: usize },
-    SearchNoTerms { op_id: String },
-    LimitZero { op_id: String },
-    AssessObjectiveTooLong { op_id: String, bytes: usize, max: usize },
-    AssessMaxItemsExceeded { op_id: String, count: u32, max: u32 },
-    ExpandWindowExceeded { op_id: String, per_side: u32, max: u32 },
+    UnknownInputRef {
+        op_id: String,
+        ref_id: String,
+    },
+    ForwardReference {
+        op_id: String,
+        ref_id: String,
+    },
+    WrongInputKind {
+        op_id: String,
+        expected: HandleKind,
+        got: HandleKind,
+    },
+    StaleStateVersion {
+        expected: u32,
+        got: u32,
+    },
+    SearchTooManyTerms {
+        op_id: String,
+        count: usize,
+        max: usize,
+    },
+    SearchNoTerms {
+        op_id: String,
+    },
+    LimitZero {
+        op_id: String,
+    },
+    AssessObjectiveTooLong {
+        op_id: String,
+        bytes: usize,
+        max: usize,
+    },
+    AssessMaxItemsExceeded {
+        op_id: String,
+        count: u32,
+        max: u32,
+    },
+    ExpandWindowExceeded {
+        op_id: String,
+        per_side: u32,
+        max: u32,
+    },
 }
 
 impl std::fmt::Display for HandleKind {
@@ -60,23 +96,50 @@ impl std::fmt::Display for ValidationError {
         match self {
             Self::EmptyPlan => f.write_str("the plan has no operations"),
             Self::NotExecuted(op) => write!(f, "{op} is not run in this version"),
-            Self::TooManyOps { count, max } => write!(f, "{count} operations, over the {max} a plan may hold"),
-            Self::DuplicateOpId(id) => write!(f, "op_id {id} is used twice"),
-            Self::UnknownInputRef { op_id, ref_id } => write!(f, "{op_id} reads {ref_id}, which no operation made"),
-            Self::ForwardReference { op_id, ref_id } => write!(f, "{op_id} reads {ref_id} before it is made"),
-            Self::WrongInputKind { op_id, expected, got } => write!(f, "{op_id} needs {expected}, not {got}"),
-            Self::StaleStateVersion { expected, got } => {
-                write!(f, "the plan is for state version {got}, and the state is at {expected}")
+            Self::TooManyOps { count, max } => {
+                write!(f, "{count} operations, over the {max} a plan may hold")
             }
-            Self::SearchTooManyTerms { op_id, count, max } => write!(f, "{op_id} searches {count} terms, over the {max} allowed"),
+            Self::DuplicateOpId(id) => write!(f, "op_id {id} is used twice"),
+            Self::UnknownInputRef { op_id, ref_id } => {
+                write!(f, "{op_id} reads {ref_id}, which no operation made")
+            }
+            Self::ForwardReference { op_id, ref_id } => {
+                write!(f, "{op_id} reads {ref_id} before it is made")
+            }
+            Self::WrongInputKind {
+                op_id,
+                expected,
+                got,
+            } => write!(f, "{op_id} needs {expected}, not {got}"),
+            Self::StaleStateVersion { expected, got } => {
+                write!(
+                    f,
+                    "the plan is for state version {got}, and the state is at {expected}"
+                )
+            }
+            Self::SearchTooManyTerms { op_id, count, max } => {
+                write!(f, "{op_id} searches {count} terms, over the {max} allowed")
+            }
             Self::SearchNoTerms { op_id } => write!(f, "{op_id} searches no terms"),
             Self::LimitZero { op_id } => write!(f, "{op_id} has a limit of 0"),
             Self::AssessObjectiveTooLong { op_id, bytes, max } => {
-                write!(f, "{op_id}'s objective is {bytes} bytes, over the {max} allowed")
+                write!(
+                    f,
+                    "{op_id}'s objective is {bytes} bytes, over the {max} allowed"
+                )
             }
-            Self::AssessMaxItemsExceeded { op_id, count, max } => write!(f, "{op_id} assesses {count} items, over the {max} allowed"),
-            Self::ExpandWindowExceeded { op_id, per_side, max } => {
-                write!(f, "{op_id} expands {per_side} records each side, over the {max} allowed")
+            Self::AssessMaxItemsExceeded { op_id, count, max } => {
+                write!(f, "{op_id} assesses {count} items, over the {max} allowed")
+            }
+            Self::ExpandWindowExceeded {
+                op_id,
+                per_side,
+                max,
+            } => {
+                write!(
+                    f,
+                    "{op_id} expands {per_side} records each side, over the {max} allowed"
+                )
             }
         }
     }
@@ -379,35 +442,50 @@ mod tests {
 
     #[test]
     fn valid_plan_passes() {
-        let action = make_action(0, vec![
-            search("s1", &["cargo"], 50),
-            expand("e1", "s1"),
-            assess("a1", "e1"),
-            select("k1", "a1"),
-            inspect("i1", "k1"),
-        ]);
+        let action = make_action(
+            0,
+            vec![
+                search("s1", &["cargo"], 50),
+                expand("e1", "s1"),
+                assess("a1", "e1"),
+                select("k1", "a1"),
+                inspect("i1", "k1"),
+            ],
+        );
         assert!(validate_plan(&action, 0).is_ok());
     }
 
     #[test]
     fn relate_and_combine_refused_at_admission() {
         let ops = [
-            ("relate", r#"{"op":"relate","op_id":"r1","input":{"output":"s1"},"relation":"git_state","per_seed":2,"limit":80}"#),
-            ("combine", r#"{"op":"combine","op_id":"c1","inputs":[{"output":"s1"}],"mode":"union","limit":20}"#),
+            (
+                "relate",
+                r#"{"op":"relate","op_id":"r1","input":{"output":"s1"},"relation":"git_state","per_seed":2,"limit":80}"#,
+            ),
+            (
+                "combine",
+                r#"{"op":"combine","op_id":"c1","inputs":[{"output":"s1"}],"mode":"union","limit":20}"#,
+            ),
         ];
         for (name, op) in ops {
             let json = format!(
                 r#"{{"version":1,"expected_state_version":0,"kind":"plan","plan":{{"ops":[{{"op":"search","op_id":"s1","terms":["git"],"match":"any","limit":5}},{op}]}}}}"#
             );
             let action: RootActionV1 = serde_json::from_str(&json).unwrap();
-            assert_eq!(validate_plan(&action, 0).unwrap_err(), ValidationError::NotExecuted(name));
+            assert_eq!(
+                validate_plan(&action, 0).unwrap_err(),
+                ValidationError::NotExecuted(name)
+            );
         }
     }
 
     #[test]
     fn empty_plan_rejected() {
         let action = make_action(0, vec![]);
-        assert_eq!(validate_plan(&action, 0).unwrap_err(), ValidationError::EmptyPlan);
+        assert_eq!(
+            validate_plan(&action, 0).unwrap_err(),
+            ValidationError::EmptyPlan
+        );
     }
 
     #[test]
@@ -424,10 +502,10 @@ mod tests {
 
     #[test]
     fn duplicate_op_id_rejected() {
-        let action = make_action(0, vec![
-            search("s1", &["cargo"], 50),
-            search("s1", &["git"], 50),
-        ]);
+        let action = make_action(
+            0,
+            vec![search("s1", &["cargo"], 50), search("s1", &["git"], 50)],
+        );
         assert_eq!(
             validate_plan(&action, 0).unwrap_err(),
             ValidationError::DuplicateOpId("s1".to_string())
@@ -436,10 +514,7 @@ mod tests {
 
     #[test]
     fn forward_reference_rejected() {
-        let action = make_action(0, vec![
-            expand("e1", "s1"),
-            search("s1", &["cargo"], 50),
-        ]);
+        let action = make_action(0, vec![expand("e1", "s1"), search("s1", &["cargo"], 50)]);
         assert!(matches!(
             validate_plan(&action, 0).unwrap_err(),
             ValidationError::ForwardReference { .. }
@@ -448,9 +523,7 @@ mod tests {
 
     #[test]
     fn unknown_input_ref_rejected() {
-        let action = make_action(0, vec![
-            expand("e1", "nonexistent"),
-        ]);
+        let action = make_action(0, vec![expand("e1", "nonexistent")]);
         assert!(matches!(
             validate_plan(&action, 0).unwrap_err(),
             ValidationError::UnknownInputRef { .. }
@@ -460,10 +533,7 @@ mod tests {
     #[test]
     fn wrong_input_kind_rejected() {
         // select expects assessment_set, but search produces evidence_set
-        let action = make_action(0, vec![
-            search("s1", &["cargo"], 50),
-            select("k1", "s1"),
-        ]);
+        let action = make_action(0, vec![search("s1", &["cargo"], 50), select("k1", "s1")]);
         assert!(matches!(
             validate_plan(&action, 0).unwrap_err(),
             ValidationError::WrongInputKind {
@@ -476,12 +546,13 @@ mod tests {
 
     #[test]
     fn stale_state_version_rejected() {
-        let action = make_action(2, vec![
-            search("s1", &["cargo"], 50),
-        ]);
+        let action = make_action(2, vec![search("s1", &["cargo"], 50)]);
         assert_eq!(
             validate_plan(&action, 5).unwrap_err(),
-            ValidationError::StaleStateVersion { expected: 5, got: 2 }
+            ValidationError::StaleStateVersion {
+                expected: 5,
+                got: 2
+            }
         );
     }
 
@@ -515,15 +586,20 @@ mod tests {
 
     #[test]
     fn assess_objective_over_cap_rejected() {
-        let action = |bytes: usize| make_action(0, vec![
-            search("s1", &["cargo"], 50),
-            PlanOpV1::Assess(AssessV1 {
-                op_id: "a1".to_string(),
-                input: InputRefV1::Output("s1".to_string()),
-                objective: "o".repeat(bytes),
-                max_items: 8,
-            }),
-        ]);
+        let action = |bytes: usize| {
+            make_action(
+                0,
+                vec![
+                    search("s1", &["cargo"], 50),
+                    PlanOpV1::Assess(AssessV1 {
+                        op_id: "a1".to_string(),
+                        input: InputRefV1::Output("s1".to_string()),
+                        objective: "o".repeat(bytes),
+                        max_items: 8,
+                    }),
+                ],
+            )
+        };
         assert!(validate_plan(&action(MAX_OBJECTIVE_BYTES), 0).is_ok());
         assert!(matches!(
             validate_plan(&action(MAX_OBJECTIVE_BYTES + 1), 0).unwrap_err(),
@@ -533,15 +609,18 @@ mod tests {
 
     #[test]
     fn assess_max_items_exceeded_rejected() {
-        let action = make_action(0, vec![
-            search("s1", &["cargo"], 50),
-            PlanOpV1::Assess(AssessV1 {
-                op_id: "a1".to_string(),
-                input: InputRefV1::Output("s1".to_string()),
-                objective: "test".to_string(),
-                max_items: 65,
-            }),
-        ]);
+        let action = make_action(
+            0,
+            vec![
+                search("s1", &["cargo"], 50),
+                PlanOpV1::Assess(AssessV1 {
+                    op_id: "a1".to_string(),
+                    input: InputRefV1::Output("s1".to_string()),
+                    objective: "test".to_string(),
+                    max_items: 65,
+                }),
+            ],
+        );
         assert!(matches!(
             validate_plan(&action, 0).unwrap_err(),
             ValidationError::AssessMaxItemsExceeded { .. }
@@ -550,17 +629,20 @@ mod tests {
 
     #[test]
     fn expand_window_exceeded_rejected() {
-        let action = make_action(0, vec![
-            search("s1", &["cargo"], 50),
-            PlanOpV1::Expand(ExpandV1 {
-                op_id: "e1".to_string(),
-                input: InputRefV1::Output("s1".to_string()),
-                scope: ExpandScope::SameSource,
-                before: 33,
-                after: 5,
-                limit: 100,
-            }),
-        ]);
+        let action = make_action(
+            0,
+            vec![
+                search("s1", &["cargo"], 50),
+                PlanOpV1::Expand(ExpandV1 {
+                    op_id: "e1".to_string(),
+                    input: InputRefV1::Output("s1".to_string()),
+                    scope: ExpandScope::SameSource,
+                    before: 33,
+                    after: 5,
+                    limit: 100,
+                }),
+            ],
+        );
         assert!(matches!(
             validate_plan(&action, 0).unwrap_err(),
             ValidationError::ExpandWindowExceeded { .. }
@@ -570,7 +652,11 @@ mod tests {
     #[test]
     fn arbitrary_json_never_panics() {
         let bad_inputs = [
-            "null", "42", "\"hello\"", "[]", "{}",
+            "null",
+            "42",
+            "\"hello\"",
+            "[]",
+            "{}",
             r#"{"version":1,"expected_state_version":0,"kind":"plan","plan":{"ops":[null]}}"#,
             r#"{"version":1,"expected_state_version":0,"kind":"plan","plan":{"ops":[{"op":"search"}]}}"#,
             r#"{"op":"search","op_id":true}"#,

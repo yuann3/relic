@@ -138,10 +138,14 @@ pub fn pick_with(page: &SearchPage, fzf: &Path, mode: PickMode) -> Result<Pick, 
 
     // Feeding stdin from this thread while fzf blocks on a full stdout pipe
     // (or never reads) would deadlock; a writer thread keeps both moving.
-    let writer = crate::signal::spawn(std::thread::Builder::new(), move || stdin.write_all(&records))?;
+    let writer = crate::signal::spawn(std::thread::Builder::new(), move || {
+        stdin.write_all(&records)
+    })?;
 
     let mut out = Vec::new();
-    let read = (&mut stdout).take(OUTPUT_MAX as u64 + 1).read_to_end(&mut out);
+    let read = (&mut stdout)
+        .take(OUTPUT_MAX as u64 + 1)
+        .read_to_end(&mut out);
     drop(stdout);
     let overflow = out.len() > OUTPUT_MAX;
     if overflow || read.is_err() {
@@ -151,11 +155,15 @@ pub fn pick_with(page: &SearchPage, fzf: &Path, mode: PickMode) -> Result<Pick, 
     let status = child.0.wait();
     crate::signal::set_child(0);
     let status = status?;
-    let written = writer.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let written = writer
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 
     read?;
     if overflow {
-        return Err(PickError::Protocol(format!("more than {OUTPUT_MAX} bytes on stdout")));
+        return Err(PickError::Protocol(format!(
+            "more than {OUTPUT_MAX} bytes on stdout"
+        )));
     }
     // fzf may legitimately exit before draining the page (early pick, cancel).
     match written {
@@ -205,7 +213,10 @@ fn find_on_path(path: Option<&OsStr>) -> Option<PathBuf> {
     std::env::split_paths(path?)
         .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join("fzf"))
-        .find(|p| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .find(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
 }
 
 fn check_version(fzf: &Path) -> Result<(), PickError> {
@@ -216,12 +227,17 @@ fn check_version(fzf: &Path) -> Result<(), PickError> {
         .output()
         .map_err(spawn_error)?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let token = text.split_whitespace().next().filter(|_| out.status.success());
+    let token = text
+        .split_whitespace()
+        .next()
+        .filter(|_| out.status.success());
     match token.and_then(parse_version) {
         Some(v) if v >= MINIMUM => Ok(()),
         _ => Err(PickError::TooOld {
-            found: token
-                .map_or_else(|| "unknown".into(), |t| app::display_line(t).chars().take(32).collect()),
+            found: token.map_or_else(
+                || "unknown".into(),
+                |t| app::display_line(t).chars().take(32).collect(),
+            ),
             minimum: MINIMUM_STR,
         }),
     }
@@ -231,7 +247,11 @@ fn check_version(fzf: &Path) -> Result<(), PickError> {
 fn parse_version(token: &str) -> Option<(u32, u32, u32)> {
     let core = token.split_once('-').map_or(token, |(core, _)| core);
     let mut parts = core.split('.').map(|p| {
-        if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) { p.parse().ok() } else { None }
+        if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+            p.parse().ok()
+        } else {
+            None
+        }
     });
     let major = parts.next()??;
     let minor = parts.next()??;
@@ -323,7 +343,9 @@ mod tests {
         assert_eq!(parse_version("0.74.4"), Some((0, 74, 4)));
         assert_eq!(parse_version("0.27"), Some((0, 27, 0)));
         assert_eq!(parse_version("0.75.0-rc1"), Some((0, 75, 0)));
-        for bad in ["", "v0.74.4", "0", "0.74.x", "0..4", "0.74.4.1", "devel", "+1.2.3"] {
+        for bad in [
+            "", "v0.74.4", "0", "0.74.x", "0..4", "0.74.4.1", "devel", "+1.2.3",
+        ] {
             assert_eq!(parse_version(bad), None, "{bad:?}");
         }
         assert!(parse_version("0.27.1").unwrap() < MINIMUM);
@@ -371,7 +393,12 @@ mod tests {
                 .stdout(Stdio::piped())
                 .spawn()
                 .unwrap();
-            child.stdin.take().unwrap().write_all(&encode(&p.hits)).unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&encode(&p.hits))
+                .unwrap();
             child.wait_with_output().unwrap()
         };
         let out = filter("cargo release");

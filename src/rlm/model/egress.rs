@@ -86,7 +86,10 @@ pub enum EgressError {
 impl std::fmt::Display for EgressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooLarge { bytes, max } => write!(f, "model request of {bytes} bytes is over the {max}-byte cap"),
+            Self::TooLarge { bytes, max } => write!(
+                f,
+                "model request of {bytes} bytes is over the {max}-byte cap"
+            ),
             Self::Budget(b) => write!(f, "model egress budget: {b}"),
         }
     }
@@ -118,10 +121,16 @@ impl EgressRequest {
         let schema = role.schema();
         let bytes = encoded_bytes(role, &user, &schema);
         if bytes > role.max() {
-            return Err(EgressError::TooLarge { bytes, max: role.max() });
+            return Err(EgressError::TooLarge {
+                bytes,
+                max: role.max(),
+            });
         }
         ledger
-            .reserve(&Reservation { model_egress_bytes: bytes as u64, ..Default::default() })
+            .reserve(&Reservation {
+                model_egress_bytes: bytes as u64,
+                ..Default::default()
+            })
             .map_err(EgressError::Budget)?;
         let mut evidence_ids = Vec::new();
         collect_evidence_ids(&payload, &mut evidence_ids);
@@ -130,12 +139,19 @@ impl EgressRequest {
             origin: target.origin.clone(),
             role,
             bytes,
-            request_hash: crate::rlm::evidence::hex_hash(format!("{}\0{user}", role.system()).as_bytes()),
+            request_hash: crate::rlm::evidence::hex_hash(
+                format!("{}\0{user}", role.system()).as_bytes(),
+            ),
             evidence_ids,
             redaction_revision: REDACTION_REVISION,
             preview: user.chars().take(PREVIEW_CHARS).collect(),
         });
-        Ok(Self { role, user, schema, bytes })
+        Ok(Self {
+            role,
+            user,
+            schema,
+            bytes,
+        })
     }
 
     pub fn role(&self) -> Role {
@@ -182,8 +198,14 @@ fn encoded_bytes(role: Role, user: &str, schema: &Value) -> usize {
 pub fn redact_strings(value: Value, redactor: &Redactor) -> Value {
     match value {
         Value::String(s) => Value::String(redactor.redact(&s)),
-        Value::Array(a) => Value::Array(a.into_iter().map(|v| redact_strings(v, redactor)).collect()),
-        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, redact_strings(v, redactor))).collect()),
+        Value::Array(a) => {
+            Value::Array(a.into_iter().map(|v| redact_strings(v, redactor)).collect())
+        }
+        Value::Object(o) => Value::Object(
+            o.into_iter()
+                .map(|(k, v)| (k, redact_strings(v, redactor)))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -211,7 +233,10 @@ mod tests {
     const SECRET: &str = "hunter2hunter2";
 
     fn target() -> Target {
-        Target { profile: "openai".into(), origin: "https://api.example.com".into() }
+        Target {
+            profile: "openai".into(),
+            origin: "https://api.example.com".into(),
+        }
     }
 
     #[test]
@@ -223,7 +248,10 @@ mod tests {
         });
         let mut ledger = BudgetLedger::new(BudgetV1::prototype_default());
         let mut audits = Vec::new();
-        let req = EgressRequest::new(Role::Child, payload, &target(), &mut ledger, &mut |a| audits.push(a)).unwrap();
+        let req = EgressRequest::new(Role::Child, payload, &target(), &mut ledger, &mut |a| {
+            audits.push(a)
+        })
+        .unwrap();
 
         assert!(!req.user().contains(SECRET), "{}", req.user());
         assert!(req.user().contains("[REDACTED:"), "{}", req.user());
@@ -231,12 +259,27 @@ mod tests {
         for id in ["pkt_00", "item_0", "ev1_00112233aabbccdd"] {
             assert!(req.user().contains(id), "{id} lost from {}", req.user());
         }
-        let [audit] = audits.as_slice() else { panic!("one audit, got {audits:?}") };
-        assert_eq!((audit.role, audit.bytes, audit.evidence_ids.as_slice()), (Role::Child, req.bytes(), &["ev1_00112233aabbccdd".to_string()][..]));
-        assert_eq!((audit.profile.as_str(), audit.origin.as_str()), ("openai", "https://api.example.com"));
+        let [audit] = audits.as_slice() else {
+            panic!("one audit, got {audits:?}")
+        };
+        assert_eq!(
+            (audit.role, audit.bytes, audit.evidence_ids.as_slice()),
+            (
+                Role::Child,
+                req.bytes(),
+                &["ev1_00112233aabbccdd".to_string()][..]
+            )
+        );
+        assert_eq!(
+            (audit.profile.as_str(), audit.origin.as_str()),
+            ("openai", "https://api.example.com")
+        );
         assert!(!audit.preview.contains(SECRET));
         let remaining = ledger.remaining().model_egress_bytes;
-        assert_eq!(remaining, BudgetV1::prototype_default().model_egress_bytes - req.bytes() as u64);
+        assert_eq!(
+            remaining,
+            BudgetV1::prototype_default().model_egress_bytes - req.bytes() as u64
+        );
         // The count covers the instructions and schema, not just the payload.
         assert!(req.bytes() > CHILD_SYSTEM_AND_SCHEMA_FLOOR);
     }
@@ -250,16 +293,32 @@ mod tests {
         let mut ledger = BudgetLedger::new(BudgetV1::prototype_default());
         let mut audits = 0;
         let big = json!({"objective": "x".repeat(CHILD_MAX)});
-        let err = EgressRequest::new(Role::Child, big.clone(), &target(), &mut ledger, &mut |_| audits += 1).unwrap_err();
-        assert!(matches!(err, EgressError::TooLarge { max: CHILD_MAX, .. }), "{err}");
+        let err = EgressRequest::new(
+            Role::Child,
+            big.clone(),
+            &target(),
+            &mut ledger,
+            &mut |_| audits += 1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EgressError::TooLarge { max: CHILD_MAX, .. }),
+            "{err}"
+        );
         // The same payload fits a root request, whose cap is larger.
-        EgressRequest::new(Role::Root, big, &target(), &mut ledger, &mut |_| audits += 1).unwrap();
+        EgressRequest::new(Role::Root, big, &target(), &mut ledger, &mut |_| {
+            audits += 1
+        })
+        .unwrap();
         assert_eq!(audits, 1);
 
         let mut budget = BudgetV1::prototype_default();
         budget.model_egress_bytes = 1000;
         let mut ledger = BudgetLedger::new(budget);
-        let err = EgressRequest::new(Role::Child, json!({}), &target(), &mut ledger, &mut |_| audits += 1).unwrap_err();
+        let err = EgressRequest::new(Role::Child, json!({}), &target(), &mut ledger, &mut |_| {
+            audits += 1
+        })
+        .unwrap_err();
         assert_eq!(err, EgressError::Budget(BudgetExhausted::ModelEgressBytes));
         assert_eq!(audits, 1, "a refused request is not audited as sent");
     }

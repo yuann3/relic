@@ -45,13 +45,23 @@ pub struct RawRecord {
 pub enum GitError {
     /// No `git` on `PATH`.
     NotInstalled,
-    TimedOut { args: String },
-    TooLarge { args: String },
+    TimedOut {
+        args: String,
+    },
+    TooLarge {
+        args: String,
+    },
     /// Lines of `git`'s output that are no record: not the git Relic
     /// asked, or a format it does not know.
-    Unreadable { args: String, lines: usize },
+    Unreadable {
+        args: String,
+        lines: usize,
+    },
     /// `git` ran and failed; `stderr` is its first line.
-    Failed { args: String, stderr: String },
+    Failed {
+        args: String,
+        stderr: String,
+    },
     Io(std::io::Error),
 }
 
@@ -59,9 +69,20 @@ impl std::fmt::Display for GitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotInstalled => f.write_str("git is not installed, or not on PATH"),
-            Self::TimedOut { args } => write!(f, "git {args} took over {} s; stopped it", TIMEOUT.as_secs()),
-            Self::TooLarge { args } => write!(f, "git {args} printed over {} MiB; stopped it", OUTPUT_MAX >> 20),
-            Self::Unreadable { args, lines } => write!(f, "git {args} printed {lines} lines that are no record; stored nothing"),
+            Self::TimedOut { args } => write!(
+                f,
+                "git {args} took over {} s; stopped it",
+                TIMEOUT.as_secs()
+            ),
+            Self::TooLarge { args } => write!(
+                f,
+                "git {args} printed over {} MiB; stopped it",
+                OUTPUT_MAX >> 20
+            ),
+            Self::Unreadable { args, lines } => write!(
+                f,
+                "git {args} printed {lines} lines that are no record; stored nothing"
+            ),
             Self::Failed { args, stderr } => write!(f, "git {args} failed: {stderr}"),
             Self::Io(e) => write!(f, "running git: {e}"),
         }
@@ -77,8 +98,13 @@ impl std::error::Error for GitError {}
 /// need not be UTF-8, and a lossy one names no directory.
 fn git_dir(repo: &Path) -> Result<PathBuf, GitError> {
     use std::os::unix::ffi::OsStrExt;
-    let out = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(out.strip_suffix(b"\n").unwrap_or(&out))))
+    let out = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(
+        out.strip_suffix(b"\n").unwrap_or(&out),
+    )))
 }
 
 /// A repository as read: what identifies it, and its records.
@@ -99,24 +125,49 @@ pub fn read(repo: &Path) -> Result<Repository, GitError> {
 fn records(repo: &Path) -> Result<Vec<RawRecord>, GitError> {
     // `%gD` with unix dates is `<ref>@{<seconds>}`; a ref name cannot hold
     // `@{`. One entry per line: a reflog subject is one line.
-    let reflog = git(repo, &["log", "--walk-reflogs", "--all", "--date=unix", "--format=%gD%x00%H%x00%gs"])?;
+    let reflog = git(
+        repo,
+        &[
+            "log",
+            "--walk-reflogs",
+            "--all",
+            "--date=unix",
+            "--format=%gD%x00%H%x00%gs",
+        ],
+    )?;
     // `git log -g --all` is newest first, every ref's entries interleaved
     // by when they were written: reversed, the order things moved in.
     let mut records = parse(&reflog, "log", reflog_entry)?;
     records.reverse();
-    let refs = git(repo, &["for-each-ref", "--format=%(refname)%00%(objectname)%00%(contents:subject)"])?;
+    let refs = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(contents:subject)",
+        ],
+    )?;
     records.extend(parse(&refs, "for-each-ref", ref_entry)?);
     Ok(records)
 }
 
 /// One record per line of `out`, or an error naming how many lines are
 /// none: an import that skipped them would look complete.
-fn parse(out: &[u8], args: &str, entry: fn(&[u8]) -> Option<RawRecord>) -> Result<Vec<RawRecord>, GitError> {
-    let lines: Vec<&[u8]> = out.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+fn parse(
+    out: &[u8],
+    args: &str,
+    entry: fn(&[u8]) -> Option<RawRecord>,
+) -> Result<Vec<RawRecord>, GitError> {
+    let lines: Vec<&[u8]> = out
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
     let records: Vec<RawRecord> = lines.iter().filter_map(|l| entry(l)).collect();
     match lines.len() - records.len() {
         0 => Ok(records),
-        lines => Err(GitError::Unreadable { args: args.into(), lines }),
+        lines => Err(GitError::Unreadable {
+            args: args.into(),
+            lines,
+        }),
     }
 }
 
@@ -130,12 +181,20 @@ fn reflog_entry(line: &[u8]) -> Option<RawRecord> {
     let selector = std::str::from_utf8(selector).ok()?;
     let (name, at) = selector.strip_suffix('}')?.rsplit_once("@{")?;
     let timestamp = at.parse().ok();
-    Some(record(RecordKind::Reflog, timestamp, &[b"git reflog ", name.as_bytes(), b" ", oid, b" ", subject]))
+    Some(record(
+        RecordKind::Reflog,
+        timestamp,
+        &[b"git reflog ", name.as_bytes(), b" ", oid, b" ", subject],
+    ))
 }
 
 fn ref_entry(line: &[u8]) -> Option<RawRecord> {
     let [name, oid, subject] = fields(line)?;
-    Some(record(RecordKind::Ref, None, &[b"git ref ", name, b" ", oid, b" ", subject]))
+    Some(record(
+        RecordKind::Ref,
+        None,
+        &[b"git ref ", name, b" ", oid, b" ", subject],
+    ))
 }
 
 fn record(kind: RecordKind, timestamp: Option<i64>, parts: &[&[u8]]) -> RawRecord {
@@ -149,7 +208,12 @@ fn record(kind: RecordKind, timestamp: Option<i64>, parts: &[&[u8]]) -> RawRecor
         text.truncate(text.floor_char_boundary(RECORD_MAX));
         lossy = true;
     }
-    RawRecord { kind, timestamp, text, lossy }
+    RawRecord {
+        kind,
+        timestamp,
+        text,
+        lossy,
+    }
 }
 
 /// `git -C <repo> <args>`: its stdout, or why there is none.
@@ -159,14 +223,20 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     // the user set elsewhere runs; the repository's own config still
     // applies, as Git needs it to read refs. These commands never touch the
     // index or the work tree, which is what fsmonitor and hooks act on.
-    cmd.args(["--no-pager", "--no-optional-locks", "-c", "log.showSignature=false", "-C"])
-        .arg(repo)
-        .args(args)
-        .env_clear()
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C");
+    cmd.args([
+        "--no-pager",
+        "--no-optional-locks",
+        "-c",
+        "log.showSignature=false",
+        "-C",
+    ])
+    .arg(repo)
+    .args(args)
+    .env_clear()
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("LC_ALL", "C");
     // Passed on only when set: an empty PATH searches the current
     // directory, where anyone could have left a `git`. HOME expands a `~` in
     // the repository's own config; GIT_CONFIG_GLOBAL still keeps
@@ -181,8 +251,14 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
         Ok(Run::Done { status, stdout, .. }) if status.success() => Ok(stdout),
         Ok(Run::Done { stderr, .. }) => {
             let stderr = String::from_utf8_lossy(&stderr);
-            let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no message");
-            Err(GitError::Failed { args: shown, stderr: crate::redact::Redactor::new().redact(first.trim()) })
+            let first = stderr
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("no message");
+            Err(GitError::Failed {
+                args: shown,
+                stderr: crate::redact::Redactor::new().redact(first.trim()),
+            })
         }
         Ok(Run::TimedOut) => Err(GitError::TimedOut { args: shown }),
         Ok(Run::TooLarge) => Err(GitError::TooLarge { args: shown }),
@@ -198,13 +274,38 @@ mod tests {
     #[test]
     fn records_are_one_line_each_and_cut_at_their_cap() {
         let r = reflog_entry(b"refs/heads/main@{1700000000}\0abc\0commit: fix").unwrap();
-        assert_eq!((r.kind, r.timestamp, r.text.as_str(), r.lossy), (RecordKind::Reflog, Some(1_700_000_000), "git reflog refs/heads/main abc commit: fix", false));
+        assert_eq!(
+            (r.kind, r.timestamp, r.text.as_str(), r.lossy),
+            (
+                RecordKind::Reflog,
+                Some(1_700_000_000),
+                "git reflog refs/heads/main abc commit: fix",
+                false
+            )
+        );
         assert_eq!(reflog_entry(b"HEAD\0abc\0no time").map(|r| r.text), None);
         let out = b"HEAD@{1}\0abc\0one\n/some/path\nHEAD@{2}\0abc\0two\n";
-        assert!(matches!(parse(out, "log", reflog_entry), Err(GitError::Unreadable { lines: 1, .. })));
-        assert_eq!(parse(b"HEAD@{1}\0abc\0one\n", "log", reflog_entry).unwrap().len(), 1);
-        let long = [b"refs/heads/x\0abc\0".as_slice(), &[b'y'; RECORD_MAX], b"\xff"].concat();
+        assert!(matches!(
+            parse(out, "log", reflog_entry),
+            Err(GitError::Unreadable { lines: 1, .. })
+        ));
+        assert_eq!(
+            parse(b"HEAD@{1}\0abc\0one\n", "log", reflog_entry)
+                .unwrap()
+                .len(),
+            1
+        );
+        let long = [
+            b"refs/heads/x\0abc\0".as_slice(),
+            &[b'y'; RECORD_MAX],
+            b"\xff",
+        ]
+        .concat();
         let r = ref_entry(&long).unwrap();
-        assert!(r.lossy && r.text.len() <= RECORD_MAX && r.text.starts_with("git ref refs/heads/x abc yyy"));
+        assert!(
+            r.lossy
+                && r.text.len() <= RECORD_MAX
+                && r.text.starts_with("git ref refs/heads/x abc yyy")
+        );
     }
 }

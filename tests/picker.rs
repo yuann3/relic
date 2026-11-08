@@ -18,7 +18,10 @@ fn protocol_error(r: Result<Pick, PickError>) -> String {
 fn returns_the_selected_page_member() {
     let fzf =
         FakeFzf::new("cat > \"$D/stdin\"; printf '12\\t2023-11-14 22:13\\tzsh\\tanything\\0'");
-    assert_eq!(pick_with(&page(&[11, 12, 13]), &fzf.path, PickMode::Inline).unwrap(), Pick::Chosen(12));
+    assert_eq!(
+        pick_with(&page(&[11, 12, 13]), &fzf.path, PickMode::Inline).unwrap(),
+        Pick::Chosen(12)
+    );
     fzf.assert_reaped();
 }
 
@@ -54,21 +57,41 @@ fn records_are_nul_framed_sanitized_and_capped() {
     p.hits[1].observed_at_ms = None;
     p.hits[2].text = "€".repeat(1000); // 3 bytes each: the cap falls mid-char
     p.hits[3].text = "plain".into();
-    assert_eq!(pick_with(&p, &fzf.path, PickMode::Inline).unwrap(), Pick::Cancelled);
+    assert_eq!(
+        pick_with(&p, &fzf.path, PickMode::Inline).unwrap(),
+        Pick::Cancelled
+    );
 
     let stdin = fzf.read("stdin");
     assert_eq!(stdin.last(), Some(&0));
     let records: Vec<&[u8]> = stdin[..stdin.len() - 1].split(|&b| b == 0).collect();
     assert_eq!(records.len(), 4);
     let fields = |r: &[u8]| -> Vec<String> {
-        String::from_utf8(r.to_vec()).unwrap().split('\t').map(String::from).collect()
+        String::from_utf8(r.to_vec())
+            .unwrap()
+            .split('\t')
+            .map(String::from)
+            .collect()
     };
-    assert_eq!(fields(records[0]), ["1", "2023-11-14 22:13", "zsh", "a b c d?e?[31mf?g?h?i j"]);
+    assert_eq!(
+        fields(records[0]),
+        ["1", "2023-11-14 22:13", "zsh", "a b c d?e?[31mf?g?h?i j"]
+    );
     assert_eq!(fields(records[1])[1], "unknown time");
-    assert!(records[2].len() < 2048, "record plus NUL fits 2 KiB: {}", records[2].len());
-    assert!(records[2].len() > 2048 - 4, "cap wastes at most one partial char");
+    assert!(
+        records[2].len() < 2048,
+        "record plus NUL fits 2 KiB: {}",
+        records[2].len()
+    );
+    assert!(
+        records[2].len() > 2048 - 4,
+        "cap wastes at most one partial char"
+    );
     assert!(fields(records[2])[3].chars().all(|c| c == '€'));
-    assert_eq!(fields(records[3]), ["4", "2023-11-14 22:13", "zsh", "plain"]);
+    assert_eq!(
+        fields(records[3]),
+        ["4", "2023-11-14 22:13", "zsh", "plain"]
+    );
     assert!(records.iter().all(|r| !r.contains(&b'\n')));
 }
 
@@ -76,7 +99,11 @@ fn records_are_nul_framed_sanitized_and_capped() {
 fn cancel_and_no_match_are_distinct_and_not_errors() {
     for (code, want) in [(130, Pick::Cancelled), (1, Pick::NoMatch)] {
         let fzf = FakeFzf::new(&format!("exit {code}"));
-        assert_eq!(pick_with(&page(&[1]), &fzf.path, PickMode::Inline).unwrap(), want, "exit {code}");
+        assert_eq!(
+            pick_with(&page(&[1]), &fzf.path, PickMode::Inline).unwrap(),
+            want,
+            "exit {code}"
+        );
         fzf.assert_reaped();
     }
 }
@@ -84,7 +111,10 @@ fn cancel_and_no_match_are_distinct_and_not_errors() {
 #[test]
 fn fzf_failure_is_a_protocol_error() {
     let fzf = FakeFzf::new("printf '1\\t\\0'; exit 2");
-    assert!(protocol_error(pick_with(&page(&[1]), &fzf.path, PickMode::Inline)).contains("exit status: 2"));
+    assert!(
+        protocol_error(pick_with(&page(&[1]), &fzf.path, PickMode::Inline))
+            .contains("exit status: 2")
+    );
     fzf.assert_reaped();
 }
 
@@ -92,7 +122,10 @@ fn fzf_failure_is_a_protocol_error() {
 fn rejects_malformed_selections() {
     let cases = [
         ("printf '99\\tx\\0'", "not on the page"),
-        ("printf '1\\tx\\0'; printf '2\\tx\\0'", "more than one record"),
+        (
+            "printf '1\\tx\\0'; printf '2\\tx\\0'",
+            "more than one record",
+        ),
         ("printf '1\\tx'", "no NUL-terminated"),
         ("true", "no NUL-terminated"),
         ("printf 'abc\\tx\\0'", "numeric id"),
@@ -118,7 +151,12 @@ fn early_exit_without_reading_stdin_still_selects() {
         h.text = "x".repeat(400);
     }
     assert_eq!(
-        fake_fzf::within(Duration::from_secs(10), move || pick_with(&p, &fzf.path, PickMode::Inline)).unwrap(),
+        fake_fzf::within(Duration::from_secs(10), move || pick_with(
+            &p,
+            &fzf.path,
+            PickMode::Inline
+        ))
+        .unwrap(),
         Pick::Chosen(4999)
     );
 }
@@ -138,7 +176,9 @@ fn oversize_output_is_cut_off_and_the_child_reaped() {
             h.text = "x".repeat(400);
         }
         let path = fzf.path.clone();
-        let r = fake_fzf::within(Duration::from_secs(10), move || pick_with(&p, &path, PickMode::Inline));
+        let r = fake_fzf::within(Duration::from_secs(10), move || {
+            pick_with(&p, &path, PickMode::Inline)
+        });
         assert!(protocol_error(r).contains("more than 2048 bytes"), "{body}");
         fzf.assert_reaped();
     }
@@ -161,9 +201,16 @@ fn version_gate() {
                 assert_eq!(minimum, "0.27.2");
                 assert_eq!(
                     found,
-                    version.split(' ').next().filter(|v| !v.is_empty()).unwrap_or("unknown")
+                    version
+                        .split(' ')
+                        .next()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or("unknown")
                 );
-                assert!(!fzf.dir.path().join("argv").exists(), "picker ran despite {version:?}");
+                assert!(
+                    !fzf.dir.path().join("argv").exists(),
+                    "picker ran despite {version:?}"
+                );
             }
             other => panic!("{version:?}: {other:?}"),
         }

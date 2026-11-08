@@ -50,7 +50,11 @@ pub fn markers(text: &str) -> impl Iterator<Item = std::ops::Range<usize>> + '_ 
             let start = from + text[from..].find(MARKER_OPEN)?;
             let kind = start + MARKER_OPEN.len();
             from = kind;
-            let len = Kind::ALL.iter().map(|k| k.name()).find(|name| text[kind..].starts_with(name)).map(str::len);
+            let len = Kind::ALL
+                .iter()
+                .map(|k| k.name())
+                .find(|name| text[kind..].starts_with(name))
+                .map(str::len);
             if let Some(len) = len
                 && text[kind + len..].starts_with(']')
             {
@@ -260,11 +264,22 @@ impl<'a> Command<'a> {
             let sep = plain && (c.is_ascii_whitespace() || b";|&()<>".contains(&c));
             if sep {
                 if let Some(st) = start.take() {
-                    words.push(Word { start: st, end: i, segment, redirect: redirect && less != 3 });
+                    words.push(Word {
+                        start: st,
+                        end: i,
+                        segment,
+                        redirect: redirect && less != 3,
+                    });
                     (redirect, less) = (false, 0);
                 }
                 redirect |= matches!(c, b'<' | b'>');
-                less = if c == b'<' { less + 1 } else if c == b'>' { 0 } else { less };
+                less = if c == b'<' {
+                    less + 1
+                } else if c == b'>' {
+                    0
+                } else {
+                    less
+                };
                 if b"\n;|&()".contains(&c) {
                     segment += 1;
                     (redirect, less) = (false, 0);
@@ -274,7 +289,12 @@ impl<'a> Command<'a> {
             }
         }
         if let Some(st) = start {
-            words.push(Word { start: st, end: b.len(), segment, redirect: redirect && less != 3 });
+            words.push(Word {
+                start: st,
+                end: b.len(),
+                segment,
+                redirect: redirect && less != 3,
+            });
         }
         Self { s, q, words }
     }
@@ -286,8 +306,10 @@ impl<'a> Command<'a> {
     /// The word after `i` in the same simple command, if it is not a flag.
     fn value_word(&self, i: usize) -> Option<&Word> {
         let next = self.words.get(i + 1)?;
-        (next.segment == self.words[i].segment && !next.redirect && !self.text(next).starts_with('-'))
-            .then_some(next)
+        (next.segment == self.words[i].segment
+            && !next.redirect
+            && !self.text(next).starts_with('-'))
+        .then_some(next)
     }
 
     /// Where a value starting at `start` ends. A value that opens a quote
@@ -351,9 +373,9 @@ impl<'a> Command<'a> {
                     b':' if !matches!(b.get(i + 1), Some(b'/' | b':'))
                         && (run == w.start || self.q[run - 1] == Q::Open) =>
                     {
-                        let after_flag = wi
-                            .checked_sub(1)
-                            .is_some_and(|p| matches!(self.text(&self.words[p]), "-H" | "--header"));
+                        let after_flag = wi.checked_sub(1).is_some_and(|p| {
+                            matches!(self.text(&self.words[p]), "-H" | "--header")
+                        });
                         if after_flag || is_header_name(name) {
                             i = self.header_value(wi, i + 1, secret, spans);
                         } else if i + 2 < w.end && b[i + 1] == b' ' {
@@ -384,7 +406,13 @@ impl<'a> Command<'a> {
     /// Redacts a header value after its colon, keeping the auth scheme
     /// (`Authorization: Bearer [REDACTED]`) since it says what kind of
     /// credential this was without revealing it.
-    fn header_value(&self, wi: usize, after_colon: usize, secret: Secret, spans: &mut Vec<Span>) -> usize {
+    fn header_value(
+        &self,
+        wi: usize,
+        after_colon: usize,
+        secret: Secret,
+        spans: &mut Vec<Span>,
+    ) -> usize {
         let w = &self.words[wi];
         let b = self.s.as_bytes();
         let end = if after_colon < w.end {
@@ -396,7 +424,9 @@ impl<'a> Command<'a> {
         while v < end && matches!(b[v], b' ' | b'\t') {
             v += 1;
         }
-        let scheme_end = (v..end).find(|&i| !b[i].is_ascii_alphabetic()).unwrap_or(end);
+        let scheme_end = (v..end)
+            .find(|&i| !b[i].is_ascii_alphabetic())
+            .unwrap_or(end);
         if is_auth_scheme(&self.s[v..scheme_end]) {
             v = scheme_end;
             while v < end && matches!(b[v], b' ' | b'\t') {
@@ -498,7 +528,9 @@ impl<'a> Command<'a> {
     /// Returns whether word `i` was such a flag, so the caller does not also
     /// take the whole source for a password.
     fn openssl_pass(&self, i: usize, spans: &mut Vec<Span>) -> bool {
-        if !matches!(self.text(&self.words[i]), "-pass" | "-passin" | "-passout") || !self.in_tool(i, &OPENSSL) {
+        if !matches!(self.text(&self.words[i]), "-pass" | "-passin" | "-passout")
+            || !self.in_tool(i, &OPENSSL)
+        {
             return false;
         }
         if let Some(v) = self.value_word(i) {
@@ -506,7 +538,13 @@ impl<'a> Command<'a> {
             let start = v.start + usize::from(quoted);
             if self.s[start..v.end].starts_with("pass:") {
                 let end = self.value_end(start, v.end, b"");
-                push_value(self.s, start + 5, end, (Strength::Strong, Kind::Password), spans);
+                push_value(
+                    self.s,
+                    start + 5,
+                    end,
+                    (Strength::Strong, Kind::Password),
+                    spans,
+                );
             }
         }
         true
@@ -530,7 +568,13 @@ impl<'a> Command<'a> {
         if let Some(password) = args.last()
             && args.len() >= 2
         {
-            push_value(self.s, password.start, password.end, (Strength::Strong, Kind::Password), spans);
+            push_value(
+                self.s,
+                password.start,
+                password.end,
+                (Strength::Strong, Kind::Password),
+                spans,
+            );
         }
     }
 
@@ -550,17 +594,28 @@ impl<'a> Command<'a> {
                 }
                 if self.s[self.words[j - 1].end..self.words[j].start].contains("<<<") {
                     let v = &self.words[j];
-                    push_value(self.s, v.start, v.end, (Strength::Strong, Kind::Password), spans);
+                    push_value(
+                        self.s,
+                        v.start,
+                        v.end,
+                        (Strength::Strong, Kind::Password),
+                        spans,
+                    );
                 }
             }
             // An `echo` or `printf` piped into it.
-            let Some(feeder_end) = i.checked_sub(1) else { continue };
+            let Some(feeder_end) = i.checked_sub(1) else {
+                continue;
+            };
             let gap = &b[self.words[feeder_end].end..w.start];
             if gap.iter().filter(|&&c| c == b'|').count() != 1 || gap.contains(&b'\n') {
                 continue;
             }
             let feeder = self.words[feeder_end].segment;
-            let first = self.words[..=feeder_end].iter().position(|f| f.segment == feeder).unwrap_or(feeder_end);
+            let first = self.words[..=feeder_end]
+                .iter()
+                .position(|f| f.segment == feeder)
+                .unwrap_or(feeder_end);
             if !matches!(self.text(&self.words[first]), "echo" | "printf") {
                 continue;
             }
@@ -570,7 +625,13 @@ impl<'a> Command<'a> {
                 .skip_while(|a| self.text(a).starts_with('-'))
                 .filter(|a| !a.redirect)
             {
-                push_value(self.s, arg.start, arg.end, (Strength::Strong, Kind::Password), spans);
+                push_value(
+                    self.s,
+                    arg.start,
+                    arg.end,
+                    (Strength::Strong, Kind::Password),
+                    spans,
+                );
             }
         }
     }
@@ -578,7 +639,9 @@ impl<'a> Command<'a> {
     /// Whether the `sudo` at word `i` has `-S` among its own flags. They end
     /// at the command it runs, whose `-S` means something else (`ls -S`).
     fn sudo_reads_stdin(&self, i: usize) -> bool {
-        let mut flags = self.words[i + 1..].iter().take_while(|f| f.segment == self.words[i].segment);
+        let mut flags = self.words[i + 1..]
+            .iter()
+            .take_while(|f| f.segment == self.words[i].segment);
         while let Some(f) = flags.next() {
             let text = self.text(f);
             if !text.starts_with('-') {
@@ -589,9 +652,11 @@ impl<'a> Command<'a> {
             }
             // These take a value: the rest of the word (`-uSteve`, which is
             // not `-S`) or the next one.
-            if let Some(value) = ["-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-r", "-t"]
-                .iter()
-                .find_map(|f| text.strip_prefix(f))
+            if let Some(value) = [
+                "-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-r", "-t",
+            ]
+            .iter()
+            .find_map(|f| text.strip_prefix(f))
             {
                 if value.is_empty() {
                     flags.next();
@@ -611,7 +676,10 @@ impl<'a> Command<'a> {
     /// but not `docker run -p 8080:80`).
     fn in_tool(&self, i: usize, tf: &ToolFlag) -> bool {
         let seg = self.words[i].segment;
-        let before = self.words[..i].iter().rev().take_while(|w| w.segment == seg);
+        let before = self.words[..i]
+            .iter()
+            .rev()
+            .take_while(|w| w.segment == seg);
         let mut seen_sub = tf.subcommand.is_none();
         for w in before {
             let text = self.text(w);
@@ -631,7 +699,10 @@ impl<'a> Command<'a> {
     fn config_setter(&self, i: usize, spans: &mut Vec<Span>) {
         let w = &self.words[i];
         let text = self.text(w);
-        let name_start = text.bytes().rposition(|c| !is_name_byte(c)).map_or(0, |p| p + 1);
+        let name_start = text
+            .bytes()
+            .rposition(|c| !is_name_byte(c))
+            .map_or(0, |p| p + 1);
         let name = text[name_start..].trim_start_matches(['-', '.']);
         // A setting is `section.key` or `snake_key`; `set-credentials` is a
         // subcommand. git's `user.signingkey` holds a public key id.
@@ -659,16 +730,43 @@ struct ToolFlag {
 }
 
 const MYSQL: &[&str] = &[
-    "mysql", "mysqldump", "mysqladmin", "mysqlimport", "mysqlshow", "mysqlcheck", "mysqlpump",
-    "mysqlbinlog", "mariadb", "mariadb-dump", "mariadb-admin",
+    "mysql",
+    "mysqldump",
+    "mysqladmin",
+    "mysqlimport",
+    "mysqlshow",
+    "mysqlcheck",
+    "mysqlpump",
+    "mysqlbinlog",
+    "mariadb",
+    "mariadb-dump",
+    "mariadb-admin",
 ];
 const MONGO: &[&str] = &[
-    "mongo", "mongosh", "mongodump", "mongorestore", "mongoexport", "mongoimport",
+    "mongo",
+    "mongosh",
+    "mongodump",
+    "mongorestore",
+    "mongoexport",
+    "mongoimport",
 ];
 const REGISTRY: &[&str] = &["docker", "podman", "nerdctl", "buildah", "helm"];
 
-const fn tf(tools: &'static [&'static str], flag: &'static str, attached: bool, separate: bool) -> ToolFlag {
-    ToolFlag { tools, flag, subcommand: None, attached, separate, after_colon: false, kind: Kind::Password }
+const fn tf(
+    tools: &'static [&'static str],
+    flag: &'static str,
+    attached: bool,
+    separate: bool,
+) -> ToolFlag {
+    ToolFlag {
+        tools,
+        flag,
+        subcommand: None,
+        attached,
+        separate,
+        after_colon: false,
+        kind: Kind::Password,
+    }
 }
 
 const OPENSSL: ToolFlag = tf(&["openssl"], "", false, false);
@@ -682,16 +780,39 @@ const TOOL_FLAGS: &[ToolFlag] = &[
     tf(&["redis-cli"], "-a", true, true),
     tf(&["zip", "unzip", "sqlcmd", "bcp"], "-P", true, true),
     tf(&["plink", "pscp", "psftp"], "-pw", false, true),
-    ToolFlag { subcommand: Some("login"), ..tf(REGISTRY, "-p", true, true) },
-    ToolFlag { after_colon: true, ..tf(&["curl"], "-u", true, true) },
-    ToolFlag { after_colon: true, ..tf(&["curl"], "-U", true, true) },
-    ToolFlag { after_colon: true, ..tf(&["curl"], "--user", false, true) },
-    ToolFlag { after_colon: true, ..tf(&["curl"], "--proxy-user", false, true) },
+    ToolFlag {
+        subcommand: Some("login"),
+        ..tf(REGISTRY, "-p", true, true)
+    },
+    ToolFlag {
+        after_colon: true,
+        ..tf(&["curl"], "-u", true, true)
+    },
+    ToolFlag {
+        after_colon: true,
+        ..tf(&["curl"], "-U", true, true)
+    },
+    ToolFlag {
+        after_colon: true,
+        ..tf(&["curl"], "--user", false, true)
+    },
+    ToolFlag {
+        after_colon: true,
+        ..tf(&["curl"], "--proxy-user", false, true)
+    },
     // `-key`, `-keyform` and the like start with `-k` but are not attached values.
     tf(&["openssl"], "-k", false, true),
     // `gh variable set --body` is not a secret; `gh secret set --body` is.
-    ToolFlag { subcommand: Some("secret"), kind: Kind::Secret, ..tf(&["gh"], "--body", true, true) },
-    ToolFlag { subcommand: Some("secret"), kind: Kind::Secret, ..tf(&["gh"], "-b", true, true) },
+    ToolFlag {
+        subcommand: Some("secret"),
+        kind: Kind::Secret,
+        ..tf(&["gh"], "--body", true, true)
+    },
+    ToolFlag {
+        subcommand: Some("secret"),
+        kind: Kind::Secret,
+        ..tf(&["gh"], "-b", true, true)
+    },
 ];
 
 /// Name bytes for variables, flags, properties and header names.
@@ -731,12 +852,21 @@ fn secret_name(name: &str) -> Option<Secret> {
         }
         "SECRET" | "CREDENTIAL" | "CREDENTIALS" | "CREDS" => Some((Strength::Strong, Kind::Secret)),
         // PGPASSWORD, MYSQLPASSWORD. Not a bare `*PASS` suffix: BYPASS, COMPASS.
-        w if w.ends_with("PASSWORD") || w.ends_with("PASSWD") => Some((Strength::Strong, Kind::Password)),
-        "TOKEN" | "PAT" | "AUTH" | "AUTHORIZATION" | "BEARER" | "COOKIE" => Some((Strength::Weak, Kind::Token)),
+        w if w.ends_with("PASSWORD") || w.ends_with("PASSWD") => {
+            Some((Strength::Strong, Kind::Password))
+        }
+        "TOKEN" | "PAT" | "AUTH" | "AUTHORIZATION" | "BEARER" | "COOKIE" => {
+            Some((Strength::Weak, Kind::Token))
+        }
         // KEY alone is too common (SORT_KEY, --key client.pem); it needs a
         // qualifier, as a separate word or fused (APIKEY).
-        "KEY" if prev.is_some_and(|p| KEY_QUALIFIERS.contains(&p)) => Some((Strength::Weak, Kind::Key)),
-        w if w.strip_suffix("KEY").is_some_and(|p| KEY_QUALIFIERS.contains(&p)) => {
+        "KEY" if prev.is_some_and(|p| KEY_QUALIFIERS.contains(&p)) => {
+            Some((Strength::Weak, Kind::Key))
+        }
+        w if w
+            .strip_suffix("KEY")
+            .is_some_and(|p| KEY_QUALIFIERS.contains(&p)) =>
+        {
             Some((Strength::Weak, Kind::Key))
         }
         _ => None,
@@ -746,7 +876,9 @@ fn secret_name(name: &str) -> Option<Secret> {
 /// A `--*-key` or `--*-secret` flag that `secret_name` does not know.
 fn bare_key_flag(name: &str) -> bool {
     secret_name(name).is_none()
-        && name_words(name.trim_start_matches('-')).last().is_some_and(|w| w == "KEY" || w == "SECRET")
+        && name_words(name.trim_start_matches('-'))
+            .last()
+            .is_some_and(|w| w == "KEY" || w == "SECRET")
 }
 
 /// Redact a flag's value when it reads as random base64, `/` and all.
@@ -757,8 +889,17 @@ fn push_random(s: &str, start: usize, end: usize, spans: &mut Vec<Span>) {
 }
 
 const KEY_QUALIFIERS: &[&str] = &[
-    "API", "SECRET", "ACCESS", "PRIVATE", "CLIENT", "SIGNING", "ENCRYPTION", "MASTER", "AUTH",
-    "SESSION", "LICENSE",
+    "API",
+    "SECRET",
+    "ACCESS",
+    "PRIVATE",
+    "CLIENT",
+    "SIGNING",
+    "ENCRYPTION",
+    "MASTER",
+    "AUTH",
+    "SESSION",
+    "LICENSE",
 ];
 
 /// A flag name whose next word is a credential. Switches that only mention
@@ -798,14 +939,25 @@ fn name_words(name: &str) -> Vec<String> {
 /// Header names that carry a credential wherever they appear. Any other
 /// secret-sounding name is a header only after `-H`.
 fn is_header_name(name: &str) -> bool {
-    ["authorization", "proxy-authorization", "cookie"].iter().any(|h| name.eq_ignore_ascii_case(h))
+    ["authorization", "proxy-authorization", "cookie"]
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
         || name.get(..2).is_some_and(|x| x.eq_ignore_ascii_case("x-"))
 }
 
 fn is_auth_scheme(word: &str) -> bool {
-    ["basic", "bearer", "token", "digest", "negotiate", "ntlm", "bot", "apikey"]
-        .iter()
-        .any(|s| word.eq_ignore_ascii_case(s))
+    [
+        "basic",
+        "bearer",
+        "token",
+        "digest",
+        "negotiate",
+        "ntlm",
+        "bot",
+        "apikey",
+    ]
+    .iter()
+    .any(|s| word.eq_ignore_ascii_case(s))
 }
 
 /// How sure a name is that its value is a credential, and of what kind.
@@ -881,13 +1033,29 @@ fn json_value(b: &[u8], at: usize, limit: usize) -> Option<(usize, usize)> {
         Some((inner, escaped)) => {
             // The closing quote is written as the opening one was. One with
             // more backslashes before it is a quote inside the value.
-            let backslashes = |i: usize| b[inner..i].iter().rev().take_while(|&&c| c == b'\\').count();
+            let backslashes = |i: usize| {
+                b[inner..i]
+                    .iter()
+                    .rev()
+                    .take_while(|&&c| c == b'\\')
+                    .count()
+            };
             let close = (inner..limit).find(|&i| {
-                b[i] == b'"' && if escaped { backslashes(i) == 1 } else { backslashes(i) % 2 == 0 }
+                b[i] == b'"'
+                    && if escaped {
+                        backslashes(i) == 1
+                    } else {
+                        backslashes(i) % 2 == 0
+                    }
             })?;
             Some((inner, close - usize::from(escaped)))
         }
-        None => Some((start, (start..limit).find(|&i| b",} \t\n'\"".contains(&b[i])).unwrap_or(limit))),
+        None => Some((
+            start,
+            (start..limit)
+                .find(|&i| b",} \t\n'\"".contains(&b[i]))
+                .unwrap_or(limit),
+        )),
     }
 }
 
@@ -906,7 +1074,13 @@ fn url_passwords(s: &str, spans: &mut Vec<Span>) {
         if let Some(at) = s[auth..auth_end].rfind('@')
             && let Some(colon) = s[auth..auth + at].find(':')
         {
-            push_value(s, auth + colon + 1, auth + at, (Strength::Strong, Kind::Password), spans);
+            push_value(
+                s,
+                auth + colon + 1,
+                auth + at,
+                (Strength::Strong, Kind::Password),
+                spans,
+            );
         }
         from = auth;
     }
@@ -942,7 +1116,9 @@ fn bearer_tokens(cmd: &Command, spans: &mut Vec<Span>) {
         } else {
             (v, b" \t\n'\"`;|&<>)")
         };
-        let end = (start..b.len()).find(|&i| stop.contains(&b[i])).unwrap_or(b.len());
+        let end = (start..b.len())
+            .find(|&i| stop.contains(&b[i]))
+            .unwrap_or(b.len());
         let token = &s[start..end];
         // "the bearer token is ..." in a commit message is prose.
         if !token.bytes().all(|c| c.is_ascii_lowercase()) {
@@ -1015,7 +1191,8 @@ fn has_vendor_prefix(t: &str) -> bool {
     let rest = |p: &str, min: usize| t.strip_prefix(p).is_some_and(|r| r.len() >= min);
     let aws = (t.starts_with("AKIA") || t.starts_with("ASIA"))
         && t.len() == 20
-        && t.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+        && t.bytes()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
     aws || ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "npm_"]
         .iter()
         .any(|p| rest(p, 20))
@@ -1029,7 +1206,11 @@ fn has_vendor_prefix(t: &str) -> bool {
 /// `header.payload.signature`, where header and payload are base64url JSON
 /// objects and so both start with `eyJ` (`{"`).
 fn jwt_end(b: &[u8], start: usize, end: usize) -> Option<usize> {
-    let seg = |from: usize| (from..b.len()).find(|&i| !is_b64url(b[i])).unwrap_or(b.len());
+    let seg = |from: usize| {
+        (from..b.len())
+            .find(|&i| !is_b64url(b[i]))
+            .unwrap_or(b.len())
+    };
     if !b[start..end].starts_with(b"eyJ") {
         return None;
     }
@@ -1096,150 +1277,516 @@ mod tests {
     /// Each case is a real-world-shaped command and the exact safe text an
     /// import must produce. Must-keep cases (input == output) guard precision.
     const CASES: &[(&str, &str)] = &[
-        ("curl https://admin:hunter2pass@example.com/api", "curl https://admin:[REDACTED:password]@example.com/api"),
-        ("psql postgres://user:pgpass123@db.internal:5432/app", "psql postgres://user:[REDACTED:password]@db.internal:5432/app"),
-        ("git clone https://oauth2:p@ss@gitlab.example.com/o/r.git", "git clone https://oauth2:[REDACTED:password]@gitlab.example.com/o/r.git"),
-        ("redis-cli -u redis://default:r3disPw@cache:6379", "redis-cli -u redis://default:[REDACTED:password]@cache:6379"),
-        ("mysql -u root -pS3cretPassw0rd db", "mysql -u root -p[REDACTED:password] db"),
-        ("mysqldump -uroot -p'my pass' shop > shop.sql", "mysqldump -uroot -p[REDACTED:password] shop > shop.sql"),
+        (
+            "curl https://admin:hunter2pass@example.com/api",
+            "curl https://admin:[REDACTED:password]@example.com/api",
+        ),
+        (
+            "psql postgres://user:pgpass123@db.internal:5432/app",
+            "psql postgres://user:[REDACTED:password]@db.internal:5432/app",
+        ),
+        (
+            "git clone https://oauth2:p@ss@gitlab.example.com/o/r.git",
+            "git clone https://oauth2:[REDACTED:password]@gitlab.example.com/o/r.git",
+        ),
+        (
+            "redis-cli -u redis://default:r3disPw@cache:6379",
+            "redis-cli -u redis://default:[REDACTED:password]@cache:6379",
+        ),
+        (
+            "mysql -u root -pS3cretPassw0rd db",
+            "mysql -u root -p[REDACTED:password] db",
+        ),
+        (
+            "mysqldump -uroot -p'my pass' shop > shop.sql",
+            "mysqldump -uroot -p[REDACTED:password] shop > shop.sql",
+        ),
         ("mysql -u root -p shop", "mysql -u root -p shop"),
-        ("mysqladmin --password=MyPassw0rd! status", "mysqladmin --password=[REDACTED:password] status"),
-        ("mysql --password hunter2 -e 'select 1'", "mysql --password [REDACTED:password] -e 'select 1'"),
-        ("docker login -p MyDockerPass123 registry", "docker login -p [REDACTED:password] registry"),
-        ("docker login -u bob --password s3cr3t ghcr.io", "docker login -u bob --password [REDACTED:password] ghcr.io"),
+        (
+            "mysqladmin --password=MyPassw0rd! status",
+            "mysqladmin --password=[REDACTED:password] status",
+        ),
+        (
+            "mysql --password hunter2 -e 'select 1'",
+            "mysql --password [REDACTED:password] -e 'select 1'",
+        ),
+        (
+            "docker login -p MyDockerPass123 registry",
+            "docker login -p [REDACTED:password] registry",
+        ),
+        (
+            "docker login -u bob --password s3cr3t ghcr.io",
+            "docker login -u bob --password [REDACTED:password] ghcr.io",
+        ),
         ("docker run -p 8080:80 nginx", "docker run -p 8080:80 nginx"),
-        ("echo $PW | docker login --password-stdin -u bob", "echo $PW | docker login --password-stdin -u bob"),
-        ("sshpass -p 'hunter2' ssh host", "sshpass -p [REDACTED:password] ssh host"),
-        ("sudo sshpass -phunter2 scp f host:", "sudo sshpass -p[REDACTED:password] scp f host:"),
-        ("redis-cli -a r3dis! ping", "redis-cli -a [REDACTED:password] ping"),
-        ("curl -u admin:Sup3rS3cret https://x.test", "curl -u admin:[REDACTED:password] https://x.test"),
-        ("curl -u admin https://x.test", "curl -u admin https://x.test"),
-        ("curl https://bob:S3cr3tPw@api.example.com/x", "curl https://bob:[REDACTED:password]@api.example.com/x"),
-        ("git clone ssh://git@github.com:22/o/r.git", "git clone ssh://git@github.com:22/o/r.git"),
-        ("zip -P zipPass archive.zip f", "zip -P [REDACTED:password] archive.zip f"),
-        ("ansible-playbook --ask-pass site.yml", "ansible-playbook --ask-pass site.yml"),
-        ("export password=lowercasesecret1", "export password=[REDACTED:password]"),
-        ("export Api_Key=MixedCaseKey123", "export Api_Key=[REDACTED:key]"),
-        ("db_pass=x9 ./migrate", "db_pass=[REDACTED:password] ./migrate"),
+        (
+            "echo $PW | docker login --password-stdin -u bob",
+            "echo $PW | docker login --password-stdin -u bob",
+        ),
+        (
+            "sshpass -p 'hunter2' ssh host",
+            "sshpass -p [REDACTED:password] ssh host",
+        ),
+        (
+            "sudo sshpass -phunter2 scp f host:",
+            "sudo sshpass -p[REDACTED:password] scp f host:",
+        ),
+        (
+            "redis-cli -a r3dis! ping",
+            "redis-cli -a [REDACTED:password] ping",
+        ),
+        (
+            "curl -u admin:Sup3rS3cret https://x.test",
+            "curl -u admin:[REDACTED:password] https://x.test",
+        ),
+        (
+            "curl -u admin https://x.test",
+            "curl -u admin https://x.test",
+        ),
+        (
+            "curl https://bob:S3cr3tPw@api.example.com/x",
+            "curl https://bob:[REDACTED:password]@api.example.com/x",
+        ),
+        (
+            "git clone ssh://git@github.com:22/o/r.git",
+            "git clone ssh://git@github.com:22/o/r.git",
+        ),
+        (
+            "zip -P zipPass archive.zip f",
+            "zip -P [REDACTED:password] archive.zip f",
+        ),
+        (
+            "ansible-playbook --ask-pass site.yml",
+            "ansible-playbook --ask-pass site.yml",
+        ),
+        (
+            "export password=lowercasesecret1",
+            "export password=[REDACTED:password]",
+        ),
+        (
+            "export Api_Key=MixedCaseKey123",
+            "export Api_Key=[REDACTED:key]",
+        ),
+        (
+            "db_pass=x9 ./migrate",
+            "db_pass=[REDACTED:password] ./migrate",
+        ),
         ("token=abc ./run", "token=[REDACTED:token] ./run"),
-        ("export GH_PAT=abc123secretvalue", "export GH_PAT=[REDACTED:token]"),
-        ("export DB_PASS=dbpasssecret; ./deploy", "export DB_PASS=[REDACTED:password]; ./deploy"),
-        ("OPENAI_API_KEY=sk-1234567890abcdef cargo run", "OPENAI_API_KEY=[REDACTED:key] cargo run"),
-        ("MYSQL_PWD=mysqlsecret mysql", "MYSQL_PWD=[REDACTED:password] mysql"),
-        ("PGPASSWORD=pgsecret psql -h db", "PGPASSWORD=[REDACTED:password] psql -h db"),
-        ("API_KEY=\"my secret value\" ./x", "API_KEY=[REDACTED:key] ./x"),
-        ("ANTHROPIC_API_KEY='sk-ant-api03-short value' claude", "ANTHROPIC_API_KEY=[REDACTED:key] claude"),
-        ("export TOKEN=\\\nabcdef123456secret", "export TOKEN=[REDACTED:token]"),
-        ("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCY aws s3 ls", "AWS_SECRET_ACCESS_KEY=[REDACTED:key] aws s3 ls"),
-        ("DATABASE_URL=postgres://u:p@h/db rails s", "DATABASE_URL=[REDACTED:secret] rails s"),
-        ("java -Ddb.password=s3cret -jar app.jar", "java -Ddb.password=[REDACTED:password] -jar app.jar"),
-        ("curl 'https://api.test/v1?user=bob&api_key=abc123&page=2'", "curl 'https://api.test/v1?user=bob&api_key=[REDACTED:key]&page=2'"),
-        ("kubectl create secret generic db --from-literal=password=pw1", "kubectl create secret generic db --from-literal=password=[REDACTED:password]"),
-        ("aws configure set aws_secret_access_key wJalrXUtnFEMI", "aws configure set aws_secret_access_key [REDACTED:key]"),
-        ("curl -H 'Authorization: Bearer abc123' https://x.test", "curl -H 'Authorization: Bearer [REDACTED:token]' https://x.test"),
-        ("curl -H \"Authorization: Basic dXNlcjpwYXNz\" x.test", "curl -H \"Authorization: Basic [REDACTED:token]\" x.test"),
-        ("curl -H Authorization:Bearer xyz9 x.test", "curl -H Authorization:Bearer [REDACTED:token] x.test"),
-        ("curl -H 'X-Api-Key: k1' x.test", "curl -H 'X-Api-Key: [REDACTED:key]' x.test"),
-        ("http :8000 'Authorization:token s3cr3t'", "http :8000 'Authorization:token [REDACTED:token]'"),
-        ("curl -H \"Authorization: Bearer $TOKEN\" x.test", "curl -H \"Authorization: Bearer $TOKEN\" x.test"),
-        ("curl -H 'Content-Type: application/json' x.test", "curl -H 'Content-Type: application/json' x.test"),
+        (
+            "export GH_PAT=abc123secretvalue",
+            "export GH_PAT=[REDACTED:token]",
+        ),
+        (
+            "export DB_PASS=dbpasssecret; ./deploy",
+            "export DB_PASS=[REDACTED:password]; ./deploy",
+        ),
+        (
+            "OPENAI_API_KEY=sk-1234567890abcdef cargo run",
+            "OPENAI_API_KEY=[REDACTED:key] cargo run",
+        ),
+        (
+            "MYSQL_PWD=mysqlsecret mysql",
+            "MYSQL_PWD=[REDACTED:password] mysql",
+        ),
+        (
+            "PGPASSWORD=pgsecret psql -h db",
+            "PGPASSWORD=[REDACTED:password] psql -h db",
+        ),
+        (
+            "API_KEY=\"my secret value\" ./x",
+            "API_KEY=[REDACTED:key] ./x",
+        ),
+        (
+            "ANTHROPIC_API_KEY='sk-ant-api03-short value' claude",
+            "ANTHROPIC_API_KEY=[REDACTED:key] claude",
+        ),
+        (
+            "export TOKEN=\\\nabcdef123456secret",
+            "export TOKEN=[REDACTED:token]",
+        ),
+        (
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCY aws s3 ls",
+            "AWS_SECRET_ACCESS_KEY=[REDACTED:key] aws s3 ls",
+        ),
+        (
+            "DATABASE_URL=postgres://u:p@h/db rails s",
+            "DATABASE_URL=[REDACTED:secret] rails s",
+        ),
+        (
+            "java -Ddb.password=s3cret -jar app.jar",
+            "java -Ddb.password=[REDACTED:password] -jar app.jar",
+        ),
+        (
+            "curl 'https://api.test/v1?user=bob&api_key=abc123&page=2'",
+            "curl 'https://api.test/v1?user=bob&api_key=[REDACTED:key]&page=2'",
+        ),
+        (
+            "kubectl create secret generic db --from-literal=password=pw1",
+            "kubectl create secret generic db --from-literal=password=[REDACTED:password]",
+        ),
+        (
+            "aws configure set aws_secret_access_key wJalrXUtnFEMI",
+            "aws configure set aws_secret_access_key [REDACTED:key]",
+        ),
+        (
+            "curl -H 'Authorization: Bearer abc123' https://x.test",
+            "curl -H 'Authorization: Bearer [REDACTED:token]' https://x.test",
+        ),
+        (
+            "curl -H \"Authorization: Basic dXNlcjpwYXNz\" x.test",
+            "curl -H \"Authorization: Basic [REDACTED:token]\" x.test",
+        ),
+        (
+            "curl -H Authorization:Bearer xyz9 x.test",
+            "curl -H Authorization:Bearer [REDACTED:token] x.test",
+        ),
+        (
+            "curl -H 'X-Api-Key: k1' x.test",
+            "curl -H 'X-Api-Key: [REDACTED:key]' x.test",
+        ),
+        (
+            "http :8000 'Authorization:token s3cr3t'",
+            "http :8000 'Authorization:token [REDACTED:token]'",
+        ),
+        (
+            "curl -H \"Authorization: Bearer $TOKEN\" x.test",
+            "curl -H \"Authorization: Bearer $TOKEN\" x.test",
+        ),
+        (
+            "curl -H 'Content-Type: application/json' x.test",
+            "curl -H 'Content-Type: application/json' x.test",
+        ),
         ("echo AKIAIOSFODNN7EXAMPLE", "echo [REDACTED:token]"),
-        ("git clone https://ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8@github.com/o/r", "git clone https://[REDACTED:token]@github.com/o/r"),
-        ("gh auth login --with-token github_pat_11ABCDEFG0123456789_abcdefXYZ", "gh auth login --with-token [REDACTED:token]"),
-        ("slack-cli send xoxb-1234567890-abcdefghij", "slack-cli send [REDACTED:token]"),
-        ("jwt decode eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk", "jwt decode [REDACTED:token]"),
-        ("echo '-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----' > k", "echo '-----BEGIN RSA PRIVATE KEY-----[REDACTED:key]-----END RSA PRIVATE KEY-----' > k"),
-        ("curl -d k=1 aB3dE6gH9jK2mN5pQ8sT1vX4yZ7bC0eF3hI6k", "curl -d k=1 [REDACTED:secret]"),
-        ("git checkout 3f2a9c1d7e4b5a6f8091a2b3c4d5e6f708192a3b", "git checkout 3f2a9c1d7e4b5a6f8091a2b3c4d5e6f708192a3b"),
-        ("docker pull alpine@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "docker pull alpine@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
-        ("cd /usr/local/lib/python3.12/site-packages/numpy2/core", "cd /usr/local/lib/python3.12/site-packages/numpy2/core"),
-        ("vim /Users/yuan/Developer/relic/src/ui/model.rs", "vim /Users/yuan/Developer/relic/src/ui/model.rs"),
-        ("cd ~/Developer/MyProject2/Sources/Components", "cd ~/Developer/MyProject2/Sources/Components"),
-        ("open https://github.com/anthropics/claude-code/pull/12345", "open https://github.com/anthropics/claude-code/pull/12345"),
-        ("npm install @typescript-eslint/eslint-plugin-Recommended", "npm install @typescript-eslint/eslint-plugin-Recommended"),
-        ("go test -run TestParseRFC3339WithTimezone ./...", "go test -run TestParseRFC3339WithTimezone ./..."),
-        ("TOKENIZERS_PARALLELISM=false python train.py", "TOKENIZERS_PARALLELISM=false python train.py"),
+        (
+            "git clone https://ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8@github.com/o/r",
+            "git clone https://[REDACTED:token]@github.com/o/r",
+        ),
+        (
+            "gh auth login --with-token github_pat_11ABCDEFG0123456789_abcdefXYZ",
+            "gh auth login --with-token [REDACTED:token]",
+        ),
+        (
+            "slack-cli send xoxb-1234567890-abcdefghij",
+            "slack-cli send [REDACTED:token]",
+        ),
+        (
+            "jwt decode eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            "jwt decode [REDACTED:token]",
+        ),
+        (
+            "echo '-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----' > k",
+            "echo '-----BEGIN RSA PRIVATE KEY-----[REDACTED:key]-----END RSA PRIVATE KEY-----' > k",
+        ),
+        (
+            "curl -d k=1 aB3dE6gH9jK2mN5pQ8sT1vX4yZ7bC0eF3hI6k",
+            "curl -d k=1 [REDACTED:secret]",
+        ),
+        (
+            "git checkout 3f2a9c1d7e4b5a6f8091a2b3c4d5e6f708192a3b",
+            "git checkout 3f2a9c1d7e4b5a6f8091a2b3c4d5e6f708192a3b",
+        ),
+        (
+            "docker pull alpine@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "docker pull alpine@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            "cd /usr/local/lib/python3.12/site-packages/numpy2/core",
+            "cd /usr/local/lib/python3.12/site-packages/numpy2/core",
+        ),
+        (
+            "vim /Users/yuan/Developer/relic/src/ui/model.rs",
+            "vim /Users/yuan/Developer/relic/src/ui/model.rs",
+        ),
+        (
+            "cd ~/Developer/MyProject2/Sources/Components",
+            "cd ~/Developer/MyProject2/Sources/Components",
+        ),
+        (
+            "open https://github.com/anthropics/claude-code/pull/12345",
+            "open https://github.com/anthropics/claude-code/pull/12345",
+        ),
+        (
+            "npm install @typescript-eslint/eslint-plugin-Recommended",
+            "npm install @typescript-eslint/eslint-plugin-Recommended",
+        ),
+        (
+            "go test -run TestParseRFC3339WithTimezone ./...",
+            "go test -run TestParseRFC3339WithTimezone ./...",
+        ),
+        (
+            "TOKENIZERS_PARALLELISM=false python train.py",
+            "TOKENIZERS_PARALLELISM=false python train.py",
+        ),
         ("MAX_TOKEN=4096 ./run", "MAX_TOKEN=4096 ./run"),
-        ("API_KEY_FILE=/run/secrets/key ./svc", "API_KEY_FILE=/run/secrets/key ./svc"),
-        ("export GITHUB_TOKEN=$(gh auth token)", "export GITHUB_TOKEN=$(gh auth token)"),
-        ("HOME=/Users/me PATH=/usr/bin cargo build", "HOME=/Users/me PATH=/usr/bin cargo build"),
-        ("ssh -i ~/.ssh/id_ed25519 git@github.com", "ssh -i ~/.ssh/id_ed25519 git@github.com"),
-        ("kubectl logs my-app-7d9f8b6c5-x2j4k -n prod", "kubectl logs my-app-7d9f8b6c5-x2j4k -n prod"),
-        ("git commit -m 'send the bearer token header'", "git commit -m 'send the bearer token header'"),
-        ("rustup target add aarch64-unknown-linux-gnu", "rustup target add aarch64-unknown-linux-gnu"),
-        ("uuidgen # 550e8400-e29b-41d4-a716-446655440000", "uuidgen # 550e8400-e29b-41d4-a716-446655440000"),
+        (
+            "API_KEY_FILE=/run/secrets/key ./svc",
+            "API_KEY_FILE=/run/secrets/key ./svc",
+        ),
+        (
+            "export GITHUB_TOKEN=$(gh auth token)",
+            "export GITHUB_TOKEN=$(gh auth token)",
+        ),
+        (
+            "HOME=/Users/me PATH=/usr/bin cargo build",
+            "HOME=/Users/me PATH=/usr/bin cargo build",
+        ),
+        (
+            "ssh -i ~/.ssh/id_ed25519 git@github.com",
+            "ssh -i ~/.ssh/id_ed25519 git@github.com",
+        ),
+        (
+            "kubectl logs my-app-7d9f8b6c5-x2j4k -n prod",
+            "kubectl logs my-app-7d9f8b6c5-x2j4k -n prod",
+        ),
+        (
+            "git commit -m 'send the bearer token header'",
+            "git commit -m 'send the bearer token header'",
+        ),
+        (
+            "rustup target add aarch64-unknown-linux-gnu",
+            "rustup target add aarch64-unknown-linux-gnu",
+        ),
+        (
+            "uuidgen # 550e8400-e29b-41d4-a716-446655440000",
+            "uuidgen # 550e8400-e29b-41d4-a716-446655440000",
+        ),
         ("echo 部署 café ✓", "echo 部署 café ✓"),
-        ("git commit -m 'fix bug' --amend", "git commit -m 'fix bug' --amend"),
-        ("echo abcdefghijklmnopqrstuvwxyzabcdefghijklmn", "echo abcdefghijklmnopqrstuvwxyzabcdefghijklmn"),
-        ("git config --global credential.helper osxkeychain", "git config --global credential.helper osxkeychain"),
-        ("echo é=1 ü:2 café_token=x", "echo é=1 ü:2 café_token=[REDACTED:token]"),
+        (
+            "git commit -m 'fix bug' --amend",
+            "git commit -m 'fix bug' --amend",
+        ),
+        (
+            "echo abcdefghijklmnopqrstuvwxyzabcdefghijklmn",
+            "echo abcdefghijklmnopqrstuvwxyzabcdefghijklmn",
+        ),
+        (
+            "git config --global credential.helper osxkeychain",
+            "git config --global credential.helper osxkeychain",
+        ),
+        (
+            "echo é=1 ü:2 café_token=x",
+            "echo é=1 ü:2 café_token=[REDACTED:token]",
+        ),
         ("", ""),
-        ("echo literal [REDACTED] markertest", "echo literal [REDACTED] markertest"),
-        ("PGPASSWORD=x psql -c 'select \"[REDACTED]\"'", "PGPASSWORD=[REDACTED:password] psql -c 'select \"[REDACTED]\"'"),
+        (
+            "echo literal [REDACTED] markertest",
+            "echo literal [REDACTED] markertest",
+        ),
+        (
+            "PGPASSWORD=x psql -c 'select \"[REDACTED]\"'",
+            "PGPASSWORD=[REDACTED:password] psql -c 'select \"[REDACTED]\"'",
+        ),
         // Rules ADR 0003 added over the first corpus, with their must-keep twins.
-        ("echo hunter2 | sudo -S apt update", "echo [REDACTED:password] | sudo -S apt update"),
-        ("printf '%s\\n' 'my pass' | sudo -S -k systemctl restart nginx", "printf [REDACTED:password] [REDACTED:password] | sudo -S -k systemctl restart nginx"),
-        ("sudo -S whoami <<< hunter2", "sudo -S whoami <<< [REDACTED:password]"),
-        ("echo hello | sudo tee /etc/motd", "echo hello | sudo tee /etc/motd"),
+        (
+            "echo hunter2 | sudo -S apt update",
+            "echo [REDACTED:password] | sudo -S apt update",
+        ),
+        (
+            "printf '%s\\n' 'my pass' | sudo -S -k systemctl restart nginx",
+            "printf [REDACTED:password] [REDACTED:password] | sudo -S -k systemctl restart nginx",
+        ),
+        (
+            "sudo -S whoami <<< hunter2",
+            "sudo -S whoami <<< [REDACTED:password]",
+        ),
+        (
+            "echo hello | sudo tee /etc/motd",
+            "echo hello | sudo tee /etc/motd",
+        ),
         ("echo done | grep d", "echo done | grep d"),
-        ("htpasswd -b /etc/nginx/.htpasswd alice S3cretPw", "htpasswd -b /etc/nginx/.htpasswd alice [REDACTED:password]"),
-        ("htpasswd -cbB .htpasswd bob 'pass word'", "htpasswd -cbB .htpasswd bob [REDACTED:password]"),
-        ("htpasswd -nb carol pw123", "htpasswd -nb carol [REDACTED:password]"),
+        (
+            "htpasswd -b /etc/nginx/.htpasswd alice S3cretPw",
+            "htpasswd -b /etc/nginx/.htpasswd alice [REDACTED:password]",
+        ),
+        (
+            "htpasswd -cbB .htpasswd bob 'pass word'",
+            "htpasswd -cbB .htpasswd bob [REDACTED:password]",
+        ),
+        (
+            "htpasswd -nb carol pw123",
+            "htpasswd -nb carol [REDACTED:password]",
+        ),
         ("htpasswd .htpasswd dave", "htpasswd .htpasswd dave"),
-        ("openssl enc -aes-256-cbc -k MyPassphrase -in a -out b", "openssl enc -aes-256-cbc -k [REDACTED:password] -in a -out b"),
-        ("openssl enc -aes-256-cbc -pass pass:hunter2 -in a", "openssl enc -aes-256-cbc -pass pass:[REDACTED:password] -in a"),
-        ("openssl rsa -in k.pem -passin 'pass:old pw' -passout pass:newpw", "openssl rsa -in k.pem -passin 'pass:[REDACTED:password]' -passout pass:[REDACTED:password]"),
-        ("openssl enc -pass env:PW -in a", "openssl enc -pass env:PW -in a"),
-        ("openssl req -new -key server.key -out server.csr", "openssl req -new -key server.key -out server.csr"),
-        ("gh secret set NPM_TOKEN --body abc123", "gh secret set NPM_TOKEN --body [REDACTED:secret]"),
-        ("gh secret set NPM_TOKEN -b 'abc 123' --repo o/r", "gh secret set NPM_TOKEN -b [REDACTED:secret] --repo o/r"),
-        ("gh secret set NPM_TOKEN --body=abc123", "gh secret set NPM_TOKEN --body=[REDACTED:secret]"),
-        ("gh variable set REGION --body us-east-1", "gh variable set REGION --body us-east-1"),
-        ("tool --signing-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "tool --signing-key [REDACTED:key]"),
-        ("tool --hmac-secret=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY=", "tool --hmac-secret=[REDACTED:secret]"),
-        ("tool --sort-key name --partition-key userId", "tool --sort-key name --partition-key userId"),
-        ("ssh-keygen -f ~/.ssh/My-Deploy-Key2", "ssh-keygen -f ~/.ssh/My-Deploy-Key2"),
-        ("echo typed [REDACTED:password] here", "echo typed [REDACTED:literal:password] here"),
-        ("PGPASSWORD=x psql -c 'select \"[REDACTED:token]\"'", "PGPASSWORD=[REDACTED:password] psql -c 'select \"[REDACTED:literal:token]\"'"),
-        ("cat k | grep -----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----", "cat k | grep -----BEGIN OPENSSH PRIVATE KEY-----[REDACTED:key]-----END OPENSSH PRIVATE KEY-----"),
+        (
+            "openssl enc -aes-256-cbc -k MyPassphrase -in a -out b",
+            "openssl enc -aes-256-cbc -k [REDACTED:password] -in a -out b",
+        ),
+        (
+            "openssl enc -aes-256-cbc -pass pass:hunter2 -in a",
+            "openssl enc -aes-256-cbc -pass pass:[REDACTED:password] -in a",
+        ),
+        (
+            "openssl rsa -in k.pem -passin 'pass:old pw' -passout pass:newpw",
+            "openssl rsa -in k.pem -passin 'pass:[REDACTED:password]' -passout pass:[REDACTED:password]",
+        ),
+        (
+            "openssl enc -pass env:PW -in a",
+            "openssl enc -pass env:PW -in a",
+        ),
+        (
+            "openssl req -new -key server.key -out server.csr",
+            "openssl req -new -key server.key -out server.csr",
+        ),
+        (
+            "gh secret set NPM_TOKEN --body abc123",
+            "gh secret set NPM_TOKEN --body [REDACTED:secret]",
+        ),
+        (
+            "gh secret set NPM_TOKEN -b 'abc 123' --repo o/r",
+            "gh secret set NPM_TOKEN -b [REDACTED:secret] --repo o/r",
+        ),
+        (
+            "gh secret set NPM_TOKEN --body=abc123",
+            "gh secret set NPM_TOKEN --body=[REDACTED:secret]",
+        ),
+        (
+            "gh variable set REGION --body us-east-1",
+            "gh variable set REGION --body us-east-1",
+        ),
+        (
+            "tool --signing-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "tool --signing-key [REDACTED:key]",
+        ),
+        (
+            "tool --hmac-secret=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY=",
+            "tool --hmac-secret=[REDACTED:secret]",
+        ),
+        (
+            "tool --sort-key name --partition-key userId",
+            "tool --sort-key name --partition-key userId",
+        ),
+        (
+            "ssh-keygen -f ~/.ssh/My-Deploy-Key2",
+            "ssh-keygen -f ~/.ssh/My-Deploy-Key2",
+        ),
+        (
+            "echo typed [REDACTED:password] here",
+            "echo typed [REDACTED:literal:password] here",
+        ),
+        (
+            "PGPASSWORD=x psql -c 'select \"[REDACTED:token]\"'",
+            "PGPASSWORD=[REDACTED:password] psql -c 'select \"[REDACTED:literal:token]\"'",
+        ),
+        (
+            "cat k | grep -----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----",
+            "cat k | grep -----BEGIN OPENSSH PRIVATE KEY-----[REDACTED:key]-----END OPENSSH PRIVATE KEY-----",
+        ),
         // Found in review: carriers the first rules missed.
-        ("curl -d '{\"username\":\"bob\",\"password\":\"hunter2\"}' https://api/login", "curl -d '{\"username\":\"bob\",\"password\":\"[REDACTED:password]\"}' https://api/login"),
-        ("curl -d \"{\\\"api_key\\\": \\\"abc123def\\\"}\" x.test", "curl -d \"{\\\"api_key\\\": \\\"[REDACTED:key]\\\"}\" x.test"),
-        ("curl -d '{\"max_token\": 4096, \"token\": 12345678}' x.test", "curl -d '{\"max_token\": 4096, \"token\": 12345678}' x.test"),
-        ("htpasswd -nb admin hunter2 >> /etc/nginx/.htpasswd", "htpasswd -nb admin [REDACTED:password] >> /etc/nginx/.htpasswd"),
-        ("htpasswd -b .htpasswd admin hunter2 > out.log", "htpasswd -b .htpasswd admin [REDACTED:password] > out.log"),
-        ("gh auth login --with-token < mytoken.txt", "gh auth login --with-token < mytoken.txt"),
-        ("mysql -u root --password < dump.sql", "mysql -u root --password < dump.sql"),
-        ("echo hunter2 | sudo -u root -S ls", "echo [REDACTED:password] | sudo -u root -S ls"),
+        (
+            "curl -d '{\"username\":\"bob\",\"password\":\"hunter2\"}' https://api/login",
+            "curl -d '{\"username\":\"bob\",\"password\":\"[REDACTED:password]\"}' https://api/login",
+        ),
+        (
+            "curl -d \"{\\\"api_key\\\": \\\"abc123def\\\"}\" x.test",
+            "curl -d \"{\\\"api_key\\\": \\\"[REDACTED:key]\\\"}\" x.test",
+        ),
+        (
+            "curl -d '{\"max_token\": 4096, \"token\": 12345678}' x.test",
+            "curl -d '{\"max_token\": 4096, \"token\": 12345678}' x.test",
+        ),
+        (
+            "htpasswd -nb admin hunter2 >> /etc/nginx/.htpasswd",
+            "htpasswd -nb admin [REDACTED:password] >> /etc/nginx/.htpasswd",
+        ),
+        (
+            "htpasswd -b .htpasswd admin hunter2 > out.log",
+            "htpasswd -b .htpasswd admin [REDACTED:password] > out.log",
+        ),
+        (
+            "gh auth login --with-token < mytoken.txt",
+            "gh auth login --with-token < mytoken.txt",
+        ),
+        (
+            "mysql -u root --password < dump.sql",
+            "mysql -u root --password < dump.sql",
+        ),
+        (
+            "echo hunter2 | sudo -u root -S ls",
+            "echo [REDACTED:password] | sudo -u root -S ls",
+        ),
         ("echo big | sudo ls -S /var", "echo big | sudo ls -S /var"),
-        ("AWS_SECRET_ACCESS_KEY=/wJalrXUtnFEMI/K7MDENG/bPxRfiCY aws s3 ls", "AWS_SECRET_ACCESS_KEY=[REDACTED:key] aws s3 ls"),
-        ("GOOGLE_APPLICATION_CREDENTIALS=/Users/me/Keys2/Prod.json gcloud auth list", "GOOGLE_APPLICATION_CREDENTIALS=/Users/me/Keys2/Prod.json gcloud auth list"),
+        (
+            "AWS_SECRET_ACCESS_KEY=/wJalrXUtnFEMI/K7MDENG/bPxRfiCY aws s3 ls",
+            "AWS_SECRET_ACCESS_KEY=[REDACTED:key] aws s3 ls",
+        ),
+        (
+            "GOOGLE_APPLICATION_CREDENTIALS=/Users/me/Keys2/Prod.json gcloud auth list",
+            "GOOGLE_APPLICATION_CREDENTIALS=/Users/me/Keys2/Prod.json gcloud auth list",
+        ),
         // Found in review: ordinary commands the first rules damaged.
         ("cargo test auth::login", "cargo test auth::login"),
-        ("cargo test token::tests::parses", "cargo test token::tests::parses"),
+        (
+            "cargo test token::tests::parses",
+            "cargo test token::tests::parses",
+        ),
         ("docker pull myorg/auth:v2", "docker pull myorg/auth:v2"),
         ("jq '{token: .x}' f.json", "jq '{token: .x}' f.json"),
-        ("grep -rn \"password:\" config/", "grep -rn \"password:\" config/"),
+        (
+            "grep -rn \"password:\" config/",
+            "grep -rn \"password:\" config/",
+        ),
         ("grep -n token: values.yaml", "grep -n token: values.yaml"),
         ("grep -r \"Bearer \" src/", "grep -r \"Bearer \" src/"),
-        ("psql \"host=db password=hunter2 dbname=app\"", "psql \"host=db password=[REDACTED:password] dbname=app\""),
-        ("ssh host \"DB_PASSWORD=x ./deploy.sh --all\"", "ssh host \"DB_PASSWORD=[REDACTED:password] ./deploy.sh --all\""),
-        ("git commit -m \"set password=foo and fix the bug\"", "git commit -m \"set password=[REDACTED:password] and fix the bug\""),
+        (
+            "psql \"host=db password=hunter2 dbname=app\"",
+            "psql \"host=db password=[REDACTED:password] dbname=app\"",
+        ),
+        (
+            "ssh host \"DB_PASSWORD=x ./deploy.sh --all\"",
+            "ssh host \"DB_PASSWORD=[REDACTED:password] ./deploy.sh --all\"",
+        ),
+        (
+            "git commit -m \"set password=foo and fix the bug\"",
+            "git commit -m \"set password=[REDACTED:password] and fix the bug\"",
+        ),
         // Found in the second review.
-        ("curl -d '{\"password\":\"hun\\\"ter2\"}' https://x", "curl -d '{\"password\":\"[REDACTED:password]\"}' https://x"),
-        ("curl -d \"{\\\"password\\\":\\\"hun\\\\\\\"ter2\\\"}\" https://x", "curl -d \"{\\\"password\\\":\\\"[REDACTED:password]\\\"}\" https://x"),
-        ("gh secret set FOO -b\"hunter2\"", "gh secret set FOO -b[REDACTED:secret]"),
+        (
+            "curl -d '{\"password\":\"hun\\\"ter2\"}' https://x",
+            "curl -d '{\"password\":\"[REDACTED:password]\"}' https://x",
+        ),
+        (
+            "curl -d \"{\\\"password\\\":\\\"hun\\\\\\\"ter2\\\"}\" https://x",
+            "curl -d \"{\\\"password\\\":\\\"[REDACTED:password]\\\"}\" https://x",
+        ),
+        (
+            "gh secret set FOO -b\"hunter2\"",
+            "gh secret set FOO -b[REDACTED:secret]",
+        ),
         ("docker pull auth:latest", "docker pull auth:latest"),
         ("npm run auth:login", "npm run auth:login"),
         ("rake secret:rotate", "rake secret:rotate"),
-        ("git commit -m \"password: reset flow\"", "git commit -m \"password: reset flow\""),
-        ("echo \"db_password: hunter2\" >> config.yml", "echo \"db_password: [REDACTED:password]\" >> config.yml"),
-        ("kubectl config set-credentials cluster-admin --token=abc", "kubectl config set-credentials cluster-admin --token=[REDACTED:token]"),
-        ("git config --global user.signingkey 3AA5C34371567BD2", "git config --global user.signingkey 3AA5C34371567BD2"),
-        ("git config user.password hunter2", "git config user.password [REDACTED:password]"),
-        ("echo hunter2 | sudo -uSteve whoami", "echo hunter2 | sudo -uSteve whoami"),
-        ("echo hunter2 | sudo -uSteve -S whoami", "echo [REDACTED:password] | sudo -uSteve -S whoami"),
-        ("echo hunter2 > /tmp/x | sudo -S ls", "echo [REDACTED:password] > /tmp/x | sudo -S ls"),
+        (
+            "git commit -m \"password: reset flow\"",
+            "git commit -m \"password: reset flow\"",
+        ),
+        (
+            "echo \"db_password: hunter2\" >> config.yml",
+            "echo \"db_password: [REDACTED:password]\" >> config.yml",
+        ),
+        (
+            "kubectl config set-credentials cluster-admin --token=abc",
+            "kubectl config set-credentials cluster-admin --token=[REDACTED:token]",
+        ),
+        (
+            "git config --global user.signingkey 3AA5C34371567BD2",
+            "git config --global user.signingkey 3AA5C34371567BD2",
+        ),
+        (
+            "git config user.password hunter2",
+            "git config user.password [REDACTED:password]",
+        ),
+        (
+            "echo hunter2 | sudo -uSteve whoami",
+            "echo hunter2 | sudo -uSteve whoami",
+        ),
+        (
+            "echo hunter2 | sudo -uSteve -S whoami",
+            "echo [REDACTED:password] | sudo -uSteve -S whoami",
+        ),
+        (
+            "echo hunter2 > /tmp/x | sudo -S ls",
+            "echo [REDACTED:password] > /tmp/x | sudo -S ls",
+        ),
     ];
 
     #[test]
@@ -1249,10 +1796,17 @@ mod tests {
             .iter()
             .filter_map(|&(input, want)| {
                 let got = r.import(input);
-                (got != want).then(|| format!("\n  in:   {input:?}\n  want: {want:?}\n  got:  {got:?}"))
+                (got != want)
+                    .then(|| format!("\n  in:   {input:?}\n  want: {want:?}\n  got:  {got:?}"))
             })
             .collect();
-        assert!(failures.is_empty(), "{} of {} cases:{}", failures.len(), CASES.len(), failures.concat());
+        assert!(
+            failures.is_empty(),
+            "{} of {} cases:{}",
+            failures.len(),
+            CASES.len(),
+            failures.concat()
+        );
     }
 
     /// Safe text is redacted again on a rescrub and on every model egress.
@@ -1265,7 +1819,10 @@ mod tests {
         }
         // A marker inside a value that is itself redacted is kept, not covered.
         let nested = "password=ab[REDACTED:token]cd";
-        assert_eq!(r.redact(nested), "password=[REDACTED:password][REDACTED:token][REDACTED:password]");
+        assert_eq!(
+            r.redact(nested),
+            "password=[REDACTED:password][REDACTED:token][REDACTED:password]"
+        );
         assert_eq!(r.redact(&r.redact(nested)), r.redact(nested));
     }
 
@@ -1273,7 +1830,10 @@ mod tests {
     fn a_marker_the_user_typed_is_not_one_the_redactor_wrote() {
         let r = Redactor::new();
         let typed = r.import("echo [REDACTED:password] and PGPASSWORD=x");
-        assert_eq!(typed, "echo [REDACTED:literal:password] and PGPASSWORD=[REDACTED:password]");
+        assert_eq!(
+            typed,
+            "echo [REDACTED:literal:password] and PGPASSWORD=[REDACTED:password]"
+        );
         // Only the real one is a marker, to the UI and to a later pass.
         let found: Vec<&str> = markers(&typed).map(|m| &typed[m]).collect();
         assert_eq!(found, ["[REDACTED:password]"]);
@@ -1301,7 +1861,10 @@ mod tests {
     #[test]
     fn only_a_known_kind_makes_a_marker() {
         let text = "[REDACTED] [REDACTED:] [REDACTED:nonsense] [REDACTED:key] [REDACTED:keys]";
-        assert_eq!(markers(text).map(|m| &text[m]).collect::<Vec<_>>(), ["[REDACTED:key]"]);
+        assert_eq!(
+            markers(text).map(|m| &text[m]).collect::<Vec<_>>(),
+            ["[REDACTED:key]"]
+        );
     }
 
     /// Detectors slice by byte offsets; no input may make one land inside a

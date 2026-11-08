@@ -72,10 +72,15 @@ impl ValidationRecord {
 /// redacted, for a run that did not pass.
 pub fn run(argv: &[String], cwd: &Path) -> std::io::Result<(ValidationRecord, Option<String>)> {
     use std::os::unix::process::CommandExt;
-    let (program, args) = argv.split_first().ok_or_else(|| std::io::Error::other("a verifier needs a program"))?;
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| std::io::Error::other("a verifier needs a program"))?;
     let redactor = Redactor::new();
     if !cwd.is_dir() {
-        return Err(std::io::Error::other(format!("{}: not a directory", redactor.import(&cwd.display().to_string()))));
+        return Err(std::io::Error::other(format!(
+            "{}: not a directory",
+            redactor.import(&cwd.display().to_string())
+        )));
     }
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd);
@@ -89,13 +94,28 @@ pub fn run(argv: &[String], cwd: &Path) -> std::io::Result<(ValidationRecord, Op
         };
     }
     let started = Instant::now();
-    let run = bounded(cmd, TIMEOUT, OUTPUT_MAX)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("could not run {}: {e}", redactor.import(program))))?;
+    let run = bounded(cmd, TIMEOUT, OUTPUT_MAX).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("could not run {}: {e}", redactor.import(program)),
+        )
+    })?;
     let (outcome, exit_code, said) = match run {
         Run::Done { status, stderr, .. } => {
-            let first = String::from_utf8_lossy(&stderr).lines().find(|l| !l.trim().is_empty()).map(|l| redactor.redact(l.trim()));
-            let outcome = if status.success() { Outcome::Passed } else { Outcome::Failed };
-            (outcome, status.code(), first.filter(|_| outcome != Outcome::Passed))
+            let first = String::from_utf8_lossy(&stderr)
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| redactor.redact(l.trim()));
+            let outcome = if status.success() {
+                Outcome::Passed
+            } else {
+                Outcome::Failed
+            };
+            (
+                outcome,
+                status.code(),
+                first.filter(|_| outcome != Outcome::Passed),
+            )
         }
         Run::TimedOut => (Outcome::TimedOut, None, None),
         Run::TooLarge => (Outcome::TooLarge, None, None),
@@ -116,7 +136,10 @@ pub fn run(argv: &[String], cwd: &Path) -> std::io::Result<(ValidationRecord, Op
 /// never see `--password` beside its value.
 fn command_line(argv: &[String]) -> String {
     let quote = |a: &String| {
-        if !a.is_empty() && a.bytes().all(|b| b.is_ascii_alphanumeric() || b"@%+=:,./_-".contains(&b)) {
+        if !a.is_empty()
+            && a.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"@%+=:,./_-".contains(&b))
+        {
             a.clone()
         } else {
             format!("'{}'", a.replace('\'', r"'\''"))
@@ -139,10 +162,17 @@ mod tests {
         set_original_umask(0o027);
         // A shell metacharacter is an argument, not syntax.
         let (r, _) = run(&argv(&["touch", "made", "x; touch injected"]), dir.path()).unwrap();
-        assert_eq!((r.outcome, r.exit_code, r.assurance.as_str()), (Outcome::Passed, Some(0), UNISOLATED));
+        assert_eq!(
+            (r.outcome, r.exit_code, r.assurance.as_str()),
+            (Outcome::Passed, Some(0), UNISOLATED)
+        );
         assert!(!dir.path().join("injected").exists());
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir.path().join("made")).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(dir.path().join("made"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o640, "the user's umask, not Relic's 077");
     }
 
@@ -150,15 +180,42 @@ mod tests {
     fn a_failing_verifier_confirms_nothing_and_its_argv_is_stored_redacted() {
         let dir = tempfile::tempdir().unwrap();
         let script = "echo 'no such ref' >&2; exit 3";
-        let (r, said) = run(&argv(&["sh", "-c", script, "x", "--token=Zq9CanaryJoined1", "--password", "Zq9CanaryApart2"]), dir.path()).unwrap();
-        assert_eq!((r.outcome, r.exit_code, r.confirmed()), (Outcome::Failed, Some(3), false));
+        let (r, said) = run(
+            &argv(&[
+                "sh",
+                "-c",
+                script,
+                "x",
+                "--token=Zq9CanaryJoined1",
+                "--password",
+                "Zq9CanaryApart2",
+            ]),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            (r.outcome, r.exit_code, r.confirmed()),
+            (Outcome::Failed, Some(3), false)
+        );
         assert_eq!(said.as_deref(), Some("no such ref"));
         assert!(!r.command.contains("Zq9Canary"), "{}", r.command);
-        assert!(r.command.starts_with("sh -c 'echo '\\''no such ref'\\'' >&2; exit 3' x --token="), "{}", r.command);
+        assert!(
+            r.command
+                .starts_with("sh -c 'echo '\\''no such ref'\\'' >&2; exit 3' x --token="),
+            "{}",
+            r.command
+        );
 
-        let err = run(&argv(&["true"]), &dir.path().join("gone")).unwrap_err().to_string();
+        let err = run(&argv(&["true"]), &dir.path().join("gone"))
+            .unwrap_err()
+            .to_string();
         assert!(err.ends_with("/gone: not a directory"), "{err}");
-        let err = run(&argv(&["no-such-verifier-zq"]), dir.path()).unwrap_err().to_string();
-        assert!(err.starts_with("could not run no-such-verifier-zq: "), "{err}");
+        let err = run(&argv(&["no-such-verifier-zq"]), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("could not run no-such-verifier-zq: "),
+            "{err}"
+        );
     }
 }

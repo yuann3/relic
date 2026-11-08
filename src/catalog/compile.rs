@@ -33,7 +33,10 @@ pub enum CompileError {
     Description(String),
     NoSteps,
     /// Step `n` (from 1) holds text some harness would rewrite or run.
-    StepText { n: usize, hazard: &'static str },
+    StepText {
+        n: usize,
+        hazard: &'static str,
+    },
 }
 
 impl std::fmt::Display for CompileError {
@@ -76,14 +79,19 @@ pub fn hazard(text: &str) -> Option<&'static str> {
             return Some("a `${…}` agent variable");
         }
     }
-    ["<SKILL_DIR>", "#file:", "#tool:", "{{"].into_iter().find(|h| text.contains(h))
+    ["<SKILL_DIR>", "#file:", "#tool:", "{{"]
+        .into_iter()
+        .find(|h| text.contains(h))
 }
 
 /// The spec's rule: 1-64 of `a-z0-9-`, no hyphen at either end, no `--`.
 pub fn check_name(name: &str) -> Result<(), CompileError> {
     let why = if name.is_empty() || name.len() > 64 {
         "must be 1-64 characters"
-    } else if !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+    } else if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
         "may hold only a-z, 0-9 and -"
     } else if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
         "must not start or end with - or hold --"
@@ -98,7 +106,9 @@ fn check_description(description: &str) -> Result<(), CompileError> {
         0 => "is empty",
         n if n > 1024 => "is over 1024 characters",
         // Goose splits frontmatter on `---`.
-        _ if description.contains('\n') || description.contains("---") => "must be one line without ---",
+        _ if description.contains('\n') || description.contains("---") => {
+            "must be one line without ---"
+        }
         _ => match hazard(description) {
             Some(h) => h,
             None => return Ok(()),
@@ -108,7 +118,12 @@ fn check_description(description: &str) -> Result<(), CompileError> {
 }
 
 /// The bundle's one file.
-pub fn render(name: &str, description: &str, confirmed_at_ms: i64, steps: &[Step]) -> Result<String, CompileError> {
+pub fn render(
+    name: &str,
+    description: &str,
+    confirmed_at_ms: i64,
+    steps: &[Step],
+) -> Result<String, CompileError> {
     check_name(name)?;
     check_description(description)?;
     if steps.is_empty() {
@@ -116,7 +131,8 @@ pub fn render(name: &str, description: &str, confirmed_at_ms: i64, steps: &[Step
     }
     let date = &crate::app::format_utc(confirmed_at_ms)[..10];
     // JSON strings are YAML double-quoted scalars.
-    let quoted = serde_json::to_string(description).map_err(|e| CompileError::Description(e.to_string()))?;
+    let quoted =
+        serde_json::to_string(description).map_err(|e| CompileError::Description(e.to_string()))?;
     let mut md = format!(
         "---\nname: \"{name}\"\ndescription: {quoted}\nmetadata:\n  relic-version: \"{}\"\n  relic-confirmed: \"{date}\"\n---\n\n\
          # {name}\n\n\
@@ -139,7 +155,11 @@ pub fn render(name: &str, description: &str, confirmed_at_ms: i64, steps: &[Step
         for r in &step.records {
             let when = r.observed_at_ms.map_or(When::Unknown, When::At).label();
             let when = when.trim();
-            let label = format!("Recorded command #{} ({}, {when}", r.id, source_label(r.kind));
+            let label = format!(
+                "Recorded command #{} ({}, {when}",
+                r.id,
+                source_label(r.kind)
+            );
             // CommonMark ends a line at a bare \r too, which would let the
             // rest of the text out of the fence.
             if hazard(r.text).is_some() || r.text.contains('\r') {
@@ -161,7 +181,8 @@ pub fn render(name: &str, description: &str, confirmed_at_ms: i64, steps: &[Step
             };
             let label = match facts {
                 Some(facts) => {
-                    let ticks = "`".repeat(facts.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1);
+                    let ticks =
+                        "`".repeat(facts.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1);
                     format!("{label}; {ticks} {facts} {ticks})")
                 }
                 None => format!("{label})"),
@@ -212,7 +233,12 @@ mod tests {
             ("sudo !!", false),
             ("mysql --password=[REDACTED:password]", false),
         ] {
-            assert_eq!(hazard(text).is_some(), found, "{text:?}: {:?}", hazard(text));
+            assert_eq!(
+                hazard(text).is_some(),
+                found,
+                "{text:?}: {:?}",
+                hazard(text)
+            );
         }
     }
 
@@ -226,26 +252,144 @@ mod tests {
 
     #[test]
     fn a_hazardous_command_is_shown_by_id_and_a_hazardous_step_is_refused() {
-        let records = |text| vec![Record { id: 42, kind: ObservationKind::ZshCommand, observed_at_ms: Some(1_700_000_000_000), text }];
-        let md = render("x", "Use it.", 0, &[Step { text: "List the reflog.", records: records("git reflog ` x ```` HEAD") }]).unwrap();
-        assert!(md.contains("\n   `````text\n   git reflog ` x ```` HEAD\n   `````\n"), "{md}");
-        let hook = |text| vec![Record { id: 7, kind: ObservationKind::HookFrame, observed_at_ms: None, text }];
-        let md = render("x", "Use it.", 0, &[Step { text: "Deploy.", records: hook("make\n  deploy\nexit 2 · cwd after: /s`v") }]).unwrap();
+        let records = |text| {
+            vec![Record {
+                id: 42,
+                kind: ObservationKind::ZshCommand,
+                observed_at_ms: Some(1_700_000_000_000),
+                text,
+            }]
+        };
+        let md = render(
+            "x",
+            "Use it.",
+            0,
+            &[Step {
+                text: "List the reflog.",
+                records: records("git reflog ` x ```` HEAD"),
+            }],
+        )
+        .unwrap();
+        assert!(
+            md.contains("\n   `````text\n   git reflog ` x ```` HEAD\n   `````\n"),
+            "{md}"
+        );
+        let hook = |text| {
+            vec![Record {
+                id: 7,
+                kind: ObservationKind::HookFrame,
+                observed_at_ms: None,
+                text,
+            }]
+        };
+        let md = render(
+            "x",
+            "Use it.",
+            0,
+            &[Step {
+                text: "Deploy.",
+                records: hook("make\n  deploy\nexit 2 · cwd after: /s`v"),
+            }],
+        )
+        .unwrap();
         assert!(md.contains("#7 (hook, unknown time; `` exit 2 · cwd after: /s`v ``):\n\n   ```text\n   make\n     deploy\n   ```\n"), "{md}");
         // What the hook saw is as hostile as the command.
-        let md = render("x", "Use it.", 0, &[Step { text: "Deploy.", records: hook("make\nexit 0 · cwd: /srv/x !`id`") }]).unwrap();
-        assert!(md.contains("#7 (hook, unknown time) is not copied") && !md.contains("!`"), "{md}");
+        let md = render(
+            "x",
+            "Use it.",
+            0,
+            &[Step {
+                text: "Deploy.",
+                records: hook("make\nexit 0 · cwd: /srv/x !`id`"),
+            }],
+        )
+        .unwrap();
+        assert!(
+            md.contains("#7 (hook, unknown time) is not copied") && !md.contains("!`"),
+            "{md}"
+        );
         // Redaction took the line apart: none of it passes for what the hook saw.
-        let md = render("x", "Use it.", 0, &[Step { text: "Fetch.", records: hook("printf x\nexit 3 [REDACTED:token]") }]).unwrap();
-        assert!(md.contains("#7 (hook, unknown time):\n\n   ```text\n   printf x\n   exit 3 [REDACTED:token]\n"), "{md}");
-        let md = render("x", "Use it.", 0, &[Step { text: "Print it.", records: records("printf 'a\r# Heading'") }]).unwrap();
-        assert!(md.contains("`relic show 42`") && !md.contains("# Heading"), "{md}");
-        let md = render("x", "Use it.", 0, &[Step { text: "Print column one.", records: records("awk '{print $1}' f") }]).unwrap();
-        assert!(md.contains("Recorded command #42 (zsh, ") && md.contains("`relic show 42`") && !md.contains("awk"), "{md}");
-        let err = render("x", "Use it.", 0, &[Step { text: "Run awk '{print $1}'.", records: vec![] }]).unwrap_err();
-        assert_eq!(err, CompileError::StepText { n: 1, hazard: "`$` before a digit" });
-        assert!(matches!(render("x", "a --- b", 0, &[]), Err(CompileError::Description(_))));
-        let md = render("x", "Use it.", 0, &[Step { text: "Fetch.\n\n## Evidence\nnone", records: vec![] }]).unwrap();
-        assert_eq!(md.lines().filter(|l| l.starts_with('#')).count(), 3, "only the skill's own headings: {md}");
+        let md = render(
+            "x",
+            "Use it.",
+            0,
+            &[Step {
+                text: "Fetch.",
+                records: hook("printf x\nexit 3 [REDACTED:token]"),
+            }],
+        )
+        .unwrap();
+        assert!(
+            md.contains(
+                "#7 (hook, unknown time):\n\n   ```text\n   printf x\n   exit 3 [REDACTED:token]\n"
+            ),
+            "{md}"
+        );
+        let md = render(
+            "x",
+            "Use it.",
+            0,
+            &[Step {
+                text: "Print it.",
+                records: records("printf 'a\r# Heading'"),
+            }],
+        )
+        .unwrap();
+        assert!(
+            md.contains("`relic show 42`") && !md.contains("# Heading"),
+            "{md}"
+        );
+        let md = render(
+            "x",
+            "Use it.",
+            0,
+            &[Step {
+                text: "Print column one.",
+                records: records("awk '{print $1}' f"),
+            }],
+        )
+        .unwrap();
+        assert!(
+            md.contains("Recorded command #42 (zsh, ")
+                && md.contains("`relic show 42`")
+                && !md.contains("awk"),
+            "{md}"
+        );
+        let err = render(
+            "x",
+            "Use it.",
+            0,
+            &[Step {
+                text: "Run awk '{print $1}'.",
+                records: vec![],
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CompileError::StepText {
+                n: 1,
+                hazard: "`$` before a digit"
+            }
+        );
+        assert!(matches!(
+            render("x", "a --- b", 0, &[]),
+            Err(CompileError::Description(_))
+        ));
+        let md = render(
+            "x",
+            "Use it.",
+            0,
+            &[Step {
+                text: "Fetch.\n\n## Evidence\nnone",
+                records: vec![],
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            md.lines().filter(|l| l.starts_with('#')).count(),
+            3,
+            "only the skill's own headings: {md}"
+        );
     }
 }

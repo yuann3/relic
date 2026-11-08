@@ -24,7 +24,9 @@ pub fn spawn(
     tx: SyncSender<UiAction>,
 ) -> std::io::Result<JoinHandle<()>> {
     let builder = std::thread::Builder::new().name(format!("relic-recall-{op}"));
-    crate::signal::spawn(builder, move || run(op, &question, &store, model, &log, &cancel, &tx))
+    crate::signal::spawn(builder, move || {
+        run(op, &question, &store, model, &log, &cancel, &tx)
+    })
 }
 
 fn run(
@@ -87,8 +89,18 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("zsh_history");
-        std::fs::write(&path, ": 1700000000:0;cd /etc/nginx\n: 1700000001:0;certbot renew\n").unwrap();
-        crate::import::import_file(&mut store, &path, crate::import::SourceKind::Zsh, &crate::redact::Redactor::new()).unwrap();
+        std::fs::write(
+            &path,
+            ": 1700000000:0;cd /etc/nginx\n: 1700000001:0;certbot renew\n",
+        )
+        .unwrap();
+        crate::import::import_file(
+            &mut store,
+            &path,
+            crate::import::SourceKind::Zsh,
+            &crate::redact::Redactor::new(),
+        )
+        .unwrap();
         let renew = store.search("certbot", 10).unwrap()[0].id;
 
         let model = Arc::new(FakeModel::new());
@@ -111,10 +123,20 @@ mod tests {
         m.query = "how did I renew".into();
         update(&mut m, UiAction::Key(Key::Ctrl('r')));
         let e = update(&mut m, UiAction::Key(Key::Char('y')));
-        let [UiEffect::StartRecall { op, ref question }] = e[..] else { panic!("{e:?}") };
+        let [UiEffect::StartRecall { op, ref question }] = e[..] else {
+            panic!("{e:?}")
+        };
 
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
-        run(op, question, &store, model, &dir.path().join("relic.db.recall.log"), &Arc::default(), &tx);
+        run(
+            op,
+            question,
+            &store,
+            model,
+            &dir.path().join("relic.db.recall.log"),
+            &Arc::default(),
+            &tx,
+        );
         drop(tx);
         for a in rx.iter() {
             update(&mut m, a);
@@ -123,14 +145,40 @@ mod tests {
         assert_eq!(r.status, RecallStatus::Finished);
         assert_eq!((r.root_calls, r.child_calls), (2, 0));
         let labels: Vec<&str> = r.steps.iter().map(|s| s.label.as_str()).collect();
-        assert_eq!(labels, ["root call 1: plan the next step", "run s1", "run i1", "root call 2: plan the next step"]);
-        assert!(r.steps.iter().all(|s| s.state == StepState::Done), "{:?}", r.steps);
+        assert_eq!(
+            labels,
+            [
+                "root call 1: plan the next step",
+                "run s1",
+                "run i1",
+                "root call 2: plan the next step"
+            ]
+        );
+        assert!(
+            r.steps.iter().all(|s| s.state == StepState::Done),
+            "{:?}",
+            r.steps
+        );
         let outcomes: Vec<Option<&str>> = r.steps.iter().map(|s| s.outcome.as_deref()).collect();
-        assert_eq!(outcomes, [Some("root reply from fake"), None, None, Some("root reply from fake")]);
+        assert_eq!(
+            outcomes,
+            [
+                Some("root reply from fake"),
+                None,
+                None,
+                Some("root reply from fake")
+            ]
+        );
         let report = r.report.as_ref().unwrap();
-        assert_eq!((report.outcome, report.claims[0].supports.as_slice()), (RecallOutcome::Answered, &[renew][..]));
+        assert_eq!(
+            (report.outcome, report.claims[0].supports.as_slice()),
+            (RecallOutcome::Answered, &[renew][..])
+        );
         m.focus = crate::ui::model::Focus::Recall;
         let e = update(&mut m, UiAction::Key(Key::Enter));
-        assert!(matches!(e[..], [UiEffect::OpenEvidence { id }] if id == renew), "{e:?}");
+        assert!(
+            matches!(e[..], [UiEffect::OpenEvidence { id }] if id == renew),
+            "{e:?}"
+        );
     }
 }

@@ -247,7 +247,8 @@ impl InputReader {
         let gate = Arc::new((Mutex::new(Gate::default()), Condvar::new()));
         let g = Arc::clone(&gate);
         let builder = std::thread::Builder::new().name("relic-input".into());
-        let handle = crate::signal::spawn(builder, move || read_loop(&g, &tx, &mut next)).expect("spawn input thread");
+        let handle = crate::signal::spawn(builder, move || read_loop(&g, &tx, &mut next))
+            .expect("spawn input thread");
         Self {
             gate,
             handle: Some(handle),
@@ -358,8 +359,13 @@ fn send(gate: &(Mutex<Gate>, Condvar), tx: &SyncSender<UiAction>, mut a: UiActio
 /// Alt+key is split back into the Esc and the key that were typed.
 pub fn translate(ev: Event, now: Instant) -> Vec<UiAction> {
     match ev {
-        Event::Key(k) if k.kind != KeyEventKind::Release && k.modifiers.contains(KeyModifiers::ALT) => {
-            let key = KeyEvent { modifiers: k.modifiers - KeyModifiers::ALT, ..k };
+        Event::Key(k)
+            if k.kind != KeyEventKind::Release && k.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            let key = KeyEvent {
+                modifiers: k.modifiers - KeyModifiers::ALT,
+                ..k
+            };
             let mut actions = vec![UiAction::Key(Key::Esc)];
             actions.extend(translate_one(Event::Key(key), now));
             actions
@@ -509,13 +515,23 @@ mod tests {
                 .collect()
         };
         for (ev, want) in cases {
-            assert_eq!(keys(ev.clone()), want.iter().cloned().collect::<Vec<_>>(), "{ev:?}");
+            assert_eq!(
+                keys(ev.clone()),
+                want.iter().cloned().collect::<Vec<_>>(),
+                "{ev:?}"
+            );
         }
         // Esc then a letter in one read arrives as Alt+letter: both keys,
         // in order, and never the letter alone.
         let alt = KeyModifiers::ALT;
-        assert_eq!(keys(key(KeyCode::Char('j'), alt)), [Key::Esc, Key::Char('j')]);
-        assert_eq!(keys(key(KeyCode::Char('n'), alt | ctrl)), [Key::Esc, Key::Ctrl('n')]);
+        assert_eq!(
+            keys(key(KeyCode::Char('j'), alt)),
+            [Key::Esc, Key::Char('j')]
+        );
+        assert_eq!(
+            keys(key(KeyCode::Char('n'), alt | ctrl)),
+            [Key::Esc, Key::Ctrl('n')]
+        );
         assert_eq!(keys(key(KeyCode::F(5), alt)), [Key::Esc]);
         assert!(matches!(
             &translate(key(KeyCode::Char('c'), ctrl), now)[..],

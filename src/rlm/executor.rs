@@ -1,11 +1,11 @@
+use crate::app::{self, Budget, Order, SearchRequest};
 use crate::domain::StoredObservation;
 use crate::rlm::budget::BudgetExhausted;
 use crate::rlm::evidence::{HandleId, HandleRegistry};
-use crate::rlm::validate::HandleKind;
 use crate::rlm::model::egress::{self, Role};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, OutputError, parse_output};
-use crate::app::{self, Budget, Order, SearchRequest};
 use crate::rlm::protocol::*;
+use crate::rlm::validate::HandleKind;
 use crate::store::{Store, is_interrupt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +16,10 @@ pub enum ExecError {
     Search(app::SearchError),
     HandleNotFound(String),
     /// A handle reference named a set of the wrong kind for its operator.
-    WrongKind { handle: String, expected: HandleKind },
+    WrongKind {
+        handle: String,
+        expected: HandleKind,
+    },
     Budget(BudgetExhausted),
     /// The investigation's cancel flag was set.
     Cancelled,
@@ -25,27 +28,43 @@ pub enum ExecError {
 /// Why a child result was rejected whole (ADR 0009).
 #[derive(Debug, PartialEq)]
 pub enum ChildRejection {
-    Oversize { bytes: usize },
+    Oversize {
+        bytes: usize,
+    },
     Malformed(String),
     Version(u8),
     PacketId(String),
     UnknownItem(String),
     DuplicateItem(String),
-    Citation { item_id: String, evidence_id: String },
+    Citation {
+        item_id: String,
+        evidence_id: String,
+    },
 }
 
 impl std::fmt::Display for ChildRejection {
-    #[expect(clippy::use_debug, reason = "quotes the ids the model wrote, with their control characters escaped")]
+    #[expect(
+        clippy::use_debug,
+        reason = "quotes the ids the model wrote, with their control characters escaped"
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Oversize { bytes } => write!(f, "{bytes} bytes, over the {CHILD_RESULT_MAX}-byte cap"),
+            Self::Oversize { bytes } => {
+                write!(f, "{bytes} bytes, over the {CHILD_RESULT_MAX}-byte cap")
+            }
             Self::Malformed(e) => write!(f, "not a child result: {e}"),
             Self::Version(v) => write!(f, "version {v}, not 1"),
             Self::PacketId(id) => write!(f, "packet_id {id:?} is not the packet sent"),
             Self::UnknownItem(id) => write!(f, "item_id {id:?} is not in the packet"),
             Self::DuplicateItem(id) => write!(f, "item_id {id:?} assessed twice"),
-            Self::Citation { item_id, evidence_id } => {
-                write!(f, "{item_id:?} cites {evidence_id:?}, which is not in the packet")
+            Self::Citation {
+                item_id,
+                evidence_id,
+            } => {
+                write!(
+                    f,
+                    "{item_id:?} cites {evidence_id:?}, which is not in the packet"
+                )
             }
         }
     }
@@ -86,7 +105,12 @@ pub fn execute_search(
         // Through the shared use case, so the model's searches run under the
         // same word cap and deadline as the user's (ADR 0006). One budget for
         // all the terms: the step as a whole has the deadline.
-        let req = SearchRequest { query, limit, mode: app::MatchMode::Words, order: Order::RecentlyImported };
+        let req = SearchRequest {
+            query,
+            limit,
+            mode: app::MatchMode::Words,
+            order: Order::RecentlyImported,
+        };
         match app::search(store, &req, budget) {
             Ok(page) => hits.extend(page.hits),
             // A step result, not a failed investigation: the root sees an
@@ -137,7 +161,12 @@ pub fn execute_expand(
             let mut seen_ids = std::collections::HashSet::new();
             let mut all_neighbors: Vec<StoredObservation> = Vec::new();
             for obs in seed_obs {
-                for n in store.get_neighbors(obs.revision_id, obs.ordinal, expand.before, expand.after)? {
+                for n in store.get_neighbors(
+                    obs.revision_id,
+                    obs.ordinal,
+                    expand.before,
+                    expand.after,
+                )? {
                     if seen_ids.insert(n.id) {
                         all_neighbors.push(n);
                     }
@@ -149,7 +178,13 @@ pub fn execute_expand(
             }
             Ok(all_neighbors)
         })
-        .map_err(|e| if is_interrupt(&e) { ExecError::Cancelled } else { ExecError::Store(e) })?;
+        .map_err(|e| {
+            if is_interrupt(&e) {
+                ExecError::Cancelled
+            } else {
+                ExecError::Store(e)
+            }
+        })?;
 
     Ok(registry.insert_evidence_set(all_neighbors))
 }
@@ -181,12 +216,25 @@ pub fn check_child_result(
     }
     let mut slots: Vec<Option<ItemAssessmentV1>> = vec![None; packet.items.len()];
     for a in result.assessments {
-        let Some(i) = packet.items.iter().position(|item| item.item_id == a.item_id) else {
+        let Some(i) = packet
+            .items
+            .iter()
+            .position(|item| item.item_id == a.item_id)
+        else {
             return Err(ChildRejection::UnknownItem(a.item_id));
         };
-        let cited = a.claims.iter().flat_map(|c| c.supports.iter().chain(&c.contradicts));
-        if let Some(bad) = cited.into_iter().find(|ev| !packet.items.iter().any(|item| &item.evidence_id == *ev)) {
-            return Err(ChildRejection::Citation { item_id: a.item_id, evidence_id: bad.clone() });
+        let cited = a
+            .claims
+            .iter()
+            .flat_map(|c| c.supports.iter().chain(&c.contradicts));
+        if let Some(bad) = cited
+            .into_iter()
+            .find(|ev| !packet.items.iter().any(|item| &item.evidence_id == *ev))
+        {
+            return Err(ChildRejection::Citation {
+                item_id: a.item_id,
+                evidence_id: bad.clone(),
+            });
         }
         if slots[i].is_some() {
             return Err(ChildRejection::DuplicateItem(a.item_id));
@@ -215,13 +263,21 @@ pub fn packets(objective: &str, items: Vec<EvidenceItem>) -> Vec<EvidencePacket>
     // admission caps an assess at 64 items, so at most 64 packets.
     let id = |n: usize| format!("pkt_{n:02}");
     let mut out: Vec<EvidencePacket> = Vec::new();
-    let over = |p: &EvidencePacket| p.items.len() > CHILD_ITEMS_MAX || packet_bytes(objective, p) > egress::CHILD_MAX;
-    let mut packet = EvidencePacket { packet_id: id(0), items: Vec::new() };
+    let over = |p: &EvidencePacket| {
+        p.items.len() > CHILD_ITEMS_MAX || packet_bytes(objective, p) > egress::CHILD_MAX
+    };
+    let mut packet = EvidencePacket {
+        packet_id: id(0),
+        items: Vec::new(),
+    };
     for item in items {
         packet.items.push(item);
         if packet.items.len() > 1 && over(&packet) {
             let moved = packet.items.pop().into_iter().collect();
-            let next = EvidencePacket { packet_id: id(out.len() + 1), items: moved };
+            let next = EvidencePacket {
+                packet_id: id(out.len() + 1),
+                items: moved,
+            };
             out.push(std::mem::replace(&mut packet, next));
         }
         if over(&packet) {
@@ -241,7 +297,10 @@ fn truncate_to_fit(objective: &str, packet: &mut EvidencePacket) {
         let item = &mut packet.items[0];
         item.safe_text.clear();
         item.safe_text.push_str(&text[..n]);
-        item.truncation = Some(TruncationV1 { original_bytes: text.len(), sent_bytes: n });
+        item.truncation = Some(TruncationV1 {
+            original_bytes: text.len(),
+            sent_bytes: n,
+        });
         packet_bytes(objective, packet) <= egress::CHILD_MAX
     };
     // Size only grows with the prefix, so binary search over byte lengths;
@@ -260,7 +319,8 @@ fn truncate_to_fit(objective: &str, packet: &mut EvidencePacket) {
 
 /// Makes the child calls for a batch of packets: each packet's reply body,
 /// or why it has none.
-pub type CallChildren<'a> = dyn FnMut(&[EvidencePacket], &str) -> Result<Vec<Result<String, String>>, ExecError> + 'a;
+pub type CallChildren<'a> =
+    dyn FnMut(&[EvidencePacket], &str) -> Result<Vec<Result<String, String>>, ExecError> + 'a;
 
 /// Execute an assess operator: batch evidence into child model calls.
 pub fn execute_assess(
@@ -297,9 +357,12 @@ pub fn execute_assess(
     let replies = call_children(&packets, &objective)?;
     let mut assessments = Vec::with_capacity(selected_count);
     for (packet, reply) in packets.iter().zip(replies) {
-        let checked = reply.map_err(|e| format!("child call for {} failed: {e}", packet.packet_id)).and_then(|raw| {
-            check_child_result(packet, &raw).map_err(|why| format!("child result for {} rejected: {why}", packet.packet_id))
-        });
+        let checked = reply
+            .map_err(|e| format!("child call for {} failed: {e}", packet.packet_id))
+            .and_then(|raw| {
+                check_child_result(packet, &raw)
+                    .map_err(|why| format!("child result for {} rejected: {why}", packet.packet_id))
+            });
         match checked {
             Ok(slots) => assessments.extend(slots),
             // The other packets' verdicts stand; this one's items stay
@@ -326,18 +389,26 @@ pub fn execute_select(
     plan_outputs: &std::collections::HashMap<String, HandleId>,
 ) -> Result<HandleId, ExecError> {
     let source = resolve_input(&select.input, plan_outputs)?;
-    let handle = registry.get(&source).ok_or_else(|| ExecError::HandleNotFound(source.clone()))?;
+    let handle = registry
+        .get(&source)
+        .ok_or_else(|| ExecError::HandleNotFound(source.clone()))?;
     // Plan admission checks plan outputs; a handle from an earlier turn
     // is checked here.
     if handle.kind != HandleKind::AssessmentSet {
-        return Err(ExecError::WrongKind { handle: source, expected: HandleKind::AssessmentSet });
+        return Err(ExecError::WrongKind {
+            handle: source,
+            expected: HandleKind::AssessmentSet,
+        });
     }
     let observations = registry.get_observations(&source).unwrap_or_default();
     let assessments = registry.get_assessments(&source).unwrap_or_default();
     let picked = observations
         .iter()
         .zip(assessments)
-        .filter(|(_, a)| a.as_ref().is_some_and(|a| select.verdicts.contains(&a.verdict)))
+        .filter(|(_, a)| {
+            a.as_ref()
+                .is_some_and(|a| select.verdicts.contains(&a.verdict))
+        })
         .map(|(o, _)| o.clone())
         .take(select.limit as usize)
         .collect();
@@ -368,28 +439,48 @@ mod tests {
 
     /// The child calls for `packets`, one after another through the egress
     /// seam, unmetered.
-    fn fake_children(model: &FakeModel, packets: &[EvidencePacket], objective: &str) -> Result<Vec<Result<String, String>>, ExecError> {
+    fn fake_children(
+        model: &FakeModel,
+        packets: &[EvidencePacket],
+        objective: &str,
+    ) -> Result<Vec<Result<String, String>>, ExecError> {
         let mut ledger = crate::rlm::budget::BudgetLedger::new(BudgetV1::prototype_default());
         let call = |p: &EvidencePacket| {
-            let req = egress::EgressRequest::new(Role::Child, child_payload(objective, p), &model.target(), &mut ledger, &mut |_| {})
-                .unwrap();
-            model.call(&req, std::time::Instant::now()).map(|r| r.body).map_err(|e| e.to_string())
+            let req = egress::EgressRequest::new(
+                Role::Child,
+                child_payload(objective, p),
+                &model.target(),
+                &mut ledger,
+                &mut |_| {},
+            )
+            .unwrap();
+            model
+                .call(&req, std::time::Instant::now())
+                .map(|r| r.body)
+                .map_err(|e| e.to_string())
         };
         Ok(packets.iter().map(call).collect())
     }
     use crate::store::{Cursor, Store};
     use std::collections::HashMap;
 
-
     fn seed_store(store: &mut Store) -> i64 {
-        let rev = store.lock_source(b"/h").unwrap().new_revision(SourceKind::Zsh).unwrap();
+        let rev = store
+            .lock_source(b"/h")
+            .unwrap()
+            .new_revision(SourceKind::Zsh)
+            .unwrap();
         let id = rev.revision_id();
         rev.commit(&Cursor::default(), Provenance::COMMAND).unwrap();
         id
     }
 
     fn insert_commands(store: &mut Store, rev_id: i64, commands: &[&str]) {
-        let mut rev = store.lock_source(b"/h").unwrap().append(SourceKind::Zsh).unwrap();
+        let mut rev = store
+            .lock_source(b"/h")
+            .unwrap()
+            .append(SourceKind::Zsh)
+            .unwrap();
         assert_eq!(rev.revision_id(), rev_id);
         for (i, cmd) in commands.iter().enumerate() {
             rev.insert(&Observation {
@@ -408,12 +499,16 @@ mod tests {
     fn search_finds_matching_records() {
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
-        insert_commands(&mut store, rev_id, &[
-            "cargo build --release",
-            "git push origin main",
-            "cargo test --lib",
-            "docker compose up",
-        ]);
+        insert_commands(
+            &mut store,
+            rev_id,
+            &[
+                "cargo build --release",
+                "git push origin main",
+                "cargo test --lib",
+                "docker compose up",
+            ],
+        );
 
         let mut registry = HandleRegistry::new(64);
         let search = SearchV1 {
@@ -423,7 +518,14 @@ mod tests {
             limit: 50,
         };
 
-        let hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
+        let hid = execute_search(
+            &store,
+            &search,
+            &mut registry,
+            &Budget::start(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         let handle = registry.get(&hid).unwrap();
         assert_eq!(handle.kind, HandleKind::EvidenceSet);
         assert_eq!(handle.count, 2);
@@ -436,15 +538,45 @@ mod tests {
     fn search_any_matches_either_term_and_all_needs_both() {
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
-        insert_commands(&mut store, rev_id, &["cargo build", "git push", "cargo git-hook", "docker ps", "git or cargo"]);
+        insert_commands(
+            &mut store,
+            rev_id,
+            &[
+                "cargo build",
+                "git push",
+                "cargo git-hook",
+                "docker ps",
+                "git or cargo",
+            ],
+        );
         let mut registry = HandleRegistry::new(64);
         let mut run = |match_mode, limit| {
-            let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into(), "git".into()], match_mode, limit };
-            let hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
-            registry.get_observations(&hid).unwrap().iter().map(|o| o.safe_text.clone()).collect::<Vec<_>>()
+            let search = SearchV1 {
+                op_id: "s1".into(),
+                terms: vec!["cargo".into(), "git".into()],
+                match_mode,
+                limit,
+            };
+            let hid = execute_search(
+                &store,
+                &search,
+                &mut registry,
+                &Budget::start(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            registry
+                .get_observations(&hid)
+                .unwrap()
+                .iter()
+                .map(|o| o.safe_text.clone())
+                .collect::<Vec<_>>()
         };
         // Newest first, each once, and not only rows with the word "or".
-        assert_eq!(run(MatchMode::Any, 10), ["git or cargo", "cargo git-hook", "git push", "cargo build"]);
+        assert_eq!(
+            run(MatchMode::Any, 10),
+            ["git or cargo", "cargo git-hook", "git push", "cargo build"]
+        );
         assert_eq!(run(MatchMode::Any, 2), ["git or cargo", "cargo git-hook"]);
         assert_eq!(run(MatchMode::All, 10), ["git or cargo", "cargo git-hook"]);
     }
@@ -465,7 +597,14 @@ mod tests {
             limit: 5,
         };
 
-        let hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
+        let hid = execute_search(
+            &store,
+            &search,
+            &mut registry,
+            &Budget::start(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(registry.get(&hid).unwrap().count, 5);
     }
 
@@ -473,10 +612,15 @@ mod tests {
     fn expand_gets_neighbors() {
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
-        let cmds: Vec<String> = (0..50).map(|i| {
-            if i == 25 { "certbot renew".to_string() }
-            else { format!("cmd_{i}") }
-        }).collect();
+        let cmds: Vec<String> = (0..50)
+            .map(|i| {
+                if i == 25 {
+                    "certbot renew".to_string()
+                } else {
+                    format!("cmd_{i}")
+                }
+            })
+            .collect();
         let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
         insert_commands(&mut store, rev_id, &cmd_refs);
 
@@ -489,7 +633,14 @@ mod tests {
             match_mode: MatchMode::Any,
             limit: 10,
         };
-        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
+        let s_hid = execute_search(
+            &store,
+            &search,
+            &mut registry,
+            &Budget::start(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(registry.get(&s_hid).unwrap().count, 1);
 
         // Expand around it.
@@ -504,7 +655,14 @@ mod tests {
         let mut plan_outputs = HashMap::new();
         plan_outputs.insert("s1".to_string(), s_hid);
 
-        let e_hid = execute_expand(&store, &expand, &mut registry, &plan_outputs, &Arc::default()).unwrap();
+        let e_hid = execute_expand(
+            &store,
+            &expand,
+            &mut registry,
+            &plan_outputs,
+            &Arc::default(),
+        )
+        .unwrap();
         let obs = registry.get_observations(&e_hid).unwrap();
 
         // Should have ordinals 22..=28 (7 items: 3 before + center + 3 after)
@@ -518,10 +676,15 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
         // Two adjacent certbot commands — their expand windows overlap.
-        let cmds: Vec<String> = (0..20).map(|i| {
-            if i == 10 || i == 11 { "certbot renew".to_string() }
-            else { format!("cmd_{i}") }
-        }).collect();
+        let cmds: Vec<String> = (0..20)
+            .map(|i| {
+                if i == 10 || i == 11 {
+                    "certbot renew".to_string()
+                } else {
+                    format!("cmd_{i}")
+                }
+            })
+            .collect();
         let cmd_refs: Vec<&str> = cmds.iter().map(|s| s.as_str()).collect();
         insert_commands(&mut store, rev_id, &cmd_refs);
 
@@ -532,7 +695,14 @@ mod tests {
             match_mode: MatchMode::Any,
             limit: 10,
         };
-        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
+        let s_hid = execute_search(
+            &store,
+            &search,
+            &mut registry,
+            &Budget::start(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(registry.get(&s_hid).unwrap().count, 2);
 
         let expand = ExpandV1 {
@@ -546,7 +716,14 @@ mod tests {
         let mut plan_outputs = HashMap::new();
         plan_outputs.insert("s1".to_string(), s_hid);
 
-        let e_hid = execute_expand(&store, &expand, &mut registry, &plan_outputs, &Arc::default()).unwrap();
+        let e_hid = execute_expand(
+            &store,
+            &expand,
+            &mut registry,
+            &plan_outputs,
+            &Arc::default(),
+        )
+        .unwrap();
         let obs = registry.get_observations(&e_hid).unwrap();
 
         // Ordinals 8..=13 — no duplicates despite overlapping windows.
@@ -560,15 +737,30 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
         let cmds: Vec<String> = (0..2_000).map(|i| format!("cargo cmd_{i}")).collect();
-        insert_commands(&mut store, rev_id, &cmds.iter().map(String::as_str).collect::<Vec<_>>());
+        insert_commands(
+            &mut store,
+            rev_id,
+            &cmds.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
         let mut registry = HandleRegistry::new(64);
-        let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into()], match_mode: MatchMode::Any, limit: 50 };
+        let search = SearchV1 {
+            op_id: "s1".into(),
+            terms: vec!["cargo".into()],
+            match_mode: MatchMode::Any,
+            limit: 50,
+        };
 
-        let spent = Budget { deadline: std::time::Instant::now(), cancel: None };
+        let spent = Budget {
+            deadline: std::time::Instant::now(),
+            cancel: None,
+        };
         let mut notes = Vec::new();
         let hid = execute_search(&store, &search, &mut registry, &spent, &mut notes).unwrap();
         assert_eq!(registry.get(&hid).unwrap().count, 0);
-        assert!(notes.len() == 1 && notes[0].starts_with("s1: query too broad"), "{notes:?}");
+        assert!(
+            notes.len() == 1 && notes[0].starts_with("s1: query too broad"),
+            "{notes:?}"
+        );
 
         // A plan built on it runs on: expanding nothing finds nothing.
         let expand = ExpandV1 {
@@ -579,20 +771,36 @@ mod tests {
             after: 2,
             limit: 10,
         };
-        let e_hid = execute_expand(&store, &expand, &mut registry, &HashMap::new(), &Arc::default()).unwrap();
+        let e_hid = execute_expand(
+            &store,
+            &expand,
+            &mut registry,
+            &HashMap::new(),
+            &Arc::default(),
+        )
+        .unwrap();
         assert_eq!(registry.get(&e_hid).unwrap().count, 0);
     }
 
     // --- Batching ---
 
     fn item(i: usize, text: String) -> EvidenceItem {
-        EvidenceItem { item_id: format!("item_{i}"), evidence_id: format!("ev1_{i:016x}"), safe_text: text, truncation: None }
+        EvidenceItem {
+            item_id: format!("item_{i}"),
+            evidence_id: format!("ev1_{i:016x}"),
+            safe_text: text,
+            truncation: None,
+        }
     }
 
     #[test]
     fn packets_hold_at_most_four_items_and_24_kib_in_order() {
         let sizes = [10, 10, 9000, 9000, 9000, 10, 30_000, 10, 10, 10, 10, 10];
-        let items: Vec<_> = sizes.iter().enumerate().map(|(i, &n)| item(i, "x".repeat(n))).collect();
+        let items: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| item(i, "x".repeat(n)))
+            .collect();
         let packets = packets("objective", items.clone());
 
         // Worked by hand: a 5th item or a 3rd 9000-byte one starts a packet,
@@ -600,13 +808,20 @@ mod tests {
         let counts: Vec<usize> = packets.iter().map(|p| p.items.len()).collect();
         assert_eq!(counts, [4, 2, 1, 4, 1]);
         for p in &packets {
-            assert!(packet_bytes("objective", p) <= egress::CHILD_MAX, "{} is over", p.packet_id);
+            assert!(
+                packet_bytes("objective", p) <= egress::CHILD_MAX,
+                "{} is over",
+                p.packet_id
+            );
         }
         let sent: Vec<&EvidenceItem> = packets.iter().flat_map(|p| &p.items).collect();
         for (sent, original) in sent.iter().zip(&items) {
             assert_eq!(sent.item_id, original.item_id);
             if sent.item_id != "item_6" {
-                assert_eq!((&sent.safe_text, &sent.truncation), (&original.safe_text, &None));
+                assert_eq!(
+                    (&sent.safe_text, &sent.truncation),
+                    (&original.safe_text, &None)
+                );
             }
         }
         let ids: std::collections::HashSet<_> = packets.iter().map(|p| &p.packet_id).collect();
@@ -618,7 +833,9 @@ mod tests {
         // Two-byte chars, so a cut at an odd byte would split one.
         let text = "é".repeat(15 * 1024);
         let packets = packets("objective", vec![item(0, text.clone())]);
-        let [packet] = packets.as_slice() else { panic!("one packet, got {}", packets.len()) };
+        let [packet] = packets.as_slice() else {
+            panic!("one packet, got {}", packets.len())
+        };
         let sent = &packet.items[0];
         let t = sent.truncation.as_ref().expect("marked as truncated");
         assert_eq!(t.original_bytes, 30 * 1024);
@@ -626,14 +843,16 @@ mod tests {
         assert!(text.starts_with(&sent.safe_text));
         // As much as fits: within one char of the cap, not cut to nothing.
         let bytes = packet_bytes("objective", packet);
-        assert!(bytes <= egress::CHILD_MAX && bytes > egress::CHILD_MAX - 2, "{bytes} bytes");
+        assert!(
+            bytes <= egress::CHILD_MAX && bytes > egress::CHILD_MAX - 2,
+            "{bytes} bytes"
+        );
     }
 
     // --- Assess tests ---
 
     #[test]
     fn assess_batches_child_calls() {
-
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
         let cmds: Vec<String> = (0..8).map(|i| format!("cargo task_{i}")).collect();
@@ -649,7 +868,14 @@ mod tests {
             match_mode: MatchMode::Any,
             limit: 50,
         };
-        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
+        let s_hid = execute_search(
+            &store,
+            &search,
+            &mut registry,
+            &Budget::start(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(registry.get(&s_hid).unwrap().count, 8);
 
         // The host batches 4 small items per call: 2 calls.
@@ -691,8 +917,14 @@ mod tests {
 
     #[test]
     fn child_result_rejected_whole_on_any_fault() {
-        let packet = EvidencePacket { packet_id: "pkt_00".into(), items: vec![item(0, "a".into()), item(1, "b".into())] };
-        let (ev0, ev1) = (packet.items[0].evidence_id.clone(), packet.items[1].evidence_id.clone());
+        let packet = EvidencePacket {
+            packet_id: "pkt_00".into(),
+            items: vec![item(0, "a".into()), item(1, "b".into())],
+        };
+        let (ev0, ev1) = (
+            packet.items[0].evidence_id.clone(),
+            packet.items[1].evidence_id.clone(),
+        );
         let good = serde_json::json!({"version": 1, "packet_id": "pkt_00", "assessments": [
             {"item_id": "item_0", "verdict": "supports", "confidence": "high",
              "claims": [{"text": "t", "supports": [ev0], "contradicts": [ev1]}]},
@@ -705,15 +937,31 @@ mod tests {
         };
 
         let verdicts = |r: Result<Vec<Option<ItemAssessmentV1>>, _>| {
-            r.unwrap().into_iter().map(|a| a.map(|a| a.verdict)).collect::<Vec<_>>()
+            r.unwrap()
+                .into_iter()
+                .map(|a| a.map(|a| a.verdict))
+                .collect::<Vec<_>>()
         };
-        assert_eq!(verdicts(with(&|_| {})), [Some(Verdict::Supports), Some(Verdict::Irrelevant)]);
+        assert_eq!(
+            verdicts(with(&|_| {})),
+            [Some(Verdict::Supports), Some(Verdict::Irrelevant)]
+        );
         let omitted = with(&|v| drop(v["assessments"].as_array_mut().unwrap().pop()));
-        assert_eq!(verdicts(omitted), [Some(Verdict::Supports), None], "a skipped item is unassessed");
+        assert_eq!(
+            verdicts(omitted),
+            [Some(Verdict::Supports), None],
+            "a skipped item is unassessed"
+        );
 
         let foreign = item(9, String::new()).evidence_id;
-        assert_eq!(with(&|v| v["packet_id"] = "pkt_01".into()), Err(ChildRejection::PacketId("pkt_01".into())));
-        assert_eq!(with(&|v| v["version"] = 2.into()), Err(ChildRejection::Version(2)));
+        assert_eq!(
+            with(&|v| v["packet_id"] = "pkt_01".into()),
+            Err(ChildRejection::PacketId("pkt_01".into()))
+        );
+        assert_eq!(
+            with(&|v| v["version"] = 2.into()),
+            Err(ChildRejection::Version(2))
+        );
         assert_eq!(
             with(&|v| v["assessments"][1]["item_id"] = "item_9".into()),
             Err(ChildRejection::UnknownItem("item_9".into()))
@@ -725,7 +973,10 @@ mod tests {
         let cited = |field: &'static str| {
             with(&|v| v["assessments"][0]["claims"][0][field] = serde_json::json!([foreign]))
         };
-        let outside = Err(ChildRejection::Citation { item_id: "item_0".into(), evidence_id: foreign.clone() });
+        let outside = Err(ChildRejection::Citation {
+            item_id: "item_0".into(),
+            evidence_id: foreign.clone(),
+        });
         assert_eq!(cited("supports"), outside);
         assert_eq!(cited("contradicts"), outside);
         assert!(matches!(
@@ -734,7 +985,12 @@ mod tests {
         ));
         // A valid result padded past the cap: refused for its size alone.
         let padded = format!("{good}{}", " ".repeat(CHILD_RESULT_MAX));
-        assert_eq!(check_child_result(&packet, &padded), Err(ChildRejection::Oversize { bytes: padded.len() }));
+        assert_eq!(
+            check_child_result(&packet, &padded),
+            Err(ChildRejection::Oversize {
+                bytes: padded.len()
+            })
+        );
     }
 
     #[test]
@@ -742,10 +998,26 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         let rev_id = seed_store(&mut store);
         let cmds: Vec<String> = (0..12).map(|i| format!("cargo task_{i}")).collect();
-        insert_commands(&mut store, rev_id, &cmds.iter().map(String::as_str).collect::<Vec<_>>());
+        insert_commands(
+            &mut store,
+            rev_id,
+            &cmds.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
         let mut registry = HandleRegistry::new(64);
-        let search = SearchV1 { op_id: "s1".into(), terms: vec!["cargo".into()], match_mode: MatchMode::Any, limit: 50 };
-        let s_hid = execute_search(&store, &search, &mut registry, &Budget::start(), &mut Vec::new()).unwrap();
+        let search = SearchV1 {
+            op_id: "s1".into(),
+            terms: vec!["cargo".into()],
+            match_mode: MatchMode::Any,
+            limit: 50,
+        };
+        let s_hid = execute_search(
+            &store,
+            &search,
+            &mut registry,
+            &Budget::start(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         // Packet 1's evidence, which packet 0's child was never sent.
         let other_packet = registry.get_evidence_handles(&s_hid).unwrap()[4].id.clone();
 
@@ -753,13 +1025,20 @@ mod tests {
         let honest = FakeModel::default_supports_handler();
         model.add_child_response(move |p| {
             let mut r = honest(p);
-            r.assessments[0].claims[0].supports.push(other_packet.clone());
+            r.assessments[0].claims[0]
+                .supports
+                .push(other_packet.clone());
             r
         });
         model.add_child_response(FakeModel::default_supports_handler());
         model.add_child_response(FakeModel::default_supports_handler());
 
-        let assess = AssessV1 { op_id: "a1".into(), input: InputRefV1::Handle(s_hid), objective: "o".into(), max_items: 12 };
+        let assess = AssessV1 {
+            op_id: "a1".into(),
+            input: InputRefV1::Handle(s_hid),
+            objective: "o".into(),
+            max_items: 12,
+        };
         let mut notes = Vec::new();
         // The call for packet 1 fails outright, as an HTTP 500 would.
         let mut call = |p: &[EvidencePacket], o: &str| {
@@ -767,12 +1046,35 @@ mod tests {
             replies[1] = Err("HTTP 500".into());
             Ok(replies)
         };
-        let a_hid = execute_assess(&assess, &mut registry, &HashMap::new(), &mut call, &mut notes).unwrap();
+        let a_hid = execute_assess(
+            &assess,
+            &mut registry,
+            &HashMap::new(),
+            &mut call,
+            &mut notes,
+        )
+        .unwrap();
 
-        let verdicts: Vec<_> = registry.get_assessments(&a_hid).unwrap().iter().map(|a| a.as_ref().map(|a| a.verdict.clone())).collect();
-        assert_eq!(verdicts, [vec![None; 8], vec![Some(Verdict::Supports); 4]].concat());
+        let verdicts: Vec<_> = registry
+            .get_assessments(&a_hid)
+            .unwrap()
+            .iter()
+            .map(|a| a.as_ref().map(|a| a.verdict.clone()))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [vec![None; 8], vec![Some(Verdict::Supports); 4]].concat()
+        );
         assert_eq!(notes.len(), 2);
-        assert!(notes[0].contains("pkt_00") && notes[0].contains("not in the packet"), "{}", notes[0]);
-        assert!(notes[1].contains("pkt_01") && notes[1].contains("HTTP 500"), "{}", notes[1]);
+        assert!(
+            notes[0].contains("pkt_00") && notes[0].contains("not in the packet"),
+            "{}",
+            notes[0]
+        );
+        assert!(
+            notes[1].contains("pkt_01") && notes[1].contains("HTTP 500"),
+            "{}",
+            notes[1]
+        );
     }
 }

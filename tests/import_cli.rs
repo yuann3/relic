@@ -32,7 +32,12 @@ fn import_into_a_busy_store_exits_2_with_a_busy_message() {
 
     writer.execute_batch("ROLLBACK").unwrap();
     let out = import();
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -40,7 +45,11 @@ fn three_spellings_of_one_file_are_one_source() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("sub")).unwrap();
     let db = dir.path().join("relic.db");
-    std::fs::write(dir.path().join("h"), ": 1700000000:0;echo one\n: 1700000001:0;echo two\n").unwrap();
+    std::fs::write(
+        dir.path().join("h"),
+        ": 1700000000:0;echo one\n: 1700000001:0;echo two\n",
+    )
+    .unwrap();
 
     let absolute = dir.path().join("h");
     for spelling in ["./h", absolute.to_str().unwrap(), "sub/../h", "h"] {
@@ -50,14 +59,27 @@ fn three_spellings_of_one_file_are_one_source() {
             .arg(&db)
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(0), "{spelling}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{spelling}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     let conn = rusqlite::Connection::open(&db).unwrap();
     let count = |table: &str| -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
     };
-    assert_eq!((count("source"), count("source_revision"), count("observation")), (1, 1, 2));
+    assert_eq!(
+        (
+            count("source"),
+            count("source_revision"),
+            count("observation")
+        ),
+        (1, 1, 2)
+    );
 }
 
 fn import_in(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String) {
@@ -68,25 +90,40 @@ fn import_in(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String) {
         .args(["--db", "data/relic.db"])
         .output()
         .unwrap();
-    (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 #[test]
 fn a_differing_shell_replaces_the_source_and_says_so_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("history"), "#1700000000\necho alpha\n#1700000001\necho beta\n").unwrap();
+    std::fs::write(
+        dir.path().join("history"),
+        "#1700000000\necho alpha\n#1700000001\necho beta\n",
+    )
+    .unwrap();
 
     let (code, stderr) = import_in(dir.path(), &["history", "--shell", "zsh"]);
     assert_eq!(code, Some(0), "{stderr}");
-    assert!(stderr.contains("history: stored 4 zsh commands"), "{stderr}");
+    assert!(
+        stderr.contains("history: stored 4 zsh commands"),
+        "{stderr}"
+    );
 
     let (code, stderr) = import_in(dir.path(), &["history", "--shell", "bash"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
-        stderr.contains("relic: history: was imported as zsh; replaced its 4 stored commands with a bash import"),
+        stderr.contains(
+            "relic: history: was imported as zsh; replaced its 4 stored commands with a bash import"
+        ),
         "{stderr}"
     );
-    assert!(stderr.contains("history: stored 2 bash commands"), "{stderr}");
+    assert!(
+        stderr.contains("history: stored 2 bash commands"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -94,7 +131,9 @@ fn each_import_says_what_it_did_with_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let hist = dir.path().join(".zsh_history");
     let lines = |range: std::ops::Range<u32>| -> String {
-        range.map(|i| format!(": {}:0;echo line-{i}\n", 1_700_000_000 + i)).collect()
+        range
+            .map(|i| format!(": {}:0;echo line-{i}\n", 1_700_000_000 + i))
+            .collect()
     };
     std::fs::write(&hist, lines(0..30)).unwrap();
     let import = || import_in(dir.path(), &[".zsh_history"]).1;
@@ -104,9 +143,14 @@ fn each_import_says_what_it_did_with_the_file() {
     std::fs::write(&hist, lines(0..32)).unwrap();
     assert!(import().contains(".zsh_history: added 2 new commands"));
     std::fs::write(&hist, lines(10..33)).unwrap();
-    assert!(import().contains("the file was rewritten; added 1 new commands and kept the earlier ones"));
+    assert!(
+        import().contains("the file was rewritten; added 1 new commands and kept the earlier ones")
+    );
     std::fs::write(&hist, lines(100..103)).unwrap();
-    assert!(import().contains("stored it whole (3 commands) as a new revision and kept the earlier ones"));
+    assert!(
+        import()
+            .contains("stored it whole (3 commands) as a new revision and kept the earlier ones")
+    );
 }
 
 #[test]
@@ -116,7 +160,10 @@ fn an_import_that_fails_on_the_file_leaves_no_database_behind() {
 
     let (code, stderr) = import_in(dir.path(), &["history"]);
     assert_ne!(code, Some(0));
-    assert!(stderr.contains("history: cannot tell whether this is a zsh or a bash history"), "{stderr}");
+    assert!(
+        stderr.contains("history: cannot tell whether this is a zsh or a bash history"),
+        "{stderr}"
+    );
     assert!(stderr.contains("--shell"), "{stderr}");
 
     let (code, stderr) = import_in(dir.path(), &["missing"]);
@@ -127,8 +174,15 @@ fn an_import_that_fails_on_the_file_leaves_no_database_behind() {
 }
 
 fn relic(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_relic")).current_dir(dir).args(args).output().unwrap();
-    (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 fn on_disk(dir: &std::path::Path, needle: &str) -> bool {
@@ -142,7 +196,11 @@ fn on_disk(dir: &std::path::Path, needle: &str) -> bool {
 fn an_import_rescrubs_what_older_redaction_rules_left_in_the_store() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("data")).unwrap();
-    std::fs::write(dir.path().join(".zsh_history"), ": 1700000000:0;mysql -u root -pOldRulesMissedThis1 shop\n").unwrap();
+    std::fs::write(
+        dir.path().join(".zsh_history"),
+        ": 1700000000:0;mysql -u root -pOldRulesMissedThis1 shop\n",
+    )
+    .unwrap();
     let (code, stderr) = import_in(dir.path(), &[".zsh_history"]);
     assert_eq!(code, Some(0), "{stderr}");
 
@@ -185,33 +243,72 @@ fn an_import_rescrubs_what_older_redaction_rules_left_in_the_store() {
 #[test]
 fn forget_deletes_a_record_for_good_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".zsh_history"), ": 1700000000:0;echo keep\n: 1700000001:0;curl LEAKEDCANARY9\n").unwrap();
+    std::fs::write(
+        dir.path().join(".zsh_history"),
+        ": 1700000000:0;echo keep\n: 1700000001:0;curl LEAKEDCANARY9\n",
+    )
+    .unwrap();
     import_in(dir.path(), &[".zsh_history"]);
     let id: i64 = rusqlite::Connection::open(dir.path().join("data/relic.db"))
         .unwrap()
-        .query_row("SELECT id FROM observation WHERE safe_text LIKE '%LEAKEDCANARY9'", [], |r| r.get(0))
+        .query_row(
+            "SELECT id FROM observation WHERE safe_text LIKE '%LEAKEDCANARY9'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
 
     // Shown exactly as stored, which is what a skill sends an agent to read.
     let show = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_relic")).current_dir(dir.path()).args(args).args(["--db", "data/relic.db"]).output().unwrap();
-        (out.status.code(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+        let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+            .current_dir(dir.path())
+            .args(args)
+            .args(["--db", "data/relic.db"])
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
     };
     let (code, stdout, _) = show(&["show", &format!("#{id}"), "--json"]);
     let page: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!((code, &page["schema"], &page["records"][0]["text"]), (Some(0), &"relic.records/v1".into(), &"curl LEAKEDCANARY9".into()));
+    assert_eq!(
+        (code, &page["schema"], &page["records"][0]["text"]),
+        (
+            Some(0),
+            &"relic.records/v1".into(),
+            &"curl LEAKEDCANARY9".into()
+        )
+    );
 
-    let (code, stderr) = relic(dir.path(), &["forget", &format!("#{id}"), "--db", "data/relic.db"]);
+    let (code, stderr) = relic(
+        dir.path(),
+        &["forget", &format!("#{id}"), "--db", "data/relic.db"],
+    );
     assert_eq!(code, Some(0), "{stderr}");
-    assert!(stderr.contains(&format!("relic: forgot record #{id}")), "{stderr}");
+    assert!(
+        stderr.contains(&format!("relic: forgot record #{id}")),
+        "{stderr}"
+    );
     let (code, stdout, stderr) = show(&["show", &id.to_string()]);
-    assert!(code == Some(1) && stdout.is_empty() && stderr.contains(&format!("no such record: #{id}")), "{stderr}");
+    assert!(
+        code == Some(1) && stdout.is_empty() && stderr.contains(&format!("no such record: #{id}")),
+        "{stderr}"
+    );
     assert!(!on_disk(&dir.path().join("data"), "LEAKEDCANARY9"));
 
     // Forgetting it again is an error that names it; so is an id never seen.
-    let (code, stderr) = relic(dir.path(), &["forget", &id.to_string(), "--db", "data/relic.db"]);
+    let (code, stderr) = relic(
+        dir.path(),
+        &["forget", &id.to_string(), "--db", "data/relic.db"],
+    );
     assert_eq!(code, Some(2), "{stderr}");
-    assert!(stderr.contains(&format!("no such record: #{id}")), "{stderr}");
+    assert!(
+        stderr.contains(&format!("no such record: #{id}")),
+        "{stderr}"
+    );
 
     // An unchanged or appended-to file does not bring it back.
     let (_, stderr) = import_in(dir.path(), &[".zsh_history"]);
@@ -222,13 +319,18 @@ fn forget_deletes_a_record_for_good_and_says_so() {
 #[test]
 fn a_write_open_leaves_relics_own_files_owner_only() {
     use std::os::unix::fs::PermissionsExt;
-    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     let loosen = |path: &std::path::Path, mode| {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
     };
 
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join(".zsh_history"), ": 1700000000:0;echo one\n").unwrap();
+    std::fs::write(
+        home.path().join(".zsh_history"),
+        ": 1700000000:0;echo one\n",
+    )
+    .unwrap();
     let import = || {
         let out = Command::new(env!("CARGO_BIN_EXE_relic"))
             .current_dir(home.path())
@@ -237,23 +339,39 @@ fn a_write_open_leaves_relics_own_files_owner_only() {
             .args(["import", ".zsh_history"])
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     // Created fresh: nothing is readable by anyone else, whatever the umask.
     import();
     let data = home.path().join("share/relic");
     let db = data.join("relic.db");
-    assert_eq!((mode(&data), mode(&db), mode(&data.join("relic.db.key"))), (0o700, 0o600, 0o600));
+    assert_eq!(
+        (mode(&data), mode(&db), mode(&data.join("relic.db.key"))),
+        (0o700, 0o600, 0o600)
+    );
 
     // A store from before the umask rule: everything world-readable, with a
     // reader holding the WAL and shm open so they exist to be fixed.
     let reader = rusqlite::Connection::open(&db).unwrap();
-    reader.query_row("SELECT COUNT(*) FROM observation", [], |r| r.get::<_, i64>(0)).unwrap();
+    reader
+        .query_row("SELECT COUNT(*) FROM observation", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
     loosen(&data, 0o755);
     for name in ["relic.db", "relic.db-wal", "relic.db-shm"] {
         loosen(&data.join(name), 0o644);
     }
-    std::fs::write(home.path().join(".zsh_history"), ": 1700000000:0;echo one\n: 1700000001:0;echo two\n").unwrap();
+    std::fs::write(
+        home.path().join(".zsh_history"),
+        ": 1700000000:0;echo one\n: 1700000001:0;echo two\n",
+    )
+    .unwrap();
     import();
     assert_eq!(mode(&data), 0o700);
     for name in ["relic.db", "relic.db-wal", "relic.db-shm"] {
@@ -263,9 +381,20 @@ fn a_write_open_leaves_relics_own_files_owner_only() {
     // A database somewhere else: its files are tightened, its directory is not.
     let other = tempfile::tempdir().unwrap();
     loosen(other.path(), 0o755);
-    let (code, stderr) = relic(home.path(), &["import", ".zsh_history", "--db", other.path().join("x.db").to_str().unwrap()]);
+    let (code, stderr) = relic(
+        home.path(),
+        &[
+            "import",
+            ".zsh_history",
+            "--db",
+            other.path().join("x.db").to_str().unwrap(),
+        ],
+    );
     assert_eq!(code, Some(0), "{stderr}");
-    assert_eq!((mode(other.path()), mode(&other.path().join("x.db"))), (0o755, 0o600));
+    assert_eq!(
+        (mode(other.path()), mode(&other.path().join("x.db"))),
+        (0o755, 0o600)
+    );
 }
 
 /// `git` in `dir`, with no config but the repository's own.
@@ -276,10 +405,19 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+        .envs([
+            ("GIT_AUTHOR_NAME", "t"),
+            ("GIT_AUTHOR_EMAIL", "t@t"),
+            ("GIT_COMMITTER_NAME", "t"),
+            ("GIT_COMMITTER_EMAIL", "t@t"),
+        ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
@@ -311,7 +449,11 @@ fn a_git_import_never_runs_a_git_left_in_the_current_directory() {
         .arg(dir.path().join("relic.db"))
         .output()
         .unwrap();
-    assert!(!trap.join("ran").exists(), "relic ran ./git: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !trap.join("ran").exists(),
+        "relic ran ./git: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -327,7 +469,12 @@ fn a_repository_whose_own_config_names_a_file_in_home_imports() {
         .arg(dir.path().join("relic.db"))
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -335,26 +482,50 @@ fn a_directory_git_cannot_read_leaves_no_database_and_is_named() {
     let dir = tempfile::tempdir().unwrap();
     let repo = repo_in(dir.path());
     // A branch at an object that is not there: `git log` fails.
-    std::fs::write(repo.join(".git/refs/heads/broken"), format!("{}\n", "1".repeat(40))).unwrap();
+    std::fs::write(
+        repo.join(".git/refs/heads/broken"),
+        format!("{}\n", "1".repeat(40)),
+    )
+    .unwrap();
     let db = dir.path().join("relic.db");
-    let out = Command::new(env!("CARGO_BIN_EXE_relic")).arg("import").arg(&repo).arg("--db").arg(&db).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+        .arg("import")
+        .arg(&repo)
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains(&format!("{}: git log failed", repo.display())), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{}: git log failed", repo.display())),
+        "{stderr}"
+    );
     assert!(!db.exists(), "a database was left behind");
 
     let plain = dir.path().join("plain");
     std::fs::create_dir(&plain).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_relic")).arg("import").arg(&plain).arg("--db").arg(&db).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+        .arg("import")
+        .arg(&plain)
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.code() == Some(2) && stderr.contains("not a git repository"), "{stderr}");
+    assert!(
+        out.status.code() == Some(2) && stderr.contains("not a git repository"),
+        "{stderr}"
+    );
     assert!(!db.exists(), "a database was left behind");
 }
 
 /// One Claude Code record of `version`, with `content` as its message
 /// content.
 fn claude_line(kind: &str, version: &str, content: &str) -> String {
-    format!(r#"{{"type":"{kind}","version":"{version}","timestamp":"2026-11-06T04:11:29.660Z","message":{{"content":{content}}}}}"#) + "\n"
+    format!(
+        r#"{{"type":"{kind}","version":"{version}","timestamp":"2026-11-06T04:11:29.660Z","message":{{"content":{content}}}}}"#
+    ) + "\n"
 }
 
 #[test]
@@ -363,8 +534,16 @@ fn claude_code_sessions_import_by_directory_and_grow_without_duplicates() {
     let project = dir.path().join("config/projects/-work-app");
     let subagents = project.join("s1/subagents");
     std::fs::create_dir_all(&subagents).unwrap();
-    std::fs::copy("tests/fixtures/claude-code/2.1.318.jsonl", project.join("s1.jsonl")).unwrap();
-    let call = claude_line("assistant", "2.1.300", r#"[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git reflog"}}]"#);
+    std::fs::copy(
+        "tests/fixtures/claude-code/2.1.318.jsonl",
+        project.join("s1.jsonl"),
+    )
+    .unwrap();
+    let call = claude_line(
+        "assistant",
+        "2.1.300",
+        r#"[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git reflog"}}]"#,
+    );
     let agent = subagents.join("agent-1.jsonl");
     std::fs::write(&agent, &call).unwrap();
     let import = || {
@@ -374,36 +553,79 @@ fn claude_code_sessions_import_by_directory_and_grow_without_duplicates() {
             .env("CLAUDE_CONFIG_DIR", dir.path().join("config"))
             .output()
             .unwrap();
-        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     };
     let kinds = || -> Vec<(i64, i64)> {
         let conn = rusqlite::Connection::open(dir.path().join("data/relic.db")).unwrap();
-        let mut stmt = conn.prepare("SELECT kind, COUNT(*) FROM observation GROUP BY kind ORDER BY kind").unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+        let mut stmt = conn
+            .prepare("SELECT kind, COUNT(*) FROM observation GROUP BY kind ORDER BY kind")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
     };
 
     let (code, stderr) = import();
     assert_eq!(code, Some(0), "{stderr}");
-    assert!(stderr.ends_with("added 7 records from 2 of 2 sessions; 0 unchanged since last import\n"), "{stderr}");
+    assert!(
+        stderr.ends_with("added 7 records from 2 of 2 sessions; 0 unchanged since last import\n"),
+        "{stderr}"
+    );
     // Commands, outputs and tool calls: the fixture's 2, 2 and 2, and the
     // subagent's call.
     assert_eq!(kinds(), [(7, 3), (8, 2), (9, 2)]);
-    assert!(import().1.ends_with("added 0 records from 0 of 2 sessions; 2 unchanged since last import\n"));
+    assert!(
+        import()
+            .1
+            .ends_with("added 0 records from 0 of 2 sessions; 2 unchanged since last import\n")
+    );
 
     // The call's result arrives after the import that stored the call, then
     // a version this relic does not know, and a call after that.
-    let result = claude_line("user", "2.1.300", r#"[{"type":"tool_result","tool_use_id":"t1","content":"abc123 HEAD@{0}"}]"#);
-    let newer = claude_line("assistant", "2.1.400", r#"[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls"}}]"#);
-    let after = claude_line("assistant", "2.1.300", r#"[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"pwd"}}]"#);
+    let result = claude_line(
+        "user",
+        "2.1.300",
+        r#"[{"type":"tool_result","tool_use_id":"t1","content":"abc123 HEAD@{0}"}]"#,
+    );
+    let newer = claude_line(
+        "assistant",
+        "2.1.400",
+        r#"[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls"}}]"#,
+    );
+    let after = claude_line(
+        "assistant",
+        "2.1.300",
+        r#"[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"pwd"}}]"#,
+    );
     std::fs::write(&agent, [call.as_str(), &result, &newer, &after].concat()).unwrap();
     let (code, stderr) = import();
     assert_eq!(code, Some(0), "{stderr}");
     assert!(stderr.contains("relic: warning: 1 sessions reach Claude Code 2.1.400, which this relic was not checked against (2.1.288 to 2.1.318)"), "{stderr}");
-    assert!(stderr.ends_with("added 1 records from 1 of 2 sessions; 1 unchanged since last import\n"), "{stderr}");
-    assert_eq!(kinds(), [(7, 3), (8, 3), (9, 2)], "the output once, and nothing from 2.1.400 on");
+    assert!(
+        stderr.ends_with("added 1 records from 1 of 2 sessions; 1 unchanged since last import\n"),
+        "{stderr}"
+    );
+    assert_eq!(
+        kinds(),
+        [(7, 3), (8, 3), (9, 2)],
+        "the output once, and nothing from 2.1.400 on"
+    );
 
     // One session alone is known by its content.
-    let out = Command::new(env!("CARGO_BIN_EXE_relic")).arg("import").arg(project.join("s1.jsonl")).args(["--db"]).arg(dir.path().join("one.db")).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_relic"))
+        .arg("import")
+        .arg(project.join("s1.jsonl"))
+        .args(["--db"])
+        .arg(dir.path().join("one.db"))
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success() && stderr.contains("s1.jsonl: stored 6 claude records in "), "{stderr}");
+    assert!(
+        out.status.success() && stderr.contains("s1.jsonl: stored 6 claude records in "),
+        "{stderr}"
+    );
 }

@@ -260,7 +260,10 @@ unsafe fn supervise(
         say(pid);
         let mut st = 0;
         // Polled, so an `fg` request is seen whenever it arrives.
-        let tick = libc::timespec { tv_sec: 0, tv_nsec: 5_000_000 };
+        let tick = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 5_000_000,
+        };
         loop {
             if FG.swap(false, Ordering::SeqCst) {
                 libc::tcsetpgrp(slave, pid);

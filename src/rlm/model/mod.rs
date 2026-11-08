@@ -80,10 +80,15 @@ pub enum ModelError {
     /// Failed before any request byte was sent; nothing can have run.
     BeforeSend(String),
     /// 429: the provider refused the request without running it.
-    RateLimited { retry_after: Option<Duration> },
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
     /// Any other non-2xx status, 5xx and 529 included: it may have run.
     /// `message` is what the endpoint said, cut short and redacted.
-    Status { code: u16, message: Option<String> },
+    Status {
+        code: u16,
+        message: Option<String>,
+    },
     /// Lost after the request went out (disconnect, timeout): it may have run.
     Ambiguous(String),
     /// The response body was over the transport's cap.
@@ -101,7 +106,9 @@ impl ModelError {
     pub fn retry_after(&self, max: Duration) -> Option<Duration> {
         match self {
             Self::BeforeSend(_) => Some(Duration::ZERO),
-            Self::RateLimited { retry_after: Some(d) } if *d <= max => Some(*d),
+            Self::RateLimited {
+                retry_after: Some(d),
+            } if *d <= max => Some(*d),
             _ => None,
         }
     }
@@ -111,10 +118,18 @@ impl std::fmt::Display for ModelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BeforeSend(e) => write!(f, "could not reach the model: {e}"),
-            Self::RateLimited { retry_after: Some(d) } => write!(f, "rate limited; retry after {} s", d.as_secs()),
+            Self::RateLimited {
+                retry_after: Some(d),
+            } => write!(f, "rate limited; retry after {} s", d.as_secs()),
             Self::RateLimited { retry_after: None } => f.write_str("rate limited"),
-            Self::Status { code, message: None } => write!(f, "model endpoint answered HTTP {code}"),
-            Self::Status { code, message: Some(m) } => write!(f, "model endpoint answered HTTP {code}: {m}"),
+            Self::Status {
+                code,
+                message: None,
+            } => write!(f, "model endpoint answered HTTP {code}"),
+            Self::Status {
+                code,
+                message: Some(m),
+            } => write!(f, "model endpoint answered HTTP {code}: {m}"),
             Self::Ambiguous(e) => write!(f, "lost the model call after sending it: {e}"),
             Self::Oversize => f.write_str("model response over the size cap"),
             Self::InvalidResponse(e) => write!(f, "not a chat completion: {e}"),
@@ -149,7 +164,8 @@ pub fn parse_output<T: DeserializeOwned>(raw: &str, max: usize) -> Result<T, Out
     if raw.len() > max {
         return Err(OutputError::Oversize { bytes: raw.len() });
     }
-    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| OutputError::Malformed(e.to_string()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| OutputError::Malformed(e.to_string()))?;
     let value = egress::redact_strings(value, &Redactor::new());
     serde_json::from_value(value).map_err(|e| OutputError::Malformed(e.to_string()))
 }
@@ -173,7 +189,11 @@ impl FakeModel {
     /// Every root state it was shown, in order.
     pub fn root_states(&self) -> Vec<String> {
         let requests = self.requests.lock().unwrap();
-        requests.iter().filter(|r| r.role() == Role::Root).map(|r| r.user().to_string()).collect()
+        requests
+            .iter()
+            .filter(|r| r.role() == Role::Root)
+            .map(|r| r.user().to_string())
+            .collect()
     }
 
     /// Every request it was sent, in order.
@@ -230,7 +250,10 @@ impl FakeModel {
                     verdict: Verdict::Supports,
                     confidence: Confidence::High,
                     claims: vec![ClaimV1 {
-                        text: format!("Evidence found: {}", &item.safe_text[..item.safe_text.len().min(50)]),
+                        text: format!(
+                            "Evidence found: {}",
+                            &item.safe_text[..item.safe_text.len().min(50)]
+                        ),
                         supports: vec![item.evidence_id.clone()],
                         contradicts: vec![],
                     }],
@@ -243,7 +266,10 @@ impl FakeModel {
 
 impl ModelBoundary for FakeModel {
     fn target(&self) -> Target {
-        Target { profile: "fake".into(), origin: "fake:".into() }
+        Target {
+            profile: "fake".into(),
+            origin: "fake:".into(),
+        }
     }
 
     fn call(&self, req: &EgressRequest, _deadline: Instant) -> Result<Reply, ModelError> {
@@ -252,9 +278,12 @@ impl ModelBoundary for FakeModel {
             Role::Root => {
                 let mut responses = self.root_responses.lock().unwrap();
                 if responses.is_empty() {
-                    return Err(ModelError::Refused("no more scripted root responses".into()));
+                    return Err(ModelError::Refused(
+                        "no more scripted root responses".into(),
+                    ));
                 }
-                let state = serde_json::from_str(req.user()).expect("a root request holds the root state");
+                let state =
+                    serde_json::from_str(req.user()).expect("a root request holds the root state");
                 responses.remove(0)(&state)
             }
             Role::Child => {
@@ -262,14 +291,21 @@ impl ModelBoundary for FakeModel {
                 struct Sent {
                     packet: EvidencePacket,
                 }
-                let sent: Sent = serde_json::from_str(req.user()).expect("a child request holds a packet");
+                let sent: Sent =
+                    serde_json::from_str(req.user()).expect("a child request holds a packet");
                 let mut responses = self.child_responses.lock().unwrap();
                 if responses.is_empty() {
-                    return Err(ModelError::Refused("no more scripted child responses".into()));
+                    return Err(ModelError::Refused(
+                        "no more scripted child responses".into(),
+                    ));
                 }
                 responses.remove(0)(&sent.packet)
             }
         };
-        Ok(Reply { body, returned_model: Some("fake".into()), usage: None })
+        Ok(Reply {
+            body,
+            returned_model: Some("fake".into()),
+            usage: None,
+        })
     }
 }

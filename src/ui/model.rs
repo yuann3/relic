@@ -110,11 +110,16 @@ pub enum PickOutcome {
 /// non-streaming, so progress is steps, counters and budget, never tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecallEvent {
-    Started { at: Instant },
+    Started {
+        at: Instant,
+    },
     StepStarted(String),
     /// Ends the newest running step; an empty outcome shows none.
     StepDone(String),
-    Calls { root: u32, child: u32 },
+    Calls {
+        root: u32,
+        child: u32,
+    },
     Finished(Box<RecallReport>),
 }
 
@@ -367,7 +372,10 @@ pub fn update(m: &mut UiModel, action: UiAction) -> Vec<UiEffect> {
             // The double-Ctrl-C window closed: its notice would now lie.
             if m.interrupt_expires().is_some_and(|end| now >= end) {
                 m.last_interrupt = None;
-                if m.notice.as_deref().is_some_and(|n| n.ends_with(INTERRUPT_HINT)) {
+                if m.notice
+                    .as_deref()
+                    .is_some_and(|n| n.ends_with(INTERRUPT_HINT))
+                {
                     m.notice = None;
                     m.dirty = true;
                 }
@@ -651,7 +659,12 @@ fn move_by(m: &mut UiModel, delta: isize) -> Vec<UiEffect> {
         }
         Focus::Recall => {
             let max = m.recall.scroll_max.get();
-            let to = m.recall.scroll.unwrap_or(max).saturating_add_signed(delta as i16).min(max);
+            let to = m
+                .recall
+                .scroll
+                .unwrap_or(max)
+                .saturating_add_signed(delta as i16)
+                .min(max);
             m.recall.scroll = (to < max).then_some(to);
             vec![]
         }
@@ -662,7 +675,12 @@ fn enter(m: &mut UiModel) -> Vec<UiEffect> {
     let id = match m.focus {
         Focus::Query | Focus::Results => m.search.selected_hit().map(|h| h.id),
         Focus::Timeline => m.evidence.shown().map(|o| o.id),
-        Focus::Recall => m.recall.report.as_ref().and_then(|r| r.evidence.first()).map(|e| e.id),
+        Focus::Recall => m
+            .recall
+            .report
+            .as_ref()
+            .and_then(|r| r.evidence.first())
+            .map(|e| e.id),
         Focus::Evidence => return vec![],
     };
     let Some(id) = id else {
@@ -724,7 +742,10 @@ fn start_recall(m: &mut UiModel) -> Vec<UiEffect> {
     };
     m.focus = Focus::Recall;
     m.notice = None;
-    vec![UiEffect::StartRecall { op, question: m.query.clone() }]
+    vec![UiEffect::StartRecall {
+        op,
+        question: m.query.clone(),
+    }]
 }
 
 fn cancel_recall(m: &mut UiModel, op: u64) -> Vec<UiEffect> {
@@ -796,13 +817,24 @@ pub(crate) fn answered(cites: &[i64]) -> RecallReport {
         outcome: RecallOutcome::Answered,
         error: None,
         answer: "with certbot".into(),
-        claims: vec![CitedText { text: "certbot renew ran".into(), supports: cites.to_vec(), contradicts: vec![] }],
+        claims: vec![CitedText {
+            text: "certbot renew ran".into(),
+            supports: cites.to_vec(),
+            contradicts: vec![],
+        }],
         procedure: vec![],
         contradictions: vec![],
         missing: vec![],
         evidence: cites
             .iter()
-            .map(|&id| CitedRecord { id, revision: 1, ordinal: id, source: "zsh", observed_at_ms: None, text: format!("cmd {id}") })
+            .map(|&id| CitedRecord {
+                id,
+                revision: 1,
+                ordinal: id,
+                source: "zsh",
+                observed_at_ms: None,
+                text: format!("cmd {id}"),
+            })
             .collect(),
         root_calls: 2,
         child_calls: 3,
@@ -941,7 +973,12 @@ mod tests {
         let mut m = with_results();
         keys(&mut m, "x"); // "gitx" is now searching; the "git" page is stale
         assert!(update(&mut m, UiAction::Key(Key::Ctrl('f'))).is_empty());
-        assert!(m.notice.as_deref().unwrap_or_default().contains("still searching"));
+        assert!(
+            m.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("still searching")
+        );
         let g = m.search.generation;
         update(&mut m, done(g, page("gitx", &[20])));
         let e = update(&mut m, UiAction::Key(Key::Ctrl('f')));
@@ -957,13 +994,19 @@ mod tests {
         assert_eq!(m.focus, Focus::Evidence);
         let g = m.search.generation;
         let e = update(&mut m, done(g, page("gitx", &[20])));
-        assert!(!e.iter().any(|e| matches!(e, UiEffect::OpenEvidence { .. })), "{e:?}");
+        assert!(
+            !e.iter().any(|e| matches!(e, UiEffect::OpenEvidence { .. })),
+            "{e:?}"
+        );
         // From the query bar the first hit still opens as before.
         m.focus = Focus::Query;
         keys(&mut m, "y");
         let g = m.search.generation;
         let e = update(&mut m, done(g, page("gitxy", &[30])));
-        assert!(matches!(&e[..], [UiEffect::OpenEvidence { id: 30 }]), "{e:?}");
+        assert!(
+            matches!(&e[..], [UiEffect::OpenEvidence { id: 30 }]),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -1010,16 +1053,29 @@ mod tests {
         let too_broad = |m: &mut UiModel| {
             let generation = m.search.generation;
             let result = Err(SearchError::TooBroad);
-            update(m, UiAction::SearchDone { generation, result, elapsed: Duration::from_millis(100) })
+            update(
+                m,
+                UiAction::SearchDone {
+                    generation,
+                    result,
+                    elapsed: Duration::from_millis(100),
+                },
+            )
         };
         let mut m = with_results();
         let shown = m.search.page.as_ref().unwrap().query.clone();
         m.search.selected = 1;
         keys(&mut m, "x");
         assert!(too_broad(&mut m).is_empty());
-        assert_eq!(m.search.page.as_ref().map(|p| p.query.as_str()), Some(shown.as_str()));
+        assert_eq!(
+            m.search.page.as_ref().map(|p| p.query.as_str()),
+            Some(shown.as_str())
+        );
         assert!(m.search.too_broad && !m.search.pending && m.search.error.is_none());
-        assert_eq!(m.search.selected, 1, "the selection on the kept page must not move");
+        assert_eq!(
+            m.search.selected, 1,
+            "the selection on the kept page must not move"
+        );
 
         // The next keystroke's page replaces it and the mark goes.
         keys(&mut m, "y");
@@ -1033,7 +1089,14 @@ mod tests {
         keys(&mut m, "x");
         too_broad(&mut m);
         assert!(m.search.page.is_none() && !m.search.too_broad);
-        assert!(m.search.error.as_deref().is_some_and(|e| e.contains("too broad")), "{:?}", m.search.error);
+        assert!(
+            m.search
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("too broad")),
+            "{:?}",
+            m.search.error
+        );
     }
 
     #[test]
@@ -1246,7 +1309,13 @@ mod tests {
         assert_eq!(m.modal, Some(Modal::ConfirmRecall));
         // Any key but y declines, and is spent on declining: typing "ruby"
         // in a pane never starts a recall.
-        for k in [Key::Esc, Key::Char('n'), Key::Enter, Key::Down, Key::Char('u')] {
+        for k in [
+            Key::Esc,
+            Key::Char('n'),
+            Key::Enter,
+            Key::Down,
+            Key::Char('u'),
+        ] {
             if m.modal.is_none() {
                 update(&mut m, UiAction::Key(Key::Char('r')));
             }
@@ -1258,7 +1327,10 @@ mod tests {
         for c in "ruby".chars() {
             m.focus = Focus::Results;
             let e = update(&mut m, UiAction::Key(Key::Char(c)));
-            assert!(!e.iter().any(|e| matches!(e, UiEffect::StartRecall { .. })), "{c}");
+            assert!(
+                !e.iter().any(|e| matches!(e, UiEffect::StartRecall { .. })),
+                "{c}"
+            );
         }
         assert!(!m.recall.running());
         m.focus = Focus::Results;
@@ -1279,13 +1351,19 @@ mod tests {
         update(&mut m, UiAction::Key(Key::Ctrl('u')));
         update(&mut m, UiAction::Key(Key::Ctrl('r')));
         assert_eq!(m.modal, None);
-        assert_eq!(m.notice.as_deref(), Some("recall answers the query; type a question first"));
+        assert_eq!(
+            m.notice.as_deref(),
+            Some("recall answers the query; type a question first")
+        );
 
         let mut m = with_results();
         m.recall_model = Err("RELIC_MODEL_NAME is required".into());
         update(&mut m, UiAction::Key(Key::Ctrl('r')));
         assert_eq!(m.modal, None);
-        assert_eq!(m.notice.as_deref(), Some("recall needs a model: RELIC_MODEL_NAME is required; see relic --help"));
+        assert_eq!(
+            m.notice.as_deref(),
+            Some("recall needs a model: RELIC_MODEL_NAME is required; see relic --help")
+        );
     }
 
     #[test]
@@ -1315,7 +1393,11 @@ mod tests {
             },
         );
         assert_eq!(m.recall.status, RecallStatus::Finished);
-        assert_eq!(m.recall.steps[1].state, StepState::Done, "the last operation ends with the recall");
+        assert_eq!(
+            m.recall.steps[1].state,
+            StepState::Done,
+            "the last operation ends with the recall"
+        );
         m.focus = Focus::Recall;
         let e = update(&mut m, UiAction::Key(Key::Enter));
         assert!(

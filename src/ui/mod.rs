@@ -53,9 +53,11 @@ pub fn run(db: &Path) -> Result<()> {
     // A dumb terminal (an Emacs shell buffer, a CI log) would get raw escape
     // sequences instead of a workspace.
     if std::env::var_os("TERM").is_none_or(|t| t.is_empty() || t == "dumb") {
-        return Err("ui needs a terminal that can draw full screen, and TERM is dumb or unset; \
+        return Err(
+            "ui needs a terminal that can draw full screen, and TERM is dumb or unset; \
                     use `relic search <words>` instead"
-            .into());
+                .into(),
+        );
     }
     // Evidence loads are single indexed lookups, cheap enough for the main
     // thread; searches get their own connection and thread. Both open before
@@ -77,7 +79,9 @@ pub fn run(db: &Path) -> Result<()> {
     let worker = {
         let (mb, tx) = (Arc::clone(&mailbox), tx.clone());
         let builder = std::thread::Builder::new().name("relic-search".into());
-        crate::signal::spawn(builder, move || search_worker(&worker_store, &mb, &tx, debounce()))?
+        crate::signal::spawn(builder, move || {
+            search_worker(&worker_store, &mb, &tx, debounce())
+        })?
     };
     // Joined once the action channel is closed: a recall blocked on a full
     // queue then gets its error at once, and its log its finish line.
@@ -133,17 +137,24 @@ pub fn run(db: &Path) -> Result<()> {
 /// and stalls 2 s, then fails, on one that does not answer (ADR 0011).
 fn redraw_all<B: Backend>(terminal: &mut Terminal<B>) -> std::result::Result<(), B::Error> {
     let size = terminal.size()?;
-    terminal.resize(ratatui::layout::Rect::from((ratatui::layout::Position::ORIGIN, size)))
+    terminal.resize(ratatui::layout::Rect::from((
+        ratatui::layout::Position::ORIGIN,
+        size,
+    )))
 }
 
 /// Whether the locale says the terminal speaks UTF-8, picking the variable
 /// as setlocale(LC_CTYPE) does: LC_ALL, then LC_CTYPE, then LANG, the first
 /// set and non-empty. None set is the C locale: ASCII.
 fn utf8_locale(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
-    ["LC_ALL", "LC_CTYPE", "LANG"].into_iter().filter_map(var).find(|v| !v.is_empty()).is_some_and(|v| {
-        let v = v.to_string_lossy().to_ascii_lowercase();
-        v.contains("utf-8") || v.contains("utf8")
-    })
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .filter_map(var)
+        .find(|v| !v.is_empty())
+        .is_some_and(|v| {
+            let v = v.to_string_lossy().to_ascii_lowercase();
+            v.contains("utf-8") || v.contains("utf8")
+        })
 }
 
 /// Closes the mailbox and joins the search worker. The receiver goes first:
@@ -223,10 +234,13 @@ where
                 // Wake for the progress meter while a recall runs, and once
                 // when the double-Ctrl-C window closes. Otherwise block until
                 // something happens: no frame timer.
-                let wake = [m.recall.running().then_some(next_tick), m.interrupt_expires()]
-                    .into_iter()
-                    .flatten()
-                    .min();
+                let wake = [
+                    m.recall.running().then_some(next_tick),
+                    m.interrupt_expires(),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
                 let action = match wake {
                     None => match rx.recv() {
                         Ok(a) => a,
@@ -288,7 +302,11 @@ where
 
     /// Performs one effect. Synchronous results come back as actions; the
     /// rest arrive later on the channel. `None` is the effect that quits.
-    fn run_effect(&mut self, effect: UiEffect, guard: &mut TerminalGuard) -> Result<Option<Vec<UiAction>>> {
+    fn run_effect(
+        &mut self,
+        effect: UiEffect,
+        guard: &mut TerminalGuard,
+    ) -> Result<Option<Vec<UiAction>>> {
         Ok(Some(match effect {
             UiEffect::Search { generation, query } => {
                 let issued = Instant::now();
@@ -324,12 +342,22 @@ where
                     old.store(true, Ordering::SeqCst);
                 }
                 // `update` asks only when a model is configured.
-                let Some(model) = self.model.clone() else { return Ok(Some(vec![])) };
+                let Some(model) = self.model.clone() else {
+                    return Ok(Some(vec![]));
+                };
                 let store = Store::open_read_only(&self.db)?;
                 let cancel = Arc::new(AtomicBool::new(false));
                 let log = app::recall_log_path(&self.db);
                 self.recalls.retain(|r| !r.is_finished());
-                self.recalls.push(recall::spawn(op, question, store, model, log, Arc::clone(&cancel), self.tx.clone())?);
+                self.recalls.push(recall::spawn(
+                    op,
+                    question,
+                    store,
+                    model,
+                    log,
+                    Arc::clone(&cancel),
+                    self.tx.clone(),
+                )?);
                 self.recall = Some((op, cancel));
                 vec![]
             }
@@ -537,7 +565,10 @@ mod tests {
         assert!(utf8_locale(env(&[("LC_CTYPE", "C.utf8"), ("LANG", "C")])));
         assert!(!utf8_locale(env(&[])));
         // LC_ALL overrides a UTF-8 LANG; an empty one does not count.
-        assert!(!utf8_locale(env(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")])));
+        assert!(!utf8_locale(env(&[
+            ("LC_ALL", "C"),
+            ("LANG", "en_US.UTF-8")
+        ])));
         assert!(utf8_locale(env(&[("LC_ALL", ""), ("LANG", "en_US.UTF-8")])));
     }
 

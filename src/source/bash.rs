@@ -68,15 +68,24 @@ impl<R: BufRead> Parser<R> {
     fn next_untimed(&mut self) -> io::Result<Option<RawRecord>> {
         loop {
             let start = self.lines.offset;
-            let Some(line) = self.read_line()? else { return Ok(None) };
+            let Some(line) = self.read_line()? else {
+                return Ok(None);
+            };
             if let Some(timestamp) = marker_time(&self.line, &line) {
                 self.marker = Some(Marker { timestamp, start });
                 return self.next_timed();
             }
             let mut lossy = line.lossy();
             let command = decode(std::mem::take(&mut self.line), &mut lossy);
-            let record =
-                RawRecord { kind: ObservationKind::BashCommand, timestamp: None, duration: None, command, start, end: self.lines.offset, lossy };
+            let record = RawRecord {
+                kind: ObservationKind::BashCommand,
+                timestamp: None,
+                duration: None,
+                command,
+                start,
+                end: self.lines.offset,
+                lossy,
+            };
             if !line.terminated {
                 self.incomplete_tail = Some(record);
                 return Ok(None);
@@ -99,7 +108,10 @@ impl<R: BufRead> Parser<R> {
             let mut content_len = 0;
             while let Some(line) = self.read_line()? {
                 if let Some(timestamp) = marker_time(&self.line, &line) {
-                    self.marker = Some(Marker { timestamp, start: end });
+                    self.marker = Some(Marker {
+                        timestamp,
+                        start: end,
+                    });
                     break;
                 }
                 terminated = line.terminated;
@@ -130,8 +142,15 @@ impl<R: BufRead> Parser<R> {
             bytes.truncate(content_len);
             let command = decode(bytes, &mut lossy);
             let blank = command.trim().is_empty();
-            let record =
-                RawRecord { kind: ObservationKind::BashCommand, timestamp: marker.timestamp, duration: None, command, start: marker.start, end, lossy };
+            let record = RawRecord {
+                kind: ObservationKind::BashCommand,
+                timestamp: marker.timestamp,
+                duration: None,
+                command,
+                start: marker.start,
+                end,
+                lossy,
+            };
             // At end of input a marker with no command is still waiting for one.
             if self.marker.is_none() && (blank || !terminated) {
                 self.incomplete_tail = Some(record);
@@ -165,7 +184,8 @@ fn marker_time(bytes: &[u8], line: &Line) -> Option<Option<i64>> {
 
 /// Whether a line, without its line ending, is a `#<digits>` marker.
 pub fn is_marker(line: &[u8]) -> bool {
-    line.strip_prefix(b"#").is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+    line.strip_prefix(b"#")
+        .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
 }
 
 #[cfg(test)]
@@ -176,7 +196,9 @@ mod tests {
 
     fn parse(input: &[u8]) -> Vec<RawRecord> {
         let first = input.split(|b| *b == b'\n').next().unwrap_or_default();
-        Parser::new(input, is_marker(first)).map(Result::unwrap).collect()
+        Parser::new(input, is_marker(first))
+            .map(Result::unwrap)
+            .collect()
     }
 
     fn commands(input: &[u8]) -> Vec<String> {
@@ -229,9 +251,18 @@ mod tests {
         let records = parse(&input);
         assert_eq!(records.len(), 23);
         assert_eq!(records[19].timestamp, None);
-        assert_eq!((records[20].timestamp, records[20].command.as_str()), (Some(1_700_000_000), "if true"));
-        assert_eq!((records[21].timestamp, records[21].command.as_str()), (None, "then ls"));
-        assert_eq!((records[22].timestamp, records[22].command.as_str()), (None, "fi"));
+        assert_eq!(
+            (records[20].timestamp, records[20].command.as_str()),
+            (Some(1_700_000_000), "if true")
+        );
+        assert_eq!(
+            (records[21].timestamp, records[21].command.as_str()),
+            (None, "then ls")
+        );
+        assert_eq!(
+            (records[22].timestamp, records[22].command.as_str()),
+            (None, "fi")
+        );
         assert_eq!(records[22].end, input.len() as u64);
     }
 
@@ -248,7 +279,11 @@ mod tests {
     #[test]
     fn nothing_is_yielded_after_the_source_fails_even_if_it_recovers() {
         let input = b"#1700000000\nfirst\n#1700000001\nsecond record\n#1700000002\nthird\n";
-        let source = FailsOnce { before: &input[..36], after: &input[36..], failed: false };
+        let source = FailsOnce {
+            before: &input[..36],
+            after: &input[36..],
+            failed: false,
+        };
         let mut parser = Parser::new(BufReader::with_capacity(4, source), true);
         assert_eq!(parser.next().unwrap().unwrap().command, "first");
         assert!(parser.next().unwrap().is_err());
@@ -275,9 +310,18 @@ mod tests {
 
     #[test]
     fn a_record_without_its_newline_is_withheld() {
-        for (input, stable_len) in [(&b"#1700000000\ndone\n#1700000001\ncargo bui"[..], 17), (b"done\ncargo bui", 5)] {
+        for (input, stable_len) in [
+            (&b"#1700000000\ndone\n#1700000001\ncargo bui"[..], 17),
+            (b"done\ncargo bui", 5),
+        ] {
             let mut parser = Parser::new(input, true);
-            assert_eq!(parser.by_ref().map(|r| r.unwrap().command).collect::<Vec<_>>(), ["done"]);
+            assert_eq!(
+                parser
+                    .by_ref()
+                    .map(|r| r.unwrap().command)
+                    .collect::<Vec<_>>(),
+                ["done"]
+            );
             assert_eq!(parser.stable_len(), stable_len);
             assert_eq!(parser.incomplete_tail().unwrap().command, "cargo bui");
         }
@@ -288,7 +332,10 @@ mod tests {
         let mut parser = Parser::new(&b"#1700000000\ndone\n#1700000001\n"[..], true);
         assert_eq!(parser.by_ref().count(), 1);
         assert_eq!(parser.stable_len(), 17);
-        assert_eq!(parser.incomplete_tail().unwrap().timestamp, Some(1_700_000_001));
+        assert_eq!(
+            parser.incomplete_tail().unwrap().timestamp,
+            Some(1_700_000_001)
+        );
     }
 
     #[test]
@@ -302,7 +349,10 @@ mod tests {
 
     #[test]
     fn whitespace_only_commands_are_dropped() {
-        assert_eq!(commands(b"ls\n   \n#1700000000\n \t\n#1700000001\npwd\n"), ["ls", "pwd"]);
+        assert_eq!(
+            commands(b"ls\n   \n#1700000000\n \t\n#1700000001\npwd\n"),
+            ["ls", "pwd"]
+        );
     }
 
     #[test]
@@ -323,7 +373,10 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records[0].lossy);
         assert_eq!(records[0].command.len(), RECORD_CAP);
-        assert_eq!(records[0].end, input.len() as u64 - "#1700000001\nnext\n".len() as u64);
+        assert_eq!(
+            records[0].end,
+            input.len() as u64 - "#1700000001\nnext\n".len() as u64
+        );
         assert_eq!(records[1].timestamp, Some(1_700_000_001));
         assert_eq!(records[1].command, "next");
         assert!(!records[1].lossy);

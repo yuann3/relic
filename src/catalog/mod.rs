@@ -43,9 +43,17 @@ impl std::fmt::Display for CatalogError {
             Self::Io(e) => write!(f, "skill catalog: {e}"),
             Self::Report(why) => write!(f, "not a recall report Relic can use: {why}"),
             Self::Compile(e) => e.fmt(f),
-            Self::Unconfirmed => f.write_str("no verifier has passed for this report; run relic validate first"),
-            Self::NotOurs(p) => write!(f, "{} exists and is not a skill Relic activated; leaving it alone", p.display()),
-            Self::NothingToRollBack(p) => write!(f, "{}: no activation left to roll back", p.display()),
+            Self::Unconfirmed => {
+                f.write_str("no verifier has passed for this report; run relic validate first")
+            }
+            Self::NotOurs(p) => write!(
+                f,
+                "{} exists and is not a skill Relic activated; leaving it alone",
+                p.display()
+            ),
+            Self::NothingToRollBack(p) => {
+                write!(f, "{}: no activation left to roll back", p.display())
+            }
             Self::NoSuchSkill(name) => write!(f, "no compiled skill named {name}"),
             Self::Stranded(e, links) => {
                 let links: Vec<String> = links.iter().map(|l| l.display().to_string()).collect();
@@ -93,12 +101,20 @@ pub struct ReportStep {
 /// A report that holds a procedure, and the digest a validation is filed
 /// under: edit the report and it needs validating again.
 pub fn read_report(bytes: &[u8]) -> Result<(Report, String), CatalogError> {
-    let report: Report = serde_json::from_slice(bytes).map_err(|e| CatalogError::Report(e.to_string()))?;
+    let report: Report =
+        serde_json::from_slice(bytes).map_err(|e| CatalogError::Report(e.to_string()))?;
     if report.schema != crate::app::RECALL_SCHEMA {
-        return Err(CatalogError::Report(format!("schema {}, not {}", report.schema, crate::app::RECALL_SCHEMA)));
+        return Err(CatalogError::Report(format!(
+            "schema {}, not {}",
+            report.schema,
+            crate::app::RECALL_SCHEMA
+        )));
     }
     if !matches!(report.outcome.as_str(), "answered" | "partial") || report.procedure.is_empty() {
-        return Err(CatalogError::Report(format!("it {} with no procedure", report.outcome)));
+        return Err(CatalogError::Report(format!(
+            "it {} with no procedure",
+            report.outcome
+        )));
     }
     Ok((report, blake3::hash(bytes).to_hex().to_string()))
 }
@@ -162,7 +178,9 @@ CREATE TABLE IF NOT EXISTS activation (
 ";
 
 fn now_ms() -> i64 {
-    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
 }
 
@@ -191,8 +209,20 @@ fn rename_with(from: &Path, to: &Path, flags: libc::c_uint) -> io::Result<()> {
     let done = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), flags) };
     // SAFETY: as above; AT_FDCWD resolves them like rename(2).
     #[cfg(not(target_vendor = "apple"))]
-    let done = unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), flags) };
-    if done == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    let done = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            flags,
+        )
+    };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Create `dir` and its missing parents, each synced into its parent: a
@@ -212,7 +242,11 @@ fn make_dirs(dir: &Path, mode: Option<u32>) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(mode))?;
     }
-    sync_dir(if parent.as_os_str().is_empty() { Path::new(".") } else { parent })
+    sync_dir(if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    })
 }
 
 impl Catalog {
@@ -240,7 +274,11 @@ impl Catalog {
         Self::open(dir).map(Some)
     }
 
-    pub fn add_validation(&self, report_digest: &str, r: &ValidationRecord) -> Result<i64, CatalogError> {
+    pub fn add_validation(
+        &self,
+        report_digest: &str,
+        r: &ValidationRecord,
+    ) -> Result<i64, CatalogError> {
         let record = serde_json::to_string(r).map_err(|e| CatalogError::Report(e.to_string()))?;
         self.conn.execute(
             "INSERT INTO validation (report_digest, record, confirmed, at_ms) VALUES (?1, ?2, ?3, ?4)",
@@ -264,9 +302,16 @@ impl Catalog {
     /// Compile a validated report into a bundle, install it, and record it.
     /// Step prose comes from the report, checked for what agents rewrite or
     /// run; every recorded command comes from the store, never the report.
-    pub fn compile(&self, store: &Store, report: &[u8], name: &str, description: &str) -> Result<Bundle, CatalogError> {
+    pub fn compile(
+        &self,
+        store: &Store,
+        report: &[u8],
+        name: &str,
+        description: &str,
+    ) -> Result<Bundle, CatalogError> {
         let (report, digest) = read_report(report)?;
-        let (validation_id, confirmed_at) = self.confirmed(&digest)?.ok_or(CatalogError::Unconfirmed)?;
+        let (validation_id, confirmed_at) =
+            self.confirmed(&digest)?.ok_or(CatalogError::Unconfirmed)?;
         let key = match store.key_path() {
             Some(path) => crate::key::load_or_create(path)?.0,
             None => [0; 32],
@@ -276,8 +321,13 @@ impl Catalog {
         for step in &report.procedure {
             let mut cited = Vec::new();
             for &id in &step.supports {
-                let o = store.get_observation(id)?.ok_or_else(|| CatalogError::Report(format!("record #{id} is gone")))?;
-                cites.push((id, blake3::keyed_hash(&key, o.safe_text.as_bytes()).to_hex()[..32].to_string()));
+                let o = store
+                    .get_observation(id)?
+                    .ok_or_else(|| CatalogError::Report(format!("record #{id} is gone")))?;
+                cites.push((
+                    id,
+                    blake3::keyed_hash(&key, o.safe_text.as_bytes()).to_hex()[..32].to_string(),
+                ));
                 cited.push(o);
             }
             observations.push(cited);
@@ -299,9 +349,11 @@ impl Catalog {
                     .collect(),
             })
             .collect();
-        let md = compile::render(name, description, confirmed_at, &steps).map_err(CatalogError::Compile)?;
+        let md = compile::render(name, description, confirmed_at, &steps)
+            .map_err(CatalogError::Compile)?;
         let bundle = self.install(name, description, &md)?;
-        let cites = serde_json::to_string(&cites).map_err(|e| CatalogError::Report(e.to_string()))?;
+        let cites =
+            serde_json::to_string(&cites).map_err(|e| CatalogError::Report(e.to_string()))?;
         self.record(&bundle, validation_id, &cites)?;
         Ok(bundle)
     }
@@ -321,13 +373,20 @@ impl Catalog {
     /// directory synced, then a rename that never replaces.
     fn install(&self, name: &str, description: &str, md: &str) -> Result<Bundle, CatalogError> {
         let hash = blake3::hash(md.as_bytes()).to_hex().to_string();
-        let bundle = Bundle { hash: hash.clone(), name: name.into(), description: description.into(), path: self.dir.join(&hash).join(name) };
+        let bundle = Bundle {
+            hash: hash.clone(),
+            name: name.into(),
+            description: description.into(),
+            path: self.dir.join(&hash).join(name),
+        };
         if bundle.path.join("SKILL.md").exists() {
             return Ok(bundle);
         }
         let mut nonce = [0u8; 8];
         getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-        let tmp = self.dir.join(format!(".tmp-{}", blake3::hash(&nonce).to_hex()));
+        let tmp = self
+            .dir
+            .join(format!(".tmp-{}", blake3::hash(&nonce).to_hex()));
         fs::create_dir_all(tmp.join(name))?;
         let file = tmp.join(name).join("SKILL.md");
         fs::write(&file, md)?;
@@ -355,7 +414,12 @@ impl Catalog {
             )
             .optional()?;
         let (hash, description) = row.ok_or_else(|| CatalogError::NoSuchSkill(name.into()))?;
-        Ok(Bundle { path: self.dir.join(&hash).join(name), hash, name: name.into(), description })
+        Ok(Bundle {
+            path: self.dir.join(&hash).join(name),
+            hash,
+            name: name.into(),
+            description,
+        })
     }
 
     /// Which bundle `link` points at now, if Relic put it there; an error
@@ -369,7 +433,10 @@ impl Catalog {
             return Err(CatalogError::NotOurs(link.into()));
         }
         let target = fs::read_link(link)?;
-        let hash = target.strip_prefix(&self.dir).ok().and_then(|rest| rest.components().next());
+        let hash = target
+            .strip_prefix(&self.dir)
+            .ok()
+            .and_then(|rest| rest.components().next());
         match hash {
             Some(hash) => Ok(Some(hash.as_os_str().to_string_lossy().into_owned())),
             None => Err(CatalogError::NotOurs(link.into())),
@@ -380,20 +447,34 @@ impl Catalog {
     /// `expected` (None: nothing there). The swap is atomic and the check
     /// comes after it: what came back is put back unless it was `expected`,
     /// so nothing put there since Relic looked is ever replaced.
-    fn point(&self, link: &Path, bundle: Option<&str>, expected: Option<&str>) -> Result<(), CatalogError> {
-        let parent = link.parent().ok_or_else(|| CatalogError::NotOurs(link.into()))?;
-        let name = link.file_name().ok_or_else(|| CatalogError::NotOurs(link.into()))?;
+    fn point(
+        &self,
+        link: &Path,
+        bundle: Option<&str>,
+        expected: Option<&str>,
+    ) -> Result<(), CatalogError> {
+        let parent = link
+            .parent()
+            .ok_or_else(|| CatalogError::NotOurs(link.into()))?;
+        let name = link
+            .file_name()
+            .ok_or_else(|| CatalogError::NotOurs(link.into()))?;
         // Dot-named, so no harness takes a leftover for a skill, and random,
         // so no other activation or file shares it.
         let mut nonce = [0u8; 8];
         getrandom::fill(&mut nonce).map_err(io::Error::other)?;
         let mut tmp = std::ffi::OsString::from(".");
         tmp.push(name);
-        tmp.push(format!(".relic-swap-{}", &blake3::hash(&nonce).to_hex()[..16]));
+        tmp.push(format!(
+            ".relic-swap-{}",
+            &blake3::hash(&nonce).to_hex()[..16]
+        ));
         let tmp = parent.join(tmp);
         let was_expected = |p: &Path| self.current(p).ok().flatten().as_deref() == expected;
         let not_ours = |e: io::Error| match e.kind() {
-            io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound => CatalogError::NotOurs(link.into()),
+            io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound => {
+                CatalogError::NotOurs(link.into())
+            }
             _ => e.into(),
         };
         match bundle {
@@ -402,7 +483,11 @@ impl Catalog {
                 let mode = crate::validation::original_umask().map(|mask| 0o777 & !u32::from(mask));
                 make_dirs(parent, mode)?;
                 std::os::unix::fs::symlink(self.dir.join(hash).join(name), &tmp)?;
-                let swapped = if expected.is_some() { rename_with(&tmp, link, SWAP) } else { rename_with(&tmp, link, EXCL) };
+                let swapped = if expected.is_some() {
+                    rename_with(&tmp, link, SWAP)
+                } else {
+                    rename_with(&tmp, link, EXCL)
+                };
                 if let Err(e) = swapped {
                     let _ = fs::remove_file(&tmp);
                     return Err(not_ours(e));
@@ -435,13 +520,21 @@ impl Catalog {
     /// Put links back where they were after a failure part-way: each
     /// `(link, was, is)` from `is` to `was`. The error then also names any
     /// that could not be.
-    fn put_back(&self, swapped: &[(&PathBuf, Option<String>, Option<String>)], error: CatalogError) -> CatalogError {
+    fn put_back(
+        &self,
+        swapped: &[(&PathBuf, Option<String>, Option<String>)],
+        error: CatalogError,
+    ) -> CatalogError {
         let stranded: Vec<PathBuf> = swapped
             .iter()
             .filter(|(link, was, is)| self.point(link, was.as_deref(), is.as_deref()).is_err())
             .map(|(link, _, _)| (*link).clone())
             .collect();
-        if stranded.is_empty() { error } else { CatalogError::Stranded(Box::new(error), stranded) }
+        if stranded.is_empty() {
+            error
+        } else {
+            CatalogError::Stranded(Box::new(error), stranded)
+        }
     }
 
     /// Point every link at `bundle`, or none of them: links are checked first,
@@ -482,7 +575,8 @@ impl Catalog {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let (undoes, previous) = last.ok_or_else(|| CatalogError::NothingToRollBack(link.clone()))?;
+            let (undoes, previous) =
+                last.ok_or_else(|| CatalogError::NothingToRollBack(link.clone()))?;
             // Refuses a link someone replaced since.
             let now = self.current(link)?;
             back.push((link, undoes, now, previous));
@@ -494,15 +588,20 @@ impl Catalog {
                 params![link.as_os_str().as_bytes(), previous, now, undoes, now_ms()],
             )?;
         }
-        let was: Vec<(&PathBuf, Option<String>, Option<String>)> =
-            back.iter().map(|(link, _, now, previous)| (*link, now.clone(), previous.clone())).collect();
+        let was: Vec<(&PathBuf, Option<String>, Option<String>)> = back
+            .iter()
+            .map(|(link, _, now, previous)| (*link, now.clone(), previous.clone()))
+            .collect();
         for (i, (link, _, now, previous)) in back.iter().enumerate() {
             if let Err(e) = self.point(link, previous.as_deref(), now.as_deref()) {
                 return Err(self.put_back(&was[..i], e));
             }
         }
         tx.commit().map_err(|e| self.put_back(&was, e.into()))?;
-        Ok(back.into_iter().map(|(_, _, _, previous)| previous).collect())
+        Ok(back
+            .into_iter()
+            .map(|(_, _, _, previous)| previous)
+            .collect())
     }
 
     /// Each link Relic made that still points where Relic last put it: the
@@ -515,8 +614,14 @@ impl Catalog {
         )?;
         let rows = stmt.query_map([], |r| {
             let link: Vec<u8> = r.get(3)?;
-            let cites: Vec<(i64, String)> = serde_json::from_str(&r.get::<_, String>(4)?)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+            let cites: Vec<(i64, String)> =
+                serde_json::from_str(&r.get::<_, String>(4)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             let mut ids: Vec<i64> = Vec::new();
             for (id, _) in cites {
                 if !ids.contains(&id) {
@@ -532,7 +637,10 @@ impl Catalog {
             })
         })?;
         let all: Vec<ActiveSkill> = rows.collect::<Result<_, _>>()?;
-        Ok(all.into_iter().filter(|s| self.current(&s.link).ok().flatten().as_deref() == Some(s.bundle.as_str())).collect())
+        Ok(all
+            .into_iter()
+            .filter(|s| self.current(&s.link).ok().flatten().as_deref() == Some(s.bundle.as_str()))
+            .collect())
     }
 }
 
@@ -545,7 +653,10 @@ pub fn visible(mut skills: Vec<ActiveSkill>, home: Option<&Path>, here: &Path) -
     skills.retain(|s| base(s).is_some_and(|b| Some(b.as_path()) == home || here.starts_with(&b)));
     skills.sort_by_key(|s| {
         let b = base(s);
-        std::cmp::Reverse((b.as_deref() != home, b.map_or(0, |b| b.components().count())))
+        std::cmp::Reverse((
+            b.as_deref() != home,
+            b.map_or(0, |b| b.components().count()),
+        ))
     });
     let mut seen = std::collections::HashSet::new();
     skills.retain(|s| seen.insert(s.name.clone()));
@@ -554,12 +665,77 @@ pub fn visible(mut skills: Vec<ActiveSkill>, home: Option<&Path>, here: &Path) -
 
 /// Words that say nothing about which skill a question needs.
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "from", "that", "this", "how", "did", "does", "what", "when", "where", "can", "could",
-    "would", "should", "get", "got", "use", "using", "into", "out", "was", "were", "are", "you", "your", "our", "its",
-    "has", "have", "had", "not", "but", "all", "any", "some", "one", "back", "again", "after", "before", "then", "now",
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "how",
+    "did",
+    "does",
+    "what",
+    "when",
+    "where",
+    "can",
+    "could",
+    "would",
+    "should",
+    "get",
+    "got",
+    "use",
+    "using",
+    "into",
+    "out",
+    "was",
+    "were",
+    "are",
+    "you",
+    "your",
+    "our",
+    "its",
+    "has",
+    "have",
+    "had",
+    "not",
+    "but",
+    "all",
+    "any",
+    "some",
+    "one",
+    "back",
+    "again",
+    "after",
+    "before",
+    "then",
+    "now",
     // What is left of a contraction, and words any question could hold.
-    "won", "don", "didn", "doesn", "isn", "wasn", "aren", "why", "work", "works", "worked", "working", "thing",
-    "things", "stuff", "way", "need", "want", "make", "just", "like", "mistake", "something", "anything", "help",
+    "won",
+    "don",
+    "didn",
+    "doesn",
+    "isn",
+    "wasn",
+    "aren",
+    "why",
+    "work",
+    "works",
+    "worked",
+    "working",
+    "thing",
+    "things",
+    "stuff",
+    "way",
+    "need",
+    "want",
+    "make",
+    "just",
+    "like",
+    "mistake",
+    "something",
+    "anything",
+    "help",
 ];
 
 fn terms(text: &str) -> std::collections::BTreeSet<String> {
@@ -577,11 +753,22 @@ pub fn select<'a>(question: &str, skills: &'a [ActiveSkill]) -> Option<&'a Activ
     let asked = terms(question);
     let mut scored: Vec<(usize, &ActiveSkill)> = skills
         .iter()
-        .map(|s| (terms(&format!("{} {}", s.name.replace('-', " "), s.description)).intersection(&asked).count(), s))
+        .map(|s| {
+            (
+                terms(&format!("{} {}", s.name.replace('-', " "), s.description))
+                    .intersection(&asked)
+                    .count(),
+                s,
+            )
+        })
         .collect();
     scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
     match scored.as_slice() {
-        [(best, skill), rest @ ..] if *best >= 2 && rest.first().is_none_or(|(next, _)| next < best) => Some(skill),
+        [(best, skill), rest @ ..]
+            if *best >= 2 && rest.first().is_none_or(|(next, _)| next < best) =>
+        {
+            Some(skill)
+        }
         _ => None,
     }
 }
@@ -591,16 +778,37 @@ mod tests {
     use super::*;
 
     fn skill(name: &str, description: &str) -> ActiveSkill {
-        ActiveSkill { name: name.into(), description: description.into(), bundle: name.into(), link: PathBuf::new(), cites: vec![] }
+        ActiveSkill {
+            name: name.into(),
+            description: description.into(),
+            bundle: name.into(),
+            link: PathBuf::new(),
+            cites: vec![],
+        }
     }
 
     #[test]
     fn the_host_step_picks_the_one_skill_a_question_names_and_otherwise_none() {
-        let reflog = skill("git-reflog-recovery", "Recover lost Git work, such as commits, branches or stashes, from the reflog");
-        let certs = skill("certbot-renewal", "Renew a TLS certificate with certbot and reload nginx");
+        let reflog = skill(
+            "git-reflog-recovery",
+            "Recover lost Git work, such as commits, branches or stashes, from the reflog",
+        );
+        let certs = skill(
+            "certbot-renewal",
+            "Renew a TLS certificate with certbot and reload nginx",
+        );
         let skills = [certs.clone(), reflog.clone()];
-        assert_eq!(select("I dropped a git stash by mistake; how do I recover it?", &skills), Some(&reflog));
-        assert_eq!(select("how did I renew the nginx certificate?", &skills), Some(&certs));
+        assert_eq!(
+            select(
+                "I dropped a git stash by mistake; how do I recover it?",
+                &skills
+            ),
+            Some(&reflog)
+        );
+        assert_eq!(
+            select("how did I renew the nginx certificate?", &skills),
+            Some(&certs)
+        );
         // One shared word is not enough, and a tie names no skill.
         assert_eq!(select("what is git?", &skills), None);
         assert_eq!(select("why won't git work in my repo?", &skills), None);
@@ -641,26 +849,48 @@ mod tests {
         assert_eq!(read(&link), "one");
         catalog.activate(&two, std::slice::from_ref(&link)).unwrap();
         assert_eq!(read(&link), "two");
-        assert_eq!(catalog.active().unwrap().iter().map(|s| s.bundle.as_str()).collect::<Vec<_>>(), [two.hash.as_str()]);
+        assert_eq!(
+            catalog
+                .active()
+                .unwrap()
+                .iter()
+                .map(|s| s.bundle.as_str())
+                .collect::<Vec<_>>(),
+            [two.hash.as_str()]
+        );
         // Nothing but the link itself is left in the skills directory.
         assert_eq!(fs::read_dir(&skills).unwrap().count(), 1);
 
-        assert_eq!(catalog.rollback(std::slice::from_ref(&link)).unwrap(), [Some(one.hash.clone())]);
+        assert_eq!(
+            catalog.rollback(std::slice::from_ref(&link)).unwrap(),
+            [Some(one.hash.clone())]
+        );
         assert_eq!(read(&link), "one");
         // Removed by hand: no agent can load it, and rolling back past the
         // first activation, to no link at all, still works.
         fs::remove_file(&link).unwrap();
         assert!(catalog.active().unwrap().is_empty());
-        assert_eq!(catalog.rollback(std::slice::from_ref(&link)).unwrap(), [None]);
-        assert!(fs::symlink_metadata(&link).is_err(), "rolled back to before the first activation");
-        assert!(matches!(catalog.rollback(std::slice::from_ref(&link)), Err(CatalogError::NothingToRollBack(_))));
+        assert_eq!(
+            catalog.rollback(std::slice::from_ref(&link)).unwrap(),
+            [None]
+        );
+        assert!(
+            fs::symlink_metadata(&link).is_err(),
+            "rolled back to before the first activation"
+        );
+        assert!(matches!(
+            catalog.rollback(std::slice::from_ref(&link)),
+            Err(CatalogError::NothingToRollBack(_))
+        ));
 
         // A skill the user made themselves is never replaced, and an all-or-
         // nothing activation touches no other link.
         let theirs = skills.join("theirs");
         fs::create_dir_all(&theirs).unwrap();
         let mine = dir.path().join("home/.claude/skills/git-reflog-recovery");
-        let err = catalog.activate(&one, &[mine.clone(), theirs.clone()]).unwrap_err();
+        let err = catalog
+            .activate(&one, &[mine.clone(), theirs.clone()])
+            .unwrap_err();
         assert!(matches!(err, CatalogError::NotOurs(p) if p == theirs));
         assert!(fs::symlink_metadata(&mine).is_err());
 
@@ -669,29 +899,63 @@ mod tests {
         catalog.activate(&one, std::slice::from_ref(&link)).unwrap();
         let dangling = dir.path().join("dangling");
         std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
-        assert!(catalog.activate(&two, &[link.clone(), dangling.join("git-reflog-recovery")]).is_err());
+        assert!(
+            catalog
+                .activate(&two, &[link.clone(), dangling.join("git-reflog-recovery")])
+                .is_err()
+        );
         assert_eq!(read(&link), "one");
-        assert_eq!(catalog.active().unwrap().iter().map(|s| s.bundle.as_str()).collect::<Vec<_>>(), [one.hash.as_str()]);
+        assert_eq!(
+            catalog
+                .active()
+                .unwrap()
+                .iter()
+                .map(|s| s.bundle.as_str())
+                .collect::<Vec<_>>(),
+            [one.hash.as_str()]
+        );
 
         // Whatever replaced a link after Relic looked survives the swap,
         // which checks what it took out and puts it back.
-        catalog.point(&link, Some(&two.hash), Some(&one.hash)).unwrap();
-        assert!(matches!(catalog.point(&link, Some(&one.hash), Some(&one.hash)), Err(CatalogError::NotOurs(_))));
+        catalog
+            .point(&link, Some(&two.hash), Some(&one.hash))
+            .unwrap();
+        assert!(matches!(
+            catalog.point(&link, Some(&one.hash), Some(&one.hash)),
+            Err(CatalogError::NotOurs(_))
+        ));
         assert_eq!(read(&link), "two");
         fs::remove_file(&link).unwrap();
         fs::create_dir(&link).unwrap();
         fs::write(link.join("SKILL.md"), "theirs").unwrap();
-        for (bundle, expected) in [(Some(&one.hash), Some(&two.hash)), (Some(&one.hash), None), (None, Some(&two.hash))] {
-            let err = catalog.point(&link, bundle.map(String::as_str), expected.map(String::as_str)).unwrap_err();
+        for (bundle, expected) in [
+            (Some(&one.hash), Some(&two.hash)),
+            (Some(&one.hash), None),
+            (None, Some(&two.hash)),
+        ] {
+            let err = catalog
+                .point(
+                    &link,
+                    bundle.map(String::as_str),
+                    expected.map(String::as_str),
+                )
+                .unwrap_err();
             assert!(matches!(err, CatalogError::NotOurs(_)), "{err}");
             assert_eq!(read(&link), "theirs");
         }
-        assert_eq!(fs::read_dir(&skills).unwrap().count(), 2, "only the link and `theirs`: no swap file left");
+        assert_eq!(
+            fs::read_dir(&skills).unwrap().count(),
+            2,
+            "only the link and `theirs`: no swap file left"
+        );
     }
 
     #[test]
     fn an_agent_sees_its_users_skills_and_its_projects_with_the_nearer_one_shadowing() {
-        let at = |name: &str, base: &str| ActiveSkill { link: PathBuf::from(format!("{base}/.agents/skills/{name}")), ..skill(name, base) };
+        let at = |name: &str, base: &str| ActiveSkill {
+            link: PathBuf::from(format!("{base}/.agents/skills/{name}")),
+            ..skill(name, base)
+        };
         let skills = vec![
             at("git-x", "/home/u"),
             at("git-x", "/work"),
@@ -700,12 +964,29 @@ mod tests {
             at("deploy", "/elsewhere"),
             at("lint", "/work/app/sub"),
         ];
-        let seen = visible(skills.clone(), Some(Path::new("/home/u")), Path::new("/work/app"));
-        let seen: Vec<(&str, &str)> = seen.iter().map(|s| (s.name.as_str(), s.description.as_str())).collect();
+        let seen = visible(
+            skills.clone(),
+            Some(Path::new("/home/u")),
+            Path::new("/work/app"),
+        );
+        let seen: Vec<(&str, &str)> = seen
+            .iter()
+            .map(|s| (s.name.as_str(), s.description.as_str()))
+            .collect();
         assert_eq!(seen.len(), 2, "{seen:?}");
-        assert!(seen.contains(&("git-x", "/work/app")) && seen.contains(&("certs", "/home/u")), "{seen:?}");
+        assert!(
+            seen.contains(&("git-x", "/work/app")) && seen.contains(&("certs", "/home/u")),
+            "{seen:?}"
+        );
         // Outside every project, only the user's own.
-        let seen = visible(skills, Some(Path::new("/home/u")), Path::new("/home/u/notes"));
-        assert!(seen.iter().all(|s| s.description == "/home/u") && seen.len() == 2, "{seen:?}");
+        let seen = visible(
+            skills,
+            Some(Path::new("/home/u")),
+            Path::new("/home/u/notes"),
+        );
+        assert!(
+            seen.iter().all(|s| s.description == "/home/u") && seen.len() == 2,
+            "{seen:?}"
+        );
     }
 }

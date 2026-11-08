@@ -33,7 +33,11 @@ pub fn load_or_create(path: &Path) -> io::Result<(InstallationKey, bool)> {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
     file.write_all(&key)?;
     Ok((key, true))
 }
@@ -51,7 +55,10 @@ mod tests {
         let (key, created) = load_or_create(&path).unwrap();
         assert!(created);
         assert_ne!(key, InstallationKey::default());
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(load_or_create(&path).unwrap(), (key, false));
     }
 
@@ -65,7 +72,10 @@ mod tests {
         let (key, created) = load_or_create(&path).unwrap();
         assert!(created);
         assert_eq!(fs::read(&path).unwrap(), key);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -75,7 +85,10 @@ mod tests {
         let (key, _) = load_or_create(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
 
-        assert_eq!(load_or_create(&path).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            load_or_create(&path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(load_or_create(&path).unwrap(), (key, false));
     }

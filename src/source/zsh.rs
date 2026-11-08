@@ -21,7 +21,11 @@ pub struct Parser<R> {
 
 impl<R: BufRead> Parser<R> {
     pub fn new(reader: R) -> Self {
-        Self { lines: Lines::new(reader, true), stable_len: 0, incomplete_tail: None }
+        Self {
+            lines: Lines::new(reader, true),
+            stable_len: 0,
+            incomplete_tail: None,
+        }
     }
 
     /// Byte end of the last complete record read so far, stored or not.
@@ -101,10 +105,24 @@ impl<R: BufRead> Iterator for Parser<R> {
 fn record(bytes: Vec<u8>, start: u64, end: u64, mut lossy: bool) -> RawRecord {
     let line = decode(bytes, &mut lossy);
     match split_extended(&line) {
-        Some((timestamp, duration, command)) => {
-            RawRecord { kind: ObservationKind::ZshCommand, timestamp, duration, command: command.to_string(), start, end, lossy }
-        }
-        None => RawRecord { kind: ObservationKind::ZshCommand, timestamp: None, duration: None, command: line, start, end, lossy },
+        Some((timestamp, duration, command)) => RawRecord {
+            kind: ObservationKind::ZshCommand,
+            timestamp,
+            duration,
+            command: command.to_string(),
+            start,
+            end,
+            lossy,
+        },
+        None => RawRecord {
+            kind: ObservationKind::ZshCommand,
+            timestamp: None,
+            duration: None,
+            command: line,
+            start,
+            end,
+            lossy,
+        },
     }
 }
 
@@ -161,7 +179,10 @@ mod tests {
 
     #[test]
     fn parse_backslash_newline_continuation() {
-        assert_eq!(commands(b": 1700000000:0;echo hello \\\nworld\n"), ["echo hello \nworld"]);
+        assert_eq!(
+            commands(b": 1700000000:0;echo hello \\\nworld\n"),
+            ["echo hello \nworld"]
+        );
     }
 
     #[test]
@@ -205,7 +226,11 @@ mod tests {
     #[test]
     fn nothing_is_yielded_after_the_source_fails_even_if_it_recovers() {
         let input = b"first\nsecond record\nthird\n";
-        let source = FailsOnce { before: &input[..12], after: &input[12..], failed: false };
+        let source = FailsOnce {
+            before: &input[..12],
+            after: &input[12..],
+            failed: false,
+        };
         let mut parser = Parser::new(BufReader::with_capacity(4, source));
         assert_eq!(parser.next().unwrap().unwrap().command, "first");
         assert!(parser.next().unwrap().is_err());
@@ -218,8 +243,16 @@ mod tests {
     fn the_space_zsh_pads_a_final_backslash_with_is_dropped() {
         // Only the one space zsh added, whatever precedes the backslash.
         assert_eq!(
-            commands(b": 1700000000:0;echo a\\ \necho b\\   \necho c\\\\ \necho d  \necho e\\ x \n"),
-            ["echo a\\", "echo b\\  ", "echo c\\\\", "echo d  ", "echo e\\ x "]
+            commands(
+                b": 1700000000:0;echo a\\ \necho b\\   \necho c\\\\ \necho d  \necho e\\ x \n"
+            ),
+            [
+                "echo a\\",
+                "echo b\\  ",
+                "echo c\\\\",
+                "echo d  ",
+                "echo e\\ x "
+            ]
         );
     }
 
@@ -234,13 +267,22 @@ mod tests {
     #[test]
     fn a_metafied_backslash_or_cr_is_handled_after_decoding() {
         // Meta 0x7C is `\`, Meta 0x2D is CR.
-        assert_eq!(commands(b"echo a\x83\x7C\nb\x83\x2D\nnext\n"), ["echo a\nb", "next"]);
+        assert_eq!(
+            commands(b"echo a\x83\x7C\nb\x83\x2D\nnext\n"),
+            ["echo a\nb", "next"]
+        );
     }
 
     #[test]
     fn meta_at_eof_warns_and_marks_the_withheld_record_lossy() {
         let mut parser = Parser::new(&b"echo ok\necho \x83"[..]);
-        assert_eq!(parser.by_ref().map(|r| r.unwrap().command).collect::<Vec<_>>(), ["echo ok"]);
+        assert_eq!(
+            parser
+                .by_ref()
+                .map(|r| r.unwrap().command)
+                .collect::<Vec<_>>(),
+            ["echo ok"]
+        );
         assert_eq!(parser.dangling_meta(), 1);
         let tail = parser.incomplete_tail().unwrap();
         assert_eq!(tail.command, "echo ");
@@ -304,7 +346,13 @@ mod tests {
     #[test]
     fn whitespace_only_commands_are_dropped_but_advance_the_boundary() {
         let mut parser = Parser::new(&b"ls\n\n: 1700000000:0;  \t\n   \n"[..]);
-        assert_eq!(parser.by_ref().map(|r| r.unwrap().command).collect::<Vec<_>>(), ["ls"]);
+        assert_eq!(
+            parser
+                .by_ref()
+                .map(|r| r.unwrap().command)
+                .collect::<Vec<_>>(),
+            ["ls"]
+        );
         assert_eq!(parser.stable_len(), 27);
         assert!(parser.incomplete_tail().is_none());
     }
@@ -327,7 +375,10 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records[0].lossy);
         assert_eq!(records[0].timestamp, Some(1_700_000_000));
-        assert_eq!(records[0].command.len(), RECORD_CAP - b": 1700000000:0;".len());
+        assert_eq!(
+            records[0].command.len(),
+            RECORD_CAP - b": 1700000000:0;".len()
+        );
         assert!(records[0].command.bytes().all(|b| b == b'a'));
         assert_eq!(records[0].end, end_of_first);
         assert_eq!(records[1].command, "next");

@@ -24,7 +24,13 @@ pub fn is_store(conn: &Connection, path: &Path) -> Result<bool, StoreError> {
                 (SELECT COUNT(*) FROM sqlite_master WHERE name = 'observation_fts')
          FROM pragma_user_version",
         [],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
     );
     let not_relic = || StoreError::NotRelic(path.to_path_buf());
     match read {
@@ -33,7 +39,10 @@ pub fn is_store(conn: &Connection, path: &Path) -> Result<bool, StoreError> {
         Ok((_, 0, _)) => Ok(false),
         Ok((_, _, 0)) | Ok((0, _, _)) => Err(not_relic()),
         Ok((v, _, _)) if v == i64::from(SCHEMA_VERSION) => Ok(true),
-        Ok((found, _, _)) => Err(StoreError::Version { path: path.to_path_buf(), found }),
+        Ok((found, _, _)) => Err(StoreError::Version {
+            path: path.to_path_buf(),
+            found,
+        }),
     }
 }
 

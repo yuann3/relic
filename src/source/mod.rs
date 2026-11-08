@@ -92,7 +92,13 @@ struct Lines<R> {
 
 impl<R: BufRead> Lines<R> {
     fn new(reader: R, unmetafy: bool) -> Self {
-        Self { reader, offset: 0, unmetafy, dangling_meta: 0, failed: false }
+        Self {
+            reader,
+            offset: 0,
+            unmetafy,
+            dangling_meta: 0,
+            failed: false,
+        }
     }
 
     /// Append the next line's content to `out`. `None` at end of input, and
@@ -102,7 +108,12 @@ impl<R: BufRead> Lines<R> {
             return Ok(None);
         }
         let begin = self.offset;
-        let mut line = Line { terminated: false, cut: false, dangling_meta: false, last: None };
+        let mut line = Line {
+            terminated: false,
+            cut: false,
+            dangling_meta: false,
+            last: None,
+        };
         let mut meta = false;
         // A CR is content unless the newline follows it.
         let mut held_cr = false;

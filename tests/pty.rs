@@ -128,7 +128,12 @@ mod tui {
         s.signal(libc::SIGTERM);
         s.signal(libc::SIGCONT);
         let status = s.wait_exit();
-        assert_eq!(status.signal(), Some(libc::SIGTERM), "{}", pty_support::describe(status));
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "{}",
+            pty_support::describe(status)
+        );
         s.assert_restored();
     }
 
@@ -139,7 +144,12 @@ mod tui {
         let _s = serial();
         let fx = Fixture::new();
         let script = "trap '' TSTP; exec \"$0\" ui --db \"$1\"";
-        let args = ["-c".as_ref(), script.as_ref(), RELIC.as_ref(), fx.db.as_os_str()];
+        let args = [
+            "-c".as_ref(),
+            script.as_ref(),
+            RELIC.as_ref(),
+            fx.db.as_os_str(),
+        ];
         let mut s = Session::spawn_program("/bin/sh".as_ref(), &args, &[]);
         s.wait_ready();
         s.send(b"\x1a");
@@ -158,7 +168,11 @@ mod tui {
         s.assert_exit_code(2);
         s.assert_restored();
         s.with(|o| {
-            assert!(o.contains("TERM is dumb or unset"), "{}", pty_support::dump(o));
+            assert!(
+                o.contains("TERM is dumb or unset"),
+                "{}",
+                pty_support::dump(o)
+            );
             assert_eq!(o.count(ENTER_ALT), 0);
         });
     }
@@ -178,7 +192,9 @@ mod tui {
         s.send(b"\x03");
         s.wait_screen("press Ctrl-C again within 1 s to quit");
         // The notice goes when the window closes, with no key pressed.
-        s.wait_for("the notice to expire", |o| !o.screen.text().contains("Ctrl-C again"));
+        s.wait_for("the notice to expire", |o| {
+            !o.screen.text().contains("Ctrl-C again")
+        });
         // Past the 1 s window a second press is a first press again.
         s.assert_alive_for(Duration::from_millis(300));
         s.send(b"\x03");
@@ -267,7 +283,11 @@ mod tui {
         s.resize(24, 80);
         s.signal(libc::SIGWINCH);
         s.wait_for("the workspace back at 80 columns", |o| {
-            o.screen.text().lines().next().is_some_and(|top| top.chars().count() == 80)
+            o.screen
+                .text()
+                .lines()
+                .next()
+                .is_some_and(|top| top.chars().count() == 80)
         });
         s.with(|o| assert!(!o.screen.text().contains("> x"), "{}", pty_support::dump(o)));
         quits_cleanly(s, b"q");
@@ -357,7 +377,12 @@ mod tui {
             let mut s = ready(&fx, &[]);
             s.signal(sig);
             let status = s.wait_exit();
-            assert_eq!(status.signal(), Some(sig), "{}", pty_support::describe(status));
+            assert_eq!(
+                status.signal(),
+                Some(sig),
+                "{}",
+                pty_support::describe(status)
+            );
             s.assert_restored();
         }
     }
@@ -371,15 +396,25 @@ mod tui {
         IFS= read -r line < /dev/tty";
 
     fn signal_while_fzf_runs(mut s: Session, fzf: &FakeFzf) {
-        s.wait_for("the fake fzf to wait on /dev/tty", |o| o.contains("FAKE-FZF-READY"));
+        s.wait_for("the fake fzf to wait on /dev/tty", |o| {
+            o.contains("FAKE-FZF-READY")
+        });
         s.signal(libc::SIGTERM);
         let status = s.wait_exit();
-        assert_eq!(status.signal(), Some(libc::SIGTERM), "{}", pty_support::describe(status));
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "{}",
+            pty_support::describe(status)
+        );
         s.assert_restored();
         let pids = String::from_utf8(fzf.read("pids")).unwrap();
         for p in pids.lines() {
             let p: libc::pid_t = p.parse().unwrap();
-            assert!(wait_gone(p, Duration::from_secs(1)), "fake fzf pid {p} outlived relic");
+            assert!(
+                wait_gone(p, Duration::from_secs(1)),
+                "fake fzf pid {p} outlived relic"
+            );
         }
     }
 
@@ -401,7 +436,10 @@ mod tui {
         let fzf = FakeFzf::new(STUBBORN_PICKER);
         let path = path_with(fzf.dir.path());
         let args = ["search", "fixture", "--fzf", "--db"].map(OsStr::new);
-        let s = Session::spawn_args(&[&args[..], &[fx.db.as_os_str()]].concat(), &[("PATH", &path)]);
+        let s = Session::spawn_args(
+            &[&args[..], &[fx.db.as_os_str()]].concat(),
+            &[("PATH", &path)],
+        );
         signal_while_fzf_runs(s, &fzf);
     }
 
@@ -415,11 +453,21 @@ mod tui {
         let path = path_with(fzf.dir.path());
         let out = fzf.dir.path().join("stdout");
         let script = "exec \"$0\" search fixture --fzf --db \"$1\" > \"$2\"";
-        let args = ["-c".as_ref(), script.as_ref(), RELIC.as_ref(), fx.db.as_os_str(), out.as_os_str()];
+        let args = [
+            "-c".as_ref(),
+            script.as_ref(),
+            RELIC.as_ref(),
+            fx.db.as_os_str(),
+            out.as_os_str(),
+        ];
         let s = Session::spawn_program("/bin/sh".as_ref(), &args, &[("PATH", &path)]);
         signal_while_fzf_runs(s, &fzf);
         let written = std::fs::read(&out).unwrap();
-        assert!(written.is_empty(), "{:?}", String::from_utf8_lossy(&written));
+        assert!(
+            written.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&written)
+        );
     }
 
     /// A signal the user's shell left ignored (`nohup`, `trap '' TERM`)
@@ -429,7 +477,12 @@ mod tui {
         let _s = serial();
         let fx = Fixture::new();
         let script = "trap '' TERM; exec \"$0\" ui --db \"$1\"";
-        let args = ["-c".as_ref(), script.as_ref(), RELIC.as_ref(), fx.db.as_os_str()];
+        let args = [
+            "-c".as_ref(),
+            script.as_ref(),
+            RELIC.as_ref(),
+            fx.db.as_os_str(),
+        ];
         let mut s = Session::spawn_program("/bin/sh".as_ref(), &args, &[]);
         s.wait_ready();
         s.signal(libc::SIGTERM);
@@ -656,7 +709,10 @@ mod tui {
             let fzf = FakeFzf::new(body);
             let path = path_with(fzf.dir.path());
             let args = ["search", "fixture", "--fzf", "--db"].map(OsStr::new);
-            let mut s = Session::spawn_args(&[&args[..], &[fx.db.as_os_str()]].concat(), &[("PATH", &path)]);
+            let mut s = Session::spawn_args(
+                &[&args[..], &[fx.db.as_os_str()]].concat(),
+                &[("PATH", &path)],
+            );
             s.assert_exit_code(code);
             fzf.assert_reaped();
         }

@@ -154,7 +154,9 @@ impl History {
     pub fn open(path: &Path) -> Result<Self, ImportError> {
         // An OS error alone does not say which file it was about.
         let named = |e: ImportError| match e {
-            ImportError::Io(e) => ImportError::Io(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+            ImportError::Io(e) => {
+                ImportError::Io(io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+            }
             e => e,
         };
         let resolved = resolve(path).map_err(named)?;
@@ -166,7 +168,12 @@ impl History {
         if !metadata.is_file() {
             return Err(ImportError::NotRegularFile(path.to_path_buf()));
         }
-        Ok(Self { path: path.to_path_buf(), resolved, file, stat: stat_hint(&metadata) })
+        Ok(Self {
+            path: path.to_path_buf(),
+            resolved,
+            file,
+            stat: stat_hint(&metadata),
+        })
     }
 
     /// The source the file gives away: a `.jsonl` file of JSON records is a
@@ -176,7 +183,12 @@ impl History {
     /// down an untimed history says nothing about who wrote the file.
     pub fn detected(&self) -> io::Result<Option<SourceKind>> {
         let first = first_line(&self.file)?;
-        let name = self.resolved.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        let name = self
+            .resolved
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
         Ok(if source::hook::looks_like(&first) {
             Some(SourceKind::Hook)
         } else if name.ends_with(".jsonl") && source::claude::looks_like(&first) {
@@ -201,7 +213,10 @@ fn first_line(file: &fs::File) -> io::Result<Vec<u8>> {
     let mut head = vec![0; 64];
     let read = file.read_at(&mut head, 0)?;
     head.truncate(read);
-    let end = head.iter().position(|b| matches!(b, b'\n' | b'\r')).unwrap_or(head.len());
+    let end = head
+        .iter()
+        .position(|b| matches!(b, b'\n' | b'\r'))
+        .unwrap_or(head.len());
     head.truncate(end);
     Ok(head)
 }
@@ -256,14 +271,25 @@ pub fn import(
     };
     let newest = source.newest().cloned();
     if newest.as_ref().is_some_and(|r| r.cursor.stat == stat) {
-        return Ok(ImportResult { replaced, rescrubbed, scrub_blocked: !scrubbed, ..ImportResult::unchanged(kind) });
+        return Ok(ImportResult {
+            replaced,
+            rescrubbed,
+            scrub_blocked: !scrubbed,
+            ..ImportResult::unchanged(kind)
+        });
     }
 
     // Under the write lock, so two first imports cannot each write a key.
-    let (key, key_warning) = match key_path.as_deref().map(|path| (path, key::load_or_create(path))) {
+    let (key, key_warning) = match key_path
+        .as_deref()
+        .map(|path| (path, key::load_or_create(path)))
+    {
         None => (None, None),
         Some((path, Ok((key, created)))) => {
-            let lost = created && newest.as_ref().is_some_and(|r| r.cursor.boundary_guard.is_some());
+            let lost = created
+                && newest
+                    .as_ref()
+                    .is_some_and(|r| r.cursor.boundary_guard.is_some());
             let warning = lost.then(|| {
                 format!("installation key {} was missing or unreadable; wrote a new one and aligned this import by content", path.display())
             });
@@ -271,16 +297,21 @@ pub fn import(
         }
         Some((path, Err(e))) => (
             None,
-            Some(format!("installation key {}: {e}; every import aligns by content until it can be written", path.display())),
+            Some(format!(
+                "installation key {}: {e}; every import aligns by content until it can be written",
+                path.display()
+            )),
         ),
     };
 
     let mut aligned = 0;
     let (mut revision, from, outcome) = match &newest {
         None => (source.new_revision(kind)?, 0, Outcome::First),
-        Some(newest) if prefix_intact(file, key.as_ref(), &newest.cursor, stat.size)? => {
-            (source.append(kind)?, newest.cursor.stable_len as u64, Outcome::Appended)
-        }
+        Some(newest) if prefix_intact(file, key.as_ref(), &newest.cursor, stat.size)? => (
+            source.append(kind)?,
+            newest.cursor.stable_len as u64,
+            Outcome::Appended,
+        ),
         Some(_) => {
             let anchor: Vec<RecordKey> = source
                 .anchor(ANCHOR_RECORDS)?
@@ -296,8 +327,9 @@ pub fn import(
         }
     };
 
-    let (stored, scan) =
-        scan(file, from, kind, |records| store_records(&mut revision, records, redactor))?;
+    let (stored, scan) = scan(file, from, kind, |records| {
+        store_records(&mut revision, records, redactor)
+    })?;
     // The hint was taken before reading. If the file changed under the read,
     // the offsets this import decided on may have pointed into other bytes
     // by the time it parsed from them. Dropping the revision stores nothing.
@@ -308,7 +340,11 @@ pub fn import(
         Some(key) => Some(boundary_guard(file, key, scan.stable_len).map_err(ImportError::Io)?),
         None => None,
     };
-    let cursor = Cursor { stat, stable_len: scan.stable_len as i64, boundary_guard };
+    let cursor = Cursor {
+        stat,
+        stable_len: scan.stable_len as i64,
+        boundary_guard,
+    };
     let revision_id = revision.revision_id();
     revision.commit(&cursor, stored.provenance)?;
     Ok(ImportResult {
@@ -347,8 +383,15 @@ pub struct GitImportResult {
 /// opened, storing only what the store does not hold yet. Nothing is ever
 /// removed: a branch deleted or a reflog expired in Git stays evidence
 /// here, which is what recovering it needs.
-pub fn import_git(store: &mut Store, repo: source::git::Repository, redactor: &Redactor) -> Result<GitImportResult, ImportError> {
-    let source::git::Repository { git_dir, records: raw } = repo;
+pub fn import_git(
+    store: &mut Store,
+    repo: source::git::Repository,
+    redactor: &Redactor,
+) -> Result<GitImportResult, ImportError> {
+    let source::git::Repository {
+        git_dir,
+        records: raw,
+    } = repo;
     let (rescrubbed, scrubbed) = store.rescrub(REDACTION_REVISION, |safe| redactor.redact(safe))?;
     let source = store.lock_source(git_dir.as_os_str().as_bytes())?;
     if let Some(kind) = source.stored_kind().filter(|k| *k != SourceKind::Git) {
@@ -359,12 +402,21 @@ pub fn import_git(store: &mut Store, repo: source::git::Repository, redactor: &R
     }
     // A ref's time is when it was seen, so it matches by text alone. Counted,
     // not a set: one second can hold the same reflog entry twice.
-    let key = |kind: ObservationKind, at: Option<i64>, text: String| (kind, at.filter(|_| kind == ObservationKind::GitReflog), text);
+    let key = |kind: ObservationKind, at: Option<i64>, text: String| {
+        (
+            kind,
+            at.filter(|_| kind == ObservationKind::GitReflog),
+            text,
+        )
+    };
     let mut known: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
     for (kind, at, text) in source.records()? {
         *known.entry(key(kind, at, text)).or_default() += 1;
     }
-    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
     let mut fresh = Vec::new();
     for r in raw {
         let kind = match r.kind {
@@ -376,12 +428,21 @@ pub fn import_git(store: &mut Store, repo: source::git::Repository, redactor: &R
             source::git::RecordKind::Ref => Some(now_ms),
         };
         let safe_text = redactor.import(&r.text);
-        if let Some(n) = known.get_mut(&key(kind, observed_at_ms, safe_text.clone())).filter(|n| **n > 0) {
+        if let Some(n) = known
+            .get_mut(&key(kind, observed_at_ms, safe_text.clone()))
+            .filter(|n| **n > 0)
+        {
             *n -= 1;
             continue;
         }
         let flags = if r.lossy { FLAG_LOSSY } else { 0 };
-        fresh.push(Observation { kind, observed_at_ms, safe_text, flags, locator: Vec::new() });
+        fresh.push(Observation {
+            kind,
+            observed_at_ms,
+            safe_text,
+            flags,
+            locator: Vec::new(),
+        });
     }
     let count = |kind| fresh.iter().filter(|o| o.kind == kind).count();
     let mut result = GitImportResult {
@@ -396,13 +457,20 @@ pub fn import_git(store: &mut Store, repo: source::git::Repository, redactor: &R
     if fresh.is_empty() {
         return Ok(result);
     }
-    result.outcome = if source.newest().is_some() { Outcome::Appended } else { Outcome::First };
+    result.outcome = if source.newest().is_some() {
+        Outcome::Appended
+    } else {
+        Outcome::First
+    };
     let mut revision = source.append(SourceKind::Git)?;
     for o in &fresh {
         revision.insert(o)?;
     }
     // No cursor: Git is asked again on every import, never stat-skipped.
-    revision.commit(&Cursor::default(), Provenance::COMMAND.with(Provenance::OBSERVED_AT))?;
+    revision.commit(
+        &Cursor::default(),
+        Provenance::COMMAND.with(Provenance::OBSERVED_AT),
+    )?;
     result.checkpoint_blocked = checkpoint_blocked(store, fresh.len())?;
     Ok(result)
 }
@@ -429,8 +497,13 @@ fn scan<T>(
     // A Claude Code result names only the call it answers, and a bash hook
     // frame is new only against the frame before it, either of which may
     // sit before `from`: their parsers read from the start and skip to it.
-    let read_from = if matches!(kind, SourceKind::Claude | SourceKind::Hook) { 0 } else { from };
-    file.seek(SeekFrom::Start(read_from)).map_err(ImportError::Io)?;
+    let read_from = if matches!(kind, SourceKind::Claude | SourceKind::Hook) {
+        0
+    } else {
+        from
+    };
+    file.seek(SeekFrom::Start(read_from))
+        .map_err(ImportError::Io)?;
     let reader = BufReader::new(file);
     let absolute = |raw: io::Result<RawRecord>| {
         raw.map(|mut raw| {
@@ -444,18 +517,31 @@ fn scan<T>(
         SourceKind::Zsh => {
             let mut parser = source::zsh::Parser::new(reader);
             let out = run(&mut parser.by_ref().map(absolute))?;
-            (out, parser.stable_len(), parser.dangling_meta(), parser.incomplete_tail().is_some())
+            (
+                out,
+                parser.stable_len(),
+                parser.dangling_meta(),
+                parser.incomplete_tail().is_some(),
+            )
         }
         SourceKind::Bash => {
             let multiline = source::bash::is_marker(&first_line(file).map_err(ImportError::Io)?);
             let mut parser = source::bash::Parser::new(reader, multiline);
             let out = run(&mut parser.by_ref().map(absolute))?;
-            (out, parser.stable_len(), 0, parser.incomplete_tail().is_some())
+            (
+                out,
+                parser.stable_len(),
+                0,
+                parser.incomplete_tail().is_some(),
+            )
         }
         SourceKind::Claude => {
             let mut parser = source::claude::Parser::resume(reader, from);
             let out = run(&mut parser.by_ref().map(absolute))?;
-            (unreadable, unsupported) = (parser.unreadable(), parser.unsupported().map(str::to_string));
+            (unreadable, unsupported) = (
+                parser.unreadable(),
+                parser.unsupported().map(str::to_string),
+            );
             (out, parser.stable_len(), 0, parser.incomplete_tail())
         }
         SourceKind::Hook => {
@@ -466,7 +552,16 @@ fn scan<T>(
         }
         SourceKind::Git => return Err(ImportError::GitAsHistory),
     };
-    Ok((out, Scan { stable_len: read_from + stable_len, dangling_meta, incomplete_tail, unreadable, unsupported }))
+    Ok((
+        out,
+        Scan {
+            stable_len: read_from + stable_len,
+            dangling_meta,
+            incomplete_tail,
+            unreadable,
+            unsupported,
+        },
+    ))
 }
 
 /// Keyed hash of the bytes just before `stable_len`.
@@ -488,7 +583,10 @@ fn prefix_intact(
 ) -> Result<bool, ImportError> {
     match (key, cursor.boundary_guard) {
         (Some(key), Some(guard)) if (0..=size).contains(&cursor.stable_len) => {
-            Ok(boundary_guard(file, key, cursor.stable_len as u64).map_err(ImportError::Io)? == guard)
+            Ok(
+                boundary_guard(file, key, cursor.stable_len as u64).map_err(ImportError::Io)?
+                    == guard,
+            )
         }
         _ => Ok(false),
     }
@@ -539,9 +637,13 @@ fn align(
             if window.len() == width {
                 window.pop_front();
             }
-            window.push_back(record_key(observation.observed_at_ms, &observation.safe_text));
+            window.push_back(record_key(
+                observation.observed_at_ms,
+                &observation.safe_text,
+            ));
             let mut later = anchor.iter();
-            let candidate = window.len() == width && window.iter().all(|key| later.any(|a| a == key));
+            let candidate =
+                window.len() == width && window.iter().all(|key| later.any(|a| a == key));
             if candidate {
                 runs += usize::from(!in_run);
                 boundary = raw.end;
@@ -560,12 +662,16 @@ fn align(
 /// followed link would then change identity (ADR 0002).
 pub fn resolve(path: &Path) -> Result<PathBuf, ImportError> {
     // No name to keep: `/`, or a path ending in `..`.
-    let name = path.file_name().ok_or_else(|| ImportError::NotRegularFile(path.to_path_buf()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| ImportError::NotRegularFile(path.to_path_buf()))?;
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    Ok(fs::canonicalize(parent).map_err(ImportError::Io)?.join(name))
+    Ok(fs::canonicalize(parent)
+        .map_err(ImportError::Io)?
+        .join(name))
 }
 
 fn open_no_follow(resolved: &Path) -> Result<fs::File, ImportError> {
@@ -575,7 +681,10 @@ fn open_no_follow(resolved: &Path) -> Result<fs::File, ImportError> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(resolved)
         .map_err(|e| match fs::read_link(resolved) {
-            Ok(target) => ImportError::FinalSymlink { path: resolved.to_path_buf(), target },
+            Ok(target) => ImportError::FinalSymlink {
+                path: resolved.to_path_buf(),
+                target,
+            },
             Err(_) => ImportError::Io(e),
         })
 }
@@ -605,7 +714,11 @@ fn store_records(
     records: impl Iterator<Item = io::Result<RawRecord>>,
     redactor: &Redactor,
 ) -> Result<Stored, ImportError> {
-    let mut stored = Stored { count: 0, lossy: 0, provenance: Provenance::COMMAND };
+    let mut stored = Stored {
+        count: 0,
+        lossy: 0,
+        provenance: Provenance::COMMAND,
+    };
     for raw in records {
         let observation = raw_to_observation(&raw.map_err(ImportError::Io)?, redactor);
         if observation.observed_at_ms.is_some() {
@@ -624,7 +737,9 @@ fn store_records(
 /// import that succeeded.
 fn checkpoint_blocked(store: &Store, stored: usize) -> Result<bool, ImportError> {
     Ok(stored >= CHECKPOINT_MIN_RECORDS
-        && !store.checkpoint().map_err(|e| ImportError::Store(StoreError::Sqlite(e)))?)
+        && !store
+            .checkpoint()
+            .map_err(|e| ImportError::Store(StoreError::Sqlite(e)))?)
 }
 
 fn raw_to_observation(raw: &RawRecord, redactor: &Redactor) -> Observation {
@@ -644,7 +759,10 @@ pub enum ImportError {
     /// A directory, device, FIFO or socket: refused before any read.
     NotRegularFile(PathBuf),
     /// The path's last component is a symlink, which is never followed.
-    FinalSymlink { path: PathBuf, target: PathBuf },
+    FinalSymlink {
+        path: PathBuf,
+        target: PathBuf,
+    },
     /// Neither `--shell`, an earlier import, the content nor the name says
     /// which shell wrote the file.
     UnknownShell(PathBuf),
@@ -671,7 +789,9 @@ impl std::fmt::Display for ImportError {
         match self {
             Self::Io(e) => write!(f, "{e}"),
             Self::NotRegularFile(path) => write!(f, "{}: not a regular file", path.display()),
-            Self::GitAsHistory => f.write_str("a Git repository is imported by its directory, not read as a history file"),
+            Self::GitAsHistory => f.write_str(
+                "a Git repository is imported by its directory, not read as a history file",
+            ),
             Self::FinalSymlink { path, target } => write!(
                 f,
                 "{}: is a symlink to {}; relic does not follow it, import the target instead",
@@ -684,7 +804,11 @@ impl std::fmt::Display for ImportError {
                 path.display()
             ),
             Self::ChangedDuringImport(path) => {
-                write!(f, "{}: changed while it was being imported; nothing was stored, try again", path.display())
+                write!(
+                    f,
+                    "{}: changed while it was being imported; nothing was stored, try again",
+                    path.display()
+                )
             }
             Self::Busy => write!(f, "{}", StoreError::Busy),
             Self::Store(e) => write!(f, "store error: {e}"),
@@ -737,11 +861,7 @@ mod tests {
         let history_path = dir.path().join("bash_history");
         {
             let mut f = fs::File::create(&history_path).unwrap();
-            write!(
-                f,
-                "#1700000000\ncargo build\n#1700000005\ngit status\n"
-            )
-            .unwrap();
+            write!(f, "#1700000000\ncargo build\n#1700000005\ngit status\n").unwrap();
         }
 
         let mut store = Store::open_memory().unwrap();
@@ -809,7 +929,10 @@ mod tests {
 
         // Second import of the same unchanged file — should skip.
         let r2 = import_file(&mut store, &history_path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!((r2.outcome, r2.records_stored, r2.records_parsed), (Outcome::Unchanged, 0, 0));
+        assert_eq!(
+            (r2.outcome, r2.records_stored, r2.records_parsed),
+            (Outcome::Unchanged, 0, 0)
+        );
 
         // Observations should still be 2, not doubled.
         assert_eq!(store.observation_count().unwrap(), 2);
@@ -829,18 +952,28 @@ mod tests {
 
         append(&history_path, &zsh_history(1..2));
         let r2 = import_file(&mut store, &history_path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!((r2.outcome, r2.records_stored, r2.records_parsed), (Outcome::Aligned, 1, 3));
+        assert_eq!(
+            (r2.outcome, r2.records_stored, r2.records_parsed),
+            (Outcome::Aligned, 1, 3)
+        );
         assert_eq!(r2.revision_id, r1.revision_id);
         assert_eq!(texts(&store), ["echo needle 0", "echo needle 1"]);
     }
 
     /// Extended-format zsh history: one `echo needle <i>` per `i`.
     fn zsh_history(range: std::ops::Range<usize>) -> String {
-        range.map(|i| format!(": {}:0;echo needle {i}\n", 1_700_000_000 + i)).collect()
+        range
+            .map(|i| format!(": {}:0;echo needle {i}\n", 1_700_000_000 + i))
+            .collect()
     }
 
     fn append(path: &Path, content: &str) {
-        fs::OpenOptions::new().append(true).open(path).unwrap().write_all(content.as_bytes()).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
     }
 
     /// Replace a history the way zsh saves one: a new file renamed over it.
@@ -871,23 +1004,38 @@ mod tests {
         let redactor = Redactor::new();
 
         let first = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!((first.outcome, first.records_parsed), (Outcome::First, 3000));
+        assert_eq!(
+            (first.outcome, first.records_parsed),
+            (Outcome::First, 3000)
+        );
 
         append(&path, &zsh_history(3000..3100));
         let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!((r.outcome, r.records_parsed, r.records_stored), (Outcome::Appended, 100, 100));
+        assert_eq!(
+            (r.outcome, r.records_parsed, r.records_stored),
+            (Outcome::Appended, 100, 100)
+        );
         assert_eq!(r.revision_id, first.revision_id);
         assert_eq!(visible(&db), [1, 1, 3100, 3100, 3100]);
         let appended = store.get_observation(3001).unwrap().unwrap();
-        assert_eq!((appended.safe_text.as_str(), appended.ordinal), ("echo needle 3000", 3000));
+        assert_eq!(
+            (appended.safe_text.as_str(), appended.ordinal),
+            ("echo needle 3000", 3000)
+        );
         // Offsets count from the start of the file, not of the tail.
         assert_eq!(appended.locator, old_len.to_le_bytes());
-        assert_eq!(stable_len(&mut store, &path), fs::metadata(&path).unwrap().len() as i64);
+        assert_eq!(
+            stable_len(&mut store, &path),
+            fs::metadata(&path).unwrap().len() as i64
+        );
 
         // The cursor an append leaves is as good as a first import's.
         append(&path, &zsh_history(3100..3101));
         let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!((r.outcome, r.records_parsed, r.records_stored), (Outcome::Appended, 1, 1));
+        assert_eq!(
+            (r.outcome, r.records_parsed, r.records_stored),
+            (Outcome::Appended, 1, 1)
+        );
         assert_eq!(visible(&db), [1, 1, 3101, 3101, 3101]);
     }
 
@@ -905,7 +1053,10 @@ mod tests {
         let r = import_file(&mut store, &path, SourceKind::Bash, &redactor).unwrap();
         assert_eq!((r.outcome, r.records_parsed), (Outcome::Appended, 1));
         let rows = stored(&store);
-        assert_eq!((rows[1].safe_text.as_str(), rows[1].observed_at_ms), ("echo two\nmore", Some(1_700_000_001_000)));
+        assert_eq!(
+            (rows[1].safe_text.as_str(), rows[1].observed_at_ms),
+            ("echo two\nmore", Some(1_700_000_001_000))
+        );
         assert_eq!(rows[1].locator, 21u64.to_le_bytes());
     }
 
@@ -922,7 +1073,10 @@ mod tests {
 
         append(&path, "al\necho next\n");
         let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!((r.outcome, r.records_stored, r.incomplete_tail), (Outcome::Appended, 2, false));
+        assert_eq!(
+            (r.outcome, r.records_stored, r.incomplete_tail),
+            (Outcome::Appended, 2, false)
+        );
         assert_eq!(texts(&store), ["echo done", "echo partial", "echo next"]);
     }
 
@@ -932,7 +1086,10 @@ mod tests {
         let path = dir.path().join("zsh_history");
         let redactor = Redactor::new();
         for (mut store, outcome) in [
-            (Store::open(&dir.path().join("relic.db")).unwrap(), Outcome::Appended),
+            (
+                Store::open(&dir.path().join("relic.db")).unwrap(),
+                Outcome::Appended,
+            ),
             (Store::open_memory().unwrap(), Outcome::Aligned),
         ] {
             fs::write(&path, "").unwrap();
@@ -961,7 +1118,8 @@ mod tests {
         fs::write(&path, "echo needle one\necho needle bbb\necho needle two\n").unwrap();
         // Not left to the clock: a coarse one could stamp both writes alike.
         let file = fs::File::options().write(true).open(&path).unwrap();
-        file.set_modified(mtime + std::time::Duration::from_secs(1)).unwrap();
+        file.set_modified(mtime + std::time::Duration::from_secs(1))
+            .unwrap();
 
         let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
         // The edited record breaks the anchor, so nothing can be placed.
@@ -986,14 +1144,21 @@ mod tests {
 
         let edited = content.replace("echo needle 1500\n", "echo needle 15oo\n");
         let from_end = content.len() - content.find("echo needle 1500\n").unwrap();
-        assert!((32_768..GUARD_WINDOW as usize).contains(&from_end), "{from_end}");
+        assert!(
+            (32_768..GUARD_WINDOW as usize).contains(&from_end),
+            "{from_end}"
+        );
         fs::write(&path, &edited).unwrap();
         let file = fs::File::options().write(true).open(&path).unwrap();
-        file.set_modified(mtime + std::time::Duration::from_secs(1)).unwrap();
+        file.set_modified(mtime + std::time::Duration::from_secs(1))
+            .unwrap();
 
         // Not trusted as an append: the whole file was read again.
         let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!((r.outcome, r.records_parsed, r.records_stored), (Outcome::Aligned, 3000, 0));
+        assert_eq!(
+            (r.outcome, r.records_parsed, r.records_stored),
+            (Outcome::Aligned, 3000, 0)
+        );
     }
 
     #[test]
@@ -1008,12 +1173,18 @@ mod tests {
 
         rewrite(&path, &zsh_history(10..33));
         let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!((r.outcome, r.records_stored, r.records_parsed), (Outcome::Aligned, 3, 23 + 3));
+        assert_eq!(
+            (r.outcome, r.records_stored, r.records_parsed),
+            (Outcome::Aligned, 3, 23 + 3)
+        );
         assert_eq!(r.revision_id, first.revision_id);
         assert_eq!(visible(&db), [1, 1, 33, 33, 33]);
         assert_eq!(texts(&store), needles(0..33));
         let rows = stored(&store);
-        assert_eq!(rows.iter().map(|o| o.ordinal).collect::<Vec<_>>(), (0..33).collect::<Vec<_>>());
+        assert_eq!(
+            rows.iter().map(|o| o.ordinal).collect::<Vec<_>>(),
+            (0..33).collect::<Vec<_>>()
+        );
 
         // A trim with nothing new adds nothing, and leaves a usable cursor.
         rewrite(&path, &zsh_history(20..33));
@@ -1021,7 +1192,10 @@ mod tests {
         assert_eq!((r.outcome, r.records_stored), (Outcome::Aligned, 0));
         append(&path, &zsh_history(33..34));
         let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!((r.outcome, r.records_stored, r.records_parsed), (Outcome::Appended, 1, 1));
+        assert_eq!(
+            (r.outcome, r.records_stored, r.records_parsed),
+            (Outcome::Appended, 1, 1)
+        );
         assert_eq!(texts(&store), needles(0..34));
         assert_eq!(visible(&db)[..2], [1, 1]);
     }
@@ -1055,12 +1229,27 @@ mod tests {
 
             rewrite(&path, &after);
             let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
-            assert_eq!((r.outcome, r.records_stored), (Outcome::Aligned, 1), "{name}");
+            assert_eq!(
+                (r.outcome, r.records_stored),
+                (Outcome::Aligned, 1),
+                "{name}"
+            );
             assert_eq!(r.revision_id, first.revision_id, "{name}");
             assert_eq!(visible(&db), [1, 1, 31, 31, 31], "{name}");
             let rows = stored(&store);
-            assert_eq!(rows[..30].iter().map(|o| o.safe_text.clone()).collect::<Vec<_>>(), needles(0..30), "{name}");
-            assert_eq!((rows[30].safe_text.as_str(), rows[30].observed_at_ms), ("echo needle 25", rerun_at), "{name}");
+            assert_eq!(
+                rows[..30]
+                    .iter()
+                    .map(|o| o.safe_text.clone())
+                    .collect::<Vec<_>>(),
+                needles(0..30),
+                "{name}"
+            );
+            assert_eq!(
+                (rows[30].safe_text.as_str(), rows[30].observed_at_ms),
+                ("echo needle 25", rerun_at),
+                "{name}"
+            );
         }
     }
 
@@ -1075,7 +1264,10 @@ mod tests {
         let first = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
 
         // The stored three appear twice: either could be where they ended.
-        rewrite(&path, "cd a\nmake needle\nmake test\nmake install\ncd b\nmake needle\nmake test\nmake install\n");
+        rewrite(
+            &path,
+            "cd a\nmake needle\nmake test\nmake install\ncd b\nmake needle\nmake test\nmake install\n",
+        );
         let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
         assert_eq!((r.outcome, r.records_stored), (Outcome::Superseded, 8));
         assert_ne!(r.revision_id, first.revision_id);
@@ -1087,7 +1279,10 @@ mod tests {
         // The new revision is the one later imports continue.
         append(&path, "cd c\n");
         let next = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
-        assert_eq!((next.outcome, next.records_stored, next.revision_id), (Outcome::Appended, 1, r.revision_id));
+        assert_eq!(
+            (next.outcome, next.records_stored, next.revision_id),
+            (Outcome::Appended, 1, r.revision_id)
+        );
     }
 
     #[test]
@@ -1106,13 +1301,23 @@ mod tests {
         assert_eq!((r.outcome, r.records_stored), (Outcome::Aligned, 0));
         assert_eq!(texts(&store), needles(0..12));
 
-        rewrite(&path, &(zsh_history(0..5) + &zsh_history(6..11) + &zsh_history(12..13)));
+        rewrite(
+            &path,
+            &(zsh_history(0..5) + &zsh_history(6..11) + &zsh_history(12..13)),
+        );
         let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
         assert_eq!((r.outcome, r.records_stored), (Outcome::Aligned, 1));
         assert_eq!(texts(&store), needles(0..13));
         assert_eq!(visible(&db), [1, 1, 13, 13, 13]);
         for removed in ["5", "11"] {
-            assert_eq!(store.search(&format!("needle {removed}"), 10).unwrap().len(), 1, "{removed}");
+            assert_eq!(
+                store
+                    .search(&format!("needle {removed}"), 10)
+                    .unwrap()
+                    .len(),
+                1,
+                "{removed}"
+            );
         }
     }
 
@@ -1129,7 +1334,11 @@ mod tests {
             let mut store = Store::open(&db).unwrap();
             let first = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
             assert!(first.key_warning.is_none(), "{name}");
-            assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600, "{name}");
+            assert_eq!(
+                fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{name}"
+            );
             let old_key = fs::read(&key).unwrap();
 
             match name {
@@ -1139,19 +1348,31 @@ mod tests {
             append(&path, &zsh_history(20..25));
             let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
             // The whole file was read to find the anchor, then the tail again.
-            assert_eq!((r.outcome, r.records_stored, r.records_parsed), (Outcome::Aligned, 5, 25 + 5), "{name}");
+            assert_eq!(
+                (r.outcome, r.records_stored, r.records_parsed),
+                (Outcome::Aligned, 5, 25 + 5),
+                "{name}"
+            );
             assert!(r.key_warning.is_some(), "{name}");
             assert_eq!(visible(&db), [1, 1, 25, 25, 25], "{name}");
             assert_eq!(texts(&store), needles(0..25), "{name}");
             let new_key = fs::read(&key).unwrap();
             assert_eq!(new_key.len(), 32, "{name}");
             assert_ne!(new_key, old_key, "{name}");
-            assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600, "{name}");
+            assert_eq!(
+                fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{name}"
+            );
 
             // The fresh key guards the next append.
             append(&path, &zsh_history(25..30));
             let r = import_file(&mut store, &path, SourceKind::Zsh, &redactor).unwrap();
-            assert_eq!((r.outcome, r.records_parsed), (Outcome::Appended, 5), "{name}");
+            assert_eq!(
+                (r.outcome, r.records_parsed),
+                (Outcome::Appended, 5),
+                "{name}"
+            );
             assert!(r.key_warning.is_none(), "{name}");
             assert_eq!(visible(&db), [1, 1, 30, 30, 30], "{name}");
         }
@@ -1215,11 +1436,9 @@ mod tests {
 
     /// Rows per table and FTS matches, seen by a connection of its own.
     fn visible(db: &Path) -> [i64; 5] {
-        let conn = rusqlite::Connection::open_with_flags(
-            db,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
+        let conn =
+            rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
         [
             "SELECT COUNT(*) FROM source",
             "SELECT COUNT(*) FROM source_revision",
@@ -1262,7 +1481,11 @@ mod tests {
         let err = import_file(&mut second, &history_path, SourceKind::Zsh, &redactor).unwrap_err();
         assert!(matches!(err, ImportError::Busy), "{err}");
         // It waited out busy_timeout rather than failing on first contact.
-        assert!(started.elapsed() >= std::time::Duration::from_millis(200), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
         assert_eq!(visible(&db), [0, 0, 0, 0, 0]);
 
         drop(writing);
@@ -1282,16 +1505,45 @@ mod tests {
         let resolved = resolve(&history_path).unwrap();
         let locator = resolved.as_os_str().as_bytes();
 
-        let mut writing = first.lock_source(locator).unwrap().new_revision(SourceKind::Zsh).unwrap();
-        let raw = RawRecord { kind: ObservationKind::ZshCommand, timestamp: Some(1_700_000_000), duration: None, command: "echo needle".into(), start: 0, end: 27, lossy: false };
-        writing.insert(&raw_to_observation(&raw, &Redactor::new())).unwrap();
+        let mut writing = first
+            .lock_source(locator)
+            .unwrap()
+            .new_revision(SourceKind::Zsh)
+            .unwrap();
+        let raw = RawRecord {
+            kind: ObservationKind::ZshCommand,
+            timestamp: Some(1_700_000_000),
+            duration: None,
+            command: "echo needle".into(),
+            start: 0,
+            end: 27,
+            lossy: false,
+        };
+        writing
+            .insert(&raw_to_observation(&raw, &Redactor::new()))
+            .unwrap();
         let stat = stat_hint(&fs::metadata(&history_path).unwrap());
 
         let waiter = std::thread::scope(|s| {
-            let waiter = s.spawn(|| import_file(&mut second, &history_path, SourceKind::Zsh, &Redactor::new()));
+            let waiter = s.spawn(|| {
+                import_file(
+                    &mut second,
+                    &history_path,
+                    SourceKind::Zsh,
+                    &Redactor::new(),
+                )
+            });
             // Well inside the 250 ms busy_timeout: the waiter gets the lock, not Busy.
             std::thread::sleep(std::time::Duration::from_millis(100));
-            writing.commit(&Cursor { stat, ..Cursor::default() }, Provenance::COMMAND).unwrap();
+            writing
+                .commit(
+                    &Cursor {
+                        stat,
+                        ..Cursor::default()
+                    },
+                    Provenance::COMMAND,
+                )
+                .unwrap();
             waiter.join().unwrap()
         });
 
@@ -1310,7 +1562,8 @@ mod tests {
         assert!(!small.checkpoint_blocked);
         assert!(wal_len() > 0);
 
-        let bulk = import_records(&mut store, b"/bulk", records(CHECKPOINT_MIN_RECORDS, None)).unwrap();
+        let bulk =
+            import_records(&mut store, b"/bulk", records(CHECKPOINT_MIN_RECORDS, None)).unwrap();
         assert!(!bulk.checkpoint_blocked);
         assert_eq!(wal_len(), 0);
         assert_eq!(visible(&db)[2], 100 + CHECKPOINT_MIN_RECORDS as i64);
@@ -1322,17 +1575,18 @@ mod tests {
         let db = dir.path().join("relic.db");
         let wal_len = || fs::metadata(dir.path().join("relic.db-wal")).unwrap().len();
         let mut store = Store::open(&db).unwrap();
-        let reader = rusqlite::Connection::open_with_flags(
-            &db,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
+        let reader =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
         // An open read transaction pins the reader's snapshot in the WAL.
         reader.execute_batch("BEGIN").unwrap();
-        let seen: i64 = reader.query_row("SELECT COUNT(*) FROM observation", [], |r| r.get(0)).unwrap();
+        let seen: i64 = reader
+            .query_row("SELECT COUNT(*) FROM observation", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(seen, 0);
 
-        let r = import_records(&mut store, b"/bulk", records(CHECKPOINT_MIN_RECORDS, None)).unwrap();
+        let r =
+            import_records(&mut store, b"/bulk", records(CHECKPOINT_MIN_RECORDS, None)).unwrap();
         assert!(r.checkpoint_blocked);
         assert!(wal_len() > 0);
         assert_eq!(visible(&db)[2], CHECKPOINT_MIN_RECORDS as i64);
@@ -1365,9 +1619,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let redactor = Redactor::new();
         for (name, kind, content, complete_len) in [
-            ("no_newline", SourceKind::Zsh, ": 1700000000:0;echo done\n: 1700000001:0;echo parti", 25),
-            ("continuation", SourceKind::Zsh, ": 1700000000:0;echo done\n: 1700000001:0;echo parti\\\n", 25),
-            ("bash", SourceKind::Bash, "#1700000000\necho done\n#1700000001\necho parti", 22),
+            (
+                "no_newline",
+                SourceKind::Zsh,
+                ": 1700000000:0;echo done\n: 1700000001:0;echo parti",
+                25,
+            ),
+            (
+                "continuation",
+                SourceKind::Zsh,
+                ": 1700000000:0;echo done\n: 1700000001:0;echo parti\\\n",
+                25,
+            ),
+            (
+                "bash",
+                SourceKind::Bash,
+                "#1700000000\necho done\n#1700000001\necho parti",
+                22,
+            ),
         ] {
             let path = dir.path().join(name);
             fs::write(&path, content).unwrap();
@@ -1388,11 +1657,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("zsh_history");
         // A decodable pair, a Meta cut off by the newline, and a Meta at EOF.
-        fs::write(&path, b"echo \xE9\x83\xA3\xA8\necho broken\x83\necho tail\x83").unwrap();
+        fs::write(
+            &path,
+            b"echo \xE9\x83\xA3\xA8\necho broken\x83\necho tail\x83",
+        )
+        .unwrap();
         let mut store = Store::open_memory().unwrap();
 
         let r = import_file(&mut store, &path, SourceKind::Zsh, &Redactor::new()).unwrap();
-        assert_eq!((r.records_stored, r.lossy_records, r.dangling_meta), (2, 1, 2));
+        assert_eq!(
+            (r.records_stored, r.lossy_records, r.dangling_meta),
+            (2, 1, 2)
+        );
         assert!(r.incomplete_tail);
         let rows = stored(&store);
         assert_eq!(rows[0].safe_text, "echo \u{90E8}");
@@ -1419,7 +1695,10 @@ mod tests {
         let rows = stored(&store);
         assert!(rows[0].safe_text.len() <= source::RECORD_CAP);
         assert_eq!(rows[0].flags, FLAG_LOSSY);
-        assert_eq!((rows[1].safe_text.as_str(), rows[1].flags), ("echo after", 0));
+        assert_eq!(
+            (rows[1].safe_text.as_str(), rows[1].flags),
+            ("echo after", 0)
+        );
         assert!(rows[2].safe_text.len() <= source::RECORD_CAP);
         assert_eq!(rows[2].flags, FLAG_LOSSY);
         assert_eq!(stable_len(&mut store, &path), content.len() as i64);
@@ -1448,7 +1727,11 @@ mod tests {
     fn whitespace_only_commands_are_not_stored() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("zsh_history");
-        fs::write(&path, ": 1700000000:0;   \n \t \n: 1700000001:0;echo kept\n").unwrap();
+        fs::write(
+            &path,
+            ": 1700000000:0;   \n \t \n: 1700000001:0;echo kept\n",
+        )
+        .unwrap();
         let mut store = Store::open_memory().unwrap();
 
         let r = import_file(&mut store, &path, SourceKind::Zsh, &Redactor::new()).unwrap();
@@ -1461,8 +1744,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // i64::MAX seconds parses, but times 1000 does not fit.
         for (name, kind, content) in [
-            ("zsh", SourceKind::Zsh, format!(": {}:0;echo far\n: 1700000000:0;echo near\n", i64::MAX)),
-            ("bash", SourceKind::Bash, format!("#{}\necho far\n#1700000000\necho near\n", i64::MAX)),
+            (
+                "zsh",
+                SourceKind::Zsh,
+                format!(": {}:0;echo far\n: 1700000000:0;echo near\n", i64::MAX),
+            ),
+            (
+                "bash",
+                SourceKind::Bash,
+                format!("#{}\necho far\n#1700000000\necho near\n", i64::MAX),
+            ),
         ] {
             let path = dir.path().join(name);
             fs::write(&path, content).unwrap();
@@ -1470,7 +1761,11 @@ mod tests {
 
             import_file(&mut store, &path, kind, &Redactor::new()).unwrap();
             let rows = stored(&store);
-            assert_eq!((rows[0].safe_text.as_str(), rows[0].observed_at_ms), ("echo far", None), "{name}");
+            assert_eq!(
+                (rows[0].safe_text.as_str(), rows[0].observed_at_ms),
+                ("echo far", None),
+                "{name}"
+            );
             assert_eq!(rows[1].observed_at_ms, Some(1_700_000_000_000), "{name}");
         }
     }
@@ -1487,7 +1782,10 @@ mod tests {
         let r = import_file(&mut store, &path, SourceKind::Bash, &Redactor::new()).unwrap();
         assert_eq!(r.records_stored, 13);
         let rows = stored(&store);
-        assert_eq!((rows[12].safe_text.as_str(), rows[12].observed_at_ms), ("echo timed", Some(1_700_000_000_000)));
+        assert_eq!(
+            (rows[12].safe_text.as_str(), rows[12].observed_at_ms),
+            ("echo timed", Some(1_700_000_000_000))
+        );
     }
 
     #[test]
@@ -1497,7 +1795,11 @@ mod tests {
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
-        for path in [fifo.clone(), PathBuf::from("/dev/null"), dir.path().to_path_buf()] {
+        for path in [
+            fifo.clone(),
+            PathBuf::from("/dev/null"),
+            dir.path().to_path_buf(),
+        ] {
             // On a thread: a FIFO nobody writes to blocks in open forever, and
             // a wrong check must fail this test, not hang the suite.
             let (done, refused) = std::sync::mpsc::channel();
@@ -1505,7 +1807,8 @@ mod tests {
             std::thread::spawn(move || {
                 let mut store = Store::open_memory().unwrap();
                 let r = import_file(&mut store, &import_path, SourceKind::Zsh, &Redactor::new());
-                let refused = matches!(&r, Err(ImportError::NotRegularFile(p)) if *p == import_path);
+                let refused =
+                    matches!(&r, Err(ImportError::NotRegularFile(p)) if *p == import_path);
                 let _ = done.send((refused, store.observation_count().unwrap()));
             });
             let outcome = refused.recv_timeout(std::time::Duration::from_secs(10));
@@ -1523,15 +1826,30 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
 
         let err = import_file(&mut store, &link, SourceKind::Zsh, &Redactor::new()).unwrap_err();
-        assert!(matches!(&err, ImportError::FinalSymlink { target: t, .. } if *t == target), "{err}");
+        assert!(
+            matches!(&err, ImportError::FinalSymlink { target: t, .. } if *t == target),
+            "{err}"
+        );
         assert!(err.to_string().contains(target.to_str().unwrap()), "{err}");
         assert_eq!(store.observation_count().unwrap(), 0);
-        assert!(store.lock_source(resolve(&link).unwrap().as_os_str().as_bytes()).unwrap().newest().is_none());
+        assert!(
+            store
+                .lock_source(resolve(&link).unwrap().as_os_str().as_bytes())
+                .unwrap()
+                .newest()
+                .is_none()
+        );
 
         // A symlinked directory on the way there is resolved, not refused.
         let via = dir.path().join("via");
         std::os::unix::fs::symlink(dir.path(), &via).unwrap();
-        let r = import_file(&mut store, &via.join("real_history"), SourceKind::Zsh, &Redactor::new()).unwrap();
+        let r = import_file(
+            &mut store,
+            &via.join("real_history"),
+            SourceKind::Zsh,
+            &Redactor::new(),
+        )
+        .unwrap();
         assert_eq!(r.records_stored, 1);
         let again = import_file(&mut store, &target, SourceKind::Zsh, &Redactor::new()).unwrap();
         assert_eq!(again.outcome, Outcome::Unchanged);
@@ -1547,8 +1865,11 @@ mod tests {
         import_file(&mut store, &path, SourceKind::Zsh, &Redactor::new()).unwrap();
 
         let conn = rusqlite::Connection::open(&db).unwrap();
-        let contract: String =
-            conn.query_row("SELECT parser_contract FROM source_revision", [], |r| r.get(0)).unwrap();
+        let contract: String = conn
+            .query_row("SELECT parser_contract FROM source_revision", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(contract, source::zsh::PARSER_CONTRACT);
         assert_ne!(source::zsh::PARSER_CONTRACT, source::bash::PARSER_CONTRACT);
     }
@@ -1569,13 +1890,25 @@ mod tests {
             store.revision_provenance(t.revision_id).unwrap(),
             Provenance::COMMAND.with(Provenance::OBSERVED_AT)
         );
-        assert_eq!(store.revision_provenance(u.revision_id).unwrap(), Provenance::COMMAND);
+        assert_eq!(
+            store.revision_provenance(u.revision_id).unwrap(),
+            Provenance::COMMAND
+        );
     }
-    fn import_as(name: &str, content: &str, shell: Option<SourceKind>) -> Result<ImportResult, ImportError> {
+    fn import_as(
+        name: &str,
+        content: &str,
+        shell: Option<SourceKind>,
+    ) -> Result<ImportResult, ImportError> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(name);
         fs::write(&path, content).unwrap();
-        import_file(&mut Store::open_memory().unwrap(), &path, shell, &Redactor::new())
+        import_file(
+            &mut Store::open_memory().unwrap(),
+            &path,
+            shell,
+            &Redactor::new(),
+        )
     }
 
     #[test]
@@ -1583,24 +1916,53 @@ mod tests {
         let zsh = ": 1700000000:0;echo one\n";
         let bash = "#1700000000\necho one\n";
         // Misleading names: the content decides.
-        assert_eq!(import_as("bash_history", zsh, None).unwrap().kind, SourceKind::Zsh);
-        assert_eq!(import_as(".zsh_history", bash, None).unwrap().kind, SourceKind::Bash);
+        assert_eq!(
+            import_as("bash_history", zsh, None).unwrap().kind,
+            SourceKind::Zsh
+        );
+        assert_eq!(
+            import_as(".zsh_history", bash, None).unwrap().kind,
+            SourceKind::Bash
+        );
         // Untimed content says nothing, so the name decides.
-        assert_eq!(import_as(".zsh_history", "echo one\n", None).unwrap().kind, SourceKind::Zsh);
-        assert_eq!(import_as(".zhistory", "echo one\n", None).unwrap().kind, SourceKind::Zsh);
-        assert_eq!(import_as(".bash_history", "echo one\n", None).unwrap().kind, SourceKind::Bash);
+        assert_eq!(
+            import_as(".zsh_history", "echo one\n", None).unwrap().kind,
+            SourceKind::Zsh
+        );
+        assert_eq!(
+            import_as(".zhistory", "echo one\n", None).unwrap().kind,
+            SourceKind::Zsh
+        );
+        assert_eq!(
+            import_as(".bash_history", "echo one\n", None).unwrap().kind,
+            SourceKind::Bash
+        );
     }
 
     #[test]
     fn a_file_that_gives_no_shell_away_is_refused_unless_one_is_given() {
         let plain = "echo one\n";
-        assert!(matches!(import_as("history", plain, None), Err(ImportError::UnknownShell(_))));
+        assert!(matches!(
+            import_as("history", plain, None),
+            Err(ImportError::UnknownShell(_))
+        ));
         // Only the first line counts: a marker-looking comment further down an
         // untimed history is not evidence of bash.
         let late = "echo one\n#1700000001\necho two\n";
-        assert!(matches!(import_as("history", late, None), Err(ImportError::UnknownShell(_))));
-        assert_eq!(import_as(".zsh_history", late, None).unwrap().kind, SourceKind::Zsh);
-        assert_eq!(import_as("history", plain, Some(SourceKind::Bash)).unwrap().kind, SourceKind::Bash);
+        assert!(matches!(
+            import_as("history", late, None),
+            Err(ImportError::UnknownShell(_))
+        ));
+        assert_eq!(
+            import_as(".zsh_history", late, None).unwrap().kind,
+            SourceKind::Zsh
+        );
+        assert_eq!(
+            import_as("history", plain, Some(SourceKind::Bash))
+                .unwrap()
+                .kind,
+            SourceKind::Bash
+        );
     }
 
     /// A bash frame is a new command only against the frame before it, which
@@ -1609,7 +1971,12 @@ mod tests {
     fn a_hook_session_is_known_by_its_frames_and_grows_frame_by_frame() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bash-1.frames");
-        let frame = |n: u32, cmd: &str| format!("rh1\0bash\0\0{}\0{n}\0/srv\0    {n}  {cmd}\n\0\n", 1_700_000_000 + n);
+        let frame = |n: u32, cmd: &str| {
+            format!(
+                "rh1\0bash\0\0{}\0{n}\0/srv\0    {n}  {cmd}\n\0\n",
+                1_700_000_000 + n
+            )
+        };
         fs::write(&path, [frame(1, "old"), frame(2, "make")].concat()).unwrap();
         let mut store = Store::open(&dir.path().join("relic.db")).unwrap();
         let redactor = Redactor::new();
@@ -1619,7 +1986,13 @@ mod tests {
         append(&path, &[frame(2, "make"), frame(3, "make test")].concat());
         let r = import_file(&mut store, &path, None, &redactor).unwrap();
         assert_eq!((r.outcome, r.records_stored), (Outcome::Appended, 1));
-        assert_eq!(texts(&store), ["make\nexit 2 · cwd after: /srv", "make test\nexit 3 · cwd after: /srv"]);
+        assert_eq!(
+            texts(&store),
+            [
+                "make\nexit 2 · cwd after: /srv",
+                "make test\nexit 3 · cwd after: /srv"
+            ]
+        );
     }
 
     #[test]
@@ -1634,7 +2007,10 @@ mod tests {
         // A zsh-looking line typed into bash must not flip the source to zsh.
         append(&path, ": 1700000000:0;echo two\n");
         let r = import_file(&mut store, &path, None, &redactor).unwrap();
-        assert_eq!((r.kind, r.replaced, r.records_stored), (SourceKind::Bash, None, 1));
+        assert_eq!(
+            (r.kind, r.replaced, r.records_stored),
+            (SourceKind::Bash, None, 1)
+        );
         assert_eq!(texts(&store), ["echo one", ": 1700000000:0;echo two"]);
     }
 
@@ -1652,7 +2028,10 @@ mod tests {
         assert_eq!(store.search("1700000000", 10).unwrap().len(), 1);
 
         let r = import_file(&mut store, &path, SourceKind::Bash, &redactor).unwrap();
-        assert_eq!((r.kind, r.replaced, r.outcome), (SourceKind::Bash, Some((SourceKind::Zsh, 4)), Outcome::First));
+        assert_eq!(
+            (r.kind, r.replaced, r.outcome),
+            (SourceKind::Bash, Some((SourceKind::Zsh, 4)), Outcome::First)
+        );
         assert_eq!(texts(&store), ["echo alpha", "echo beta"]);
         // One source, one revision, and nothing of the zsh reading left to find.
         assert_eq!(visible(&db)[..4], [1, 1, 2, 2]);
@@ -1661,14 +2040,19 @@ mod tests {
         // The index holds exactly the rows that are left, not just fewer hits.
         rusqlite::Connection::open(&db)
             .unwrap()
-            .execute("INSERT INTO observation_fts (observation_fts) VALUES ('integrity-check')", [])
+            .execute(
+                "INSERT INTO observation_fts (observation_fts) VALUES ('integrity-check')",
+                [],
+            )
             .unwrap();
 
         // The corrected kind is the stored one: no --shell, no second replace.
         let r = import_file(&mut store, &path, None, &redactor).unwrap();
-        assert_eq!((r.kind, r.replaced, r.outcome), (SourceKind::Bash, None, Outcome::Unchanged));
+        assert_eq!(
+            (r.kind, r.replaced, r.outcome),
+            (SourceKind::Bash, None, Outcome::Unchanged)
+        );
     }
-
 
     /// `git` in `dir` with a fixed identity and clock, so reflog times are
     /// known and repeated entries fall in one second.
@@ -1684,11 +2068,20 @@ mod tests {
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+            .envs([
+                ("GIT_AUTHOR_NAME", "t"),
+                ("GIT_AUTHOR_EMAIL", "t@t"),
+                ("GIT_COMMITTER_NAME", "t"),
+                ("GIT_COMMITTER_EMAIL", "t@t"),
+            ])
             .env("GIT_COMMITTER_DATE", format!("{at} +0000"))
             .output()
             .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
@@ -1699,7 +2092,9 @@ mod tests {
     fn git_texts(store: &Store) -> Vec<(ObservationKind, Option<i64>, String)> {
         let mut rows = store.recent(1000).unwrap();
         rows.reverse();
-        rows.into_iter().map(|h| (h.kind, h.observed_at_ms, h.safe_text)).collect()
+        rows.into_iter()
+            .map(|h| (h.kind, h.observed_at_ms, h.safe_text))
+            .collect()
     }
 
     #[test]
@@ -1708,7 +2103,16 @@ mod tests {
         let repo = dir.path();
         git(repo, &["init", "-q", "-b", "main"]);
         git(repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
-        git(repo, &["commit", "-q", "--allow-empty", "-m", "two password=hunter2"]);
+        git(
+            repo,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "two password=hunter2",
+            ],
+        );
         let lost = git(repo, &["rev-parse", "HEAD"]);
         git(repo, &["branch", "feat"]);
         fs::write(repo.join("f"), "x").unwrap();
@@ -1718,37 +2122,71 @@ mod tests {
         git(repo, &["reset", "-q", "--hard", "HEAD"]);
         git(repo, &["reset", "-q", "--hard", "HEAD"]);
         git(repo, &["reset", "-q", "--hard", "HEAD~1"]);
-        let entries = git(repo, &["log", "-g", "--all", "--format=%H"]).lines().count();
+        let entries = git(repo, &["log", "-g", "--all", "--format=%H"])
+            .lines()
+            .count();
 
         let mut store = Store::open_memory().unwrap();
         let redactor = Redactor::new();
         let r = import_git(&mut store, read_git(&repo.join(".git")), &redactor).unwrap();
-        assert_eq!((r.outcome, r.reflog_stored, r.refs_stored), (Outcome::First, entries, 3));
+        assert_eq!(
+            (r.outcome, r.reflog_stored, r.refs_stored),
+            (Outcome::First, entries, 3)
+        );
         let rows = git_texts(&store);
         let at = Some(1_700_000_000_000);
-        let resets = rows.iter().filter(|(k, t, s)| *k == ObservationKind::GitReflog && *t == at && s.ends_with("reset: moving to HEAD")).count();
+        let resets = rows
+            .iter()
+            .filter(|(k, t, s)| {
+                *k == ObservationKind::GitReflog && *t == at && s.ends_with("reset: moving to HEAD")
+            })
+            .count();
         assert_eq!(resets, 3, "one from the stash, two typed: {rows:#?}");
         let commit = format!("git reflog HEAD {lost} commit: two password=[REDACTED:password]");
-        assert!(rows.iter().any(|(_, t, s)| *s == commit && *t == at), "{rows:#?}");
-        assert!(rows.iter().any(|(k, _, s)| *k == ObservationKind::GitRef && s.starts_with("git ref refs/heads/feat ")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|(_, t, s)| *s == commit && *t == at),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|(k, _, s)| *k == ObservationKind::GitRef
+                && s.starts_with("git ref refs/heads/feat ")),
+            "{rows:#?}"
+        );
         // The lost commit the evidence names is one Git can still give back.
-        assert_eq!(git(repo, &["rev-parse", "--verify", &format!("{lost}^{{commit}}")]), lost);
+        assert_eq!(
+            git(
+                repo,
+                &["rev-parse", "--verify", &format!("{lost}^{{commit}}")]
+            ),
+            lost
+        );
 
         // Git forgets the branch, the stash and every reflog entry; relic does not.
         git(repo, &["branch", "-q", "-D", "feat"]);
         git(repo, &["stash", "drop", "-q"]);
         git(repo, &["reflog", "expire", "--expire=now", "--all"]);
         let again = import_git(&mut store, read_git(repo), &redactor).unwrap();
-        assert_eq!((again.outcome, again.reflog_stored, again.refs_stored), (Outcome::Unchanged, 0, 0));
+        assert_eq!(
+            (again.outcome, again.reflog_stored, again.refs_stored),
+            (Outcome::Unchanged, 0, 0)
+        );
         assert_eq!(git_texts(&store), rows);
 
         // A new commit moves HEAD and main: two entries, and main's new place.
         git(repo, &["commit", "-q", "--allow-empty", "-m", "three"]);
         let next = import_git(&mut store, read_git(repo), &redactor).unwrap();
-        assert_eq!((next.outcome, next.reflog_stored, next.refs_stored), (Outcome::Appended, 2, 1));
+        assert_eq!(
+            (next.outcome, next.reflog_stored, next.refs_stored),
+            (Outcome::Appended, 2, 1)
+        );
         let after = git_texts(&store);
         assert_eq!(&after[..rows.len()], &rows[..]);
-        assert!(after[rows.len()..].iter().all(|(_, _, s)| s.contains("three")), "{after:#?}");
+        assert!(
+            after[rows.len()..]
+                .iter()
+                .all(|(_, _, s)| s.contains("three")),
+            "{after:#?}"
+        );
     }
 
     #[test]
@@ -1771,7 +2209,11 @@ mod tests {
         // interleave by time, and within a second keep Git's order.
         git(repo, &["commit", "-q", "--allow-empty", "-m", "a"]);
         git(repo, &["commit", "-q", "--allow-empty", "-m", "b"]);
-        git_at(repo, 1_700_000_100, &["commit", "-q", "--allow-empty", "-m", "c"]);
+        git_at(
+            repo,
+            1_700_000_100,
+            &["commit", "-q", "--allow-empty", "-m", "c"],
+        );
         git_at(repo, 1_700_000_100, &["reset", "-q", "--hard", "HEAD"]);
         // Long after the commit it points at: stored when the ref moved, not
         // by commit date.
@@ -1779,8 +2221,14 @@ mod tests {
         let mut store = Store::open_memory().unwrap();
         import_git(&mut store, read_git(repo), &Redactor::new()).unwrap();
         let rows = git_texts(&store);
-        let reflog: Vec<_> = rows.iter().filter(|(k, _, _)| *k == ObservationKind::GitReflog).collect();
-        assert!(reflog.windows(2).all(|w| w[0].1 <= w[1].1), "oldest first: {reflog:#?}");
+        let reflog: Vec<_> = rows
+            .iter()
+            .filter(|(k, _, _)| *k == ObservationKind::GitReflog)
+            .collect();
+        assert!(
+            reflog.windows(2).all(|w| w[0].1 <= w[1].1),
+            "oldest first: {reflog:#?}"
+        );
         let head: Vec<&str> = reflog
             .iter()
             .filter(|(_, _, s)| s.starts_with("git reflog HEAD "))
@@ -1802,14 +2250,28 @@ mod tests {
         git(&repo, &["init", "-q", "-b", "main"]);
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
         git(&repo, &["worktree", "add", "-q", "-b", "side", "../wt"]);
-        git(&dir.path().join("wt"), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        git(
+            &dir.path().join("wt"),
+            &["commit", "-q", "--allow-empty", "-m", "two"],
+        );
         let mut store = Store::open_memory().unwrap();
         let first = import_git(&mut store, read_git(&repo), &Redactor::new()).unwrap();
         let rows = git_texts(&store);
-        assert!(rows.iter().any(|(_, _, s)| s.ends_with(" commit: two")), "the worktree's moves: {rows:#?}");
-        let again = import_git(&mut store, read_git(&dir.path().join("wt")), &Redactor::new()).unwrap();
-        assert_eq!((first.outcome, again.outcome), (Outcome::First, Outcome::Unchanged), "{:#?}", git_texts(&store));
+        assert!(
+            rows.iter().any(|(_, _, s)| s.ends_with(" commit: two")),
+            "the worktree's moves: {rows:#?}"
+        );
+        let again = import_git(
+            &mut store,
+            read_git(&dir.path().join("wt")),
+            &Redactor::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (first.outcome, again.outcome),
+            (Outcome::First, Outcome::Unchanged),
+            "{:#?}",
+            git_texts(&store)
+        );
     }
-
-
 }

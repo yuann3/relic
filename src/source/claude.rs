@@ -136,7 +136,9 @@ impl<R: BufRead> Parser<R> {
         while self.unsupported.is_none() {
             let start = self.lines.offset;
             self.line.clear();
-            let Some(line) = self.lines.read_into(&mut self.line)? else { return Ok(None) };
+            let Some(line) = self.lines.read_into(&mut self.line)? else {
+                return Ok(None);
+            };
             if !line.terminated {
                 self.incomplete_tail = true;
                 return Ok(None);
@@ -146,7 +148,15 @@ impl<R: BufRead> Parser<R> {
                 Parsed::Record(kind, timestamp, text, lossy) => {
                     self.stable_len = end;
                     if start >= self.from {
-                        return Ok(Some(RawRecord { kind, timestamp, duration: None, command: text, start, end, lossy }));
+                        return Ok(Some(RawRecord {
+                            kind,
+                            timestamp,
+                            duration: None,
+                            command: text,
+                            start,
+                            end,
+                            lossy,
+                        }));
                     }
                 }
                 Parsed::Nothing => self.stable_len = end,
@@ -244,16 +254,24 @@ struct TextBlock {
 /// A line cut at the record cap is a strict prefix of a JSON object, which
 /// never parses, so it is unreadable too.
 fn parse(line: &[u8], pending: &mut std::collections::HashSet<String>) -> Parsed {
-    let Ok(head) = serde_json::from_slice::<Head>(line) else { return Parsed::Unreadable };
+    let Ok(head) = serde_json::from_slice::<Head>(line) else {
+        return Parsed::Unreadable;
+    };
     if !matches!(head.kind.as_deref(), Some("user" | "assistant")) {
         return Parsed::Nothing;
     }
-    let Some(version) = head.version else { return Parsed::Unreadable };
+    let Some(version) = head.version else {
+        return Parsed::Unreadable;
+    };
     if !Version::parse(&version).is_some_and(|v| (OLDEST..=NEWEST).contains(&v)) {
         return Parsed::Unsupported(version);
     }
-    let Ok(envelope) = serde_json::from_slice::<Envelope>(line) else { return Parsed::Unreadable };
-    let Content::Blocks(blocks) = envelope.message.content else { return Parsed::Nothing };
+    let Ok(envelope) = serde_json::from_slice::<Envelope>(line) else {
+        return Parsed::Unreadable;
+    };
+    let Content::Blocks(blocks) = envelope.message.content else {
+        return Parsed::Nothing;
+    };
     let timestamp = envelope.timestamp.as_deref().and_then(iso_seconds);
     // One tool block per record in every version checked.
     for block in blocks {
@@ -262,27 +280,52 @@ fn parse(line: &[u8], pending: &mut std::collections::HashSet<String>) -> Parsed
                 return match input.get("command").and_then(|c| c.as_str()) {
                     Some(command) => {
                         pending.insert(id);
-                        Parsed::Record(ObservationKind::AgentCommand, timestamp, command.to_string(), false)
+                        Parsed::Record(
+                            ObservationKind::AgentCommand,
+                            timestamp,
+                            command.to_string(),
+                            false,
+                        )
                     }
                     None => Parsed::Unreadable,
                 };
             }
             Block::ToolUse { name, input, .. } => {
-                let Some((_, field)) = TOOLS.iter().find(|(tool, _)| *tool == name) else { return Parsed::Nothing };
-                let Some(arg) = input.get(*field).and_then(|a| a.as_str()) else { return Parsed::Unreadable };
+                let Some((_, field)) = TOOLS.iter().find(|(tool, _)| *tool == name) else {
+                    return Parsed::Nothing;
+                };
+                let Some(arg) = input.get(*field).and_then(|a| a.as_str()) else {
+                    return Parsed::Unreadable;
+                };
                 let mut text = format!("{name} {arg}");
-                if let Some(args) = input.get("args").and_then(|a| a.as_str()).filter(|a| !a.is_empty() && name == "Skill") {
+                if let Some(args) = input
+                    .get("args")
+                    .and_then(|a| a.as_str())
+                    .filter(|a| !a.is_empty() && name == "Skill")
+                {
                     text.push(' ');
                     text.push_str(args);
                 }
                 let (text, lossy) = capped(text, ARG_MAX);
                 return Parsed::Record(ObservationKind::AgentTool, timestamp, text, lossy);
             }
-            Block::ToolResult { tool_use_id, content, is_error } if pending.remove(&tool_use_id) => {
-                let interrupted = envelope.tool_use_result.as_ref().and_then(|r| r.get("interrupted")).and_then(|i| i.as_bool());
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } if pending.remove(&tool_use_id) => {
+                let interrupted = envelope
+                    .tool_use_result
+                    .as_ref()
+                    .and_then(|r| r.get("interrupted"))
+                    .and_then(|i| i.as_bool());
                 let said = match content {
                     Some(ResultContent::Text(text)) => text,
-                    Some(ResultContent::Blocks(blocks)) => blocks.into_iter().filter_map(|b| b.text).collect::<Vec<_>>().join("\n"),
+                    Some(ResultContent::Blocks(blocks)) => blocks
+                        .into_iter()
+                        .filter_map(|b| b.text)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                     None => String::new(),
                 };
                 let status = match (interrupted, is_error) {
@@ -290,7 +333,11 @@ fn parse(line: &[u8], pending: &mut std::collections::HashSet<String>) -> Parsed
                     (_, true) => "failed: ",
                     _ => "",
                 };
-                let said = if said.trim().is_empty() { "(no output)".to_string() } else { said };
+                let said = if said.trim().is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    said
+                };
                 let (text, lossy) = ends(format!("{status}{said}"), OUTPUT_MAX);
                 return Parsed::Record(ObservationKind::AgentOutput, timestamp, text, lossy);
             }
@@ -330,16 +377,29 @@ fn iso_seconds(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     let num = |r: std::ops::Range<usize>| -> Option<i64> {
         let part = b.get(r)?;
-        part.iter().all(u8::is_ascii_digit).then(|| part.iter().fold(0, |n, d| n * 10 + i64::from(d - b'0')))
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| part.iter().fold(0, |n, d| n * 10 + i64::from(d - b'0')))
     };
-    let shape = b.len() >= 20 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':' && b[16] == b':';
-    let zulu = b.last() == Some(&b'Z') && (b.len() == 20 || (b.len() > 21 && b[19] == b'.' && num(20..b.len() - 1).is_some()));
+    let shape = b.len() >= 20
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':';
+    let zulu = b.last() == Some(&b'Z')
+        && (b.len() == 20 || (b.len() > 21 && b[19] == b'.' && num(20..b.len() - 1).is_some()));
     if !shape || !zulu {
         return None;
     }
     let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
         return None;
     }
     // Howard Hinnant's days_from_civil.
@@ -363,7 +423,10 @@ mod tests {
     }
 
     fn kinds_and_texts(records: &[RawRecord]) -> Vec<(ObservationKind, &str)> {
-        records.iter().map(|r| (r.kind, r.command.as_str())).collect()
+        records
+            .iter()
+            .map(|r| (r.kind, r.command.as_str()))
+            .collect()
     }
 
     /// A session Claude Code 2.1.318 recorded (`claude -p` in a scratch
@@ -389,12 +452,23 @@ mod tests {
         // 2026-11-06T04:11:27.506Z, as `date -u -d` gives it.
         assert_eq!(records[0].timestamp, Some(1_793_938_287));
         assert!(records.iter().all(|r| !r.lossy));
-        assert_eq!((parser.unreadable(), parser.unsupported(), parser.incomplete_tail()), (0, None, false));
+        assert_eq!(
+            (
+                parser.unreadable(),
+                parser.unsupported(),
+                parser.incomplete_tail()
+            ),
+            (0, None, false)
+        );
         assert_eq!(parser.stable_len(), fixture.len() as u64);
         // Each record spans exactly its own line.
         for r in &records {
             let line = &fixture[r.start as usize..r.end as usize];
-            assert!(line.starts_with(b"{") && line.ends_with(b"\n") && !line[..line.len() - 1].contains(&b'\n'));
+            assert!(
+                line.starts_with(b"{")
+                    && line.ends_with(b"\n")
+                    && !line[..line.len() - 1].contains(&b'\n')
+            );
         }
     }
 
@@ -405,21 +479,33 @@ mod tests {
     }
 
     fn bash(id: &str, command: &str) -> String {
-        let call = format!(r#"[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":{command:?}}}}}]"#);
+        let call = format!(
+            r#"[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":{command:?}}}}}]"#
+        );
         line("assistant", "2.1.300", &call, "")
     }
 
     /// A result for call `id`; `extra` is the rest of the envelope, such as
     /// its `toolUseResult`, which most Bash results lack.
     fn result(id: &str, content: &str, is_error: bool, extra: &str) -> String {
-        let block = format!(r#"[{{"type":"tool_result","tool_use_id":"{id}","content":{content},"is_error":{is_error}}}]"#);
+        let block = format!(
+            r#"[{{"type":"tool_result","tool_use_id":"{id}","content":{content},"is_error":{is_error}}}]"#
+        );
         line("user", "2.1.300", &block, extra)
     }
 
     #[test]
     fn results_pair_with_their_bash_call_say_how_it_ended_and_are_capped() {
-        let long = format!("Compiling é{}test result: FAILED. 1 passed; 1 failed", "x".repeat(OUTPUT_MAX));
-        let read = line("assistant", "2.1.300", r#"[{"type":"tool_use","id":"r","name":"Read","input":{"file_path":"/f"}}]"#, "");
+        let long = format!(
+            "Compiling é{}test result: FAILED. 1 passed; 1 failed",
+            "x".repeat(OUTPUT_MAX)
+        );
+        let read = line(
+            "assistant",
+            "2.1.300",
+            r#"[{"type":"tool_use","id":"r","name":"Read","input":{"file_path":"/f"}}]"#,
+            "",
+        );
         let input = [
             bash("a", "git rev-parse nope"),
             bash("b", "sleep 9"),
@@ -427,34 +513,79 @@ mod tests {
             bash("c", "cat big"),
             bash("d", "printf"),
             // Answered out of order, as parallel calls are.
-            result("b", r#""""#, false, r#","toolUseResult":{"stdout":"","interrupted":true}"#),
-            result("a", r#""Exit code 128\nfatal: bad ref""#, true, r#","toolUseResult":"Error: Exit code 128""#),
+            result(
+                "b",
+                r#""""#,
+                false,
+                r#","toolUseResult":{"stdout":"","interrupted":true}"#,
+            ),
+            result(
+                "a",
+                r#""Exit code 128\nfatal: bad ref""#,
+                true,
+                r#","toolUseResult":"Error: Exit code 128""#,
+            ),
             result("r", r#""1\tfile body""#, false, ""),
             result("c", &format!("{long:?}"), false, ""),
-            result("d", r#"[{"type":"text","text":"one"},{"type":"text","text":"two"}]"#, false, ""),
+            result(
+                "d",
+                r#"[{"type":"text","text":"one"},{"type":"text","text":"two"}]"#,
+                false,
+                "",
+            ),
             // A second answer, or one to a call never made: no call to pair.
             result("a", r#""again""#, false, ""),
             result("zz", r#""stray""#, false, ""),
         ]
         .concat();
         let (records, _) = parse_all(input.as_bytes());
-        let outputs: Vec<&RawRecord> = records.iter().filter(|r| r.kind == ObservationKind::AgentOutput).collect();
+        let outputs: Vec<&RawRecord> = records
+            .iter()
+            .filter(|r| r.kind == ObservationKind::AgentOutput)
+            .collect();
         let texts: Vec<&str> = outputs.iter().map(|r| r.command.as_str()).collect();
-        assert_eq!(texts[..2], ["interrupted: (no output)", "failed: Exit code 128\nfatal: bad ref"]);
-        assert!(texts[2].len() <= OUTPUT_MAX && outputs[2].lossy && !outputs[1].lossy, "{}", texts[2].len());
+        assert_eq!(
+            texts[..2],
+            [
+                "interrupted: (no output)",
+                "failed: Exit code 128\nfatal: bad ref"
+            ]
+        );
+        assert!(
+            texts[2].len() <= OUTPUT_MAX && outputs[2].lossy && !outputs[1].lossy,
+            "{}",
+            texts[2].len()
+        );
         assert_eq!(texts[3..], ["one\ntwo"]);
-        assert!(texts[2].starts_with("Compiling é") && texts[2].contains("x\n[…]\nx") && texts[2].ends_with("xtest result: FAILED. 1 passed; 1 failed"), "{}", texts[2]);
+        assert!(
+            texts[2].starts_with("Compiling é")
+                && texts[2].contains("x\n[…]\nx")
+                && texts[2].ends_with("xtest result: FAILED. 1 passed; 1 failed"),
+            "{}",
+            texts[2]
+        );
     }
 
     #[test]
     fn a_resumed_parse_yields_exactly_the_tail_of_a_whole_one() {
         // The boundary falls between a call and its result.
         let head = bash("a", "git reflog");
-        let input = [head.clone(), result("a", r#""abc123 HEAD@{0}""#, false, ""), bash("b", "ls")].concat();
+        let input = [
+            head.clone(),
+            result("a", r#""abc123 HEAD@{0}""#, false, ""),
+            bash("b", "ls"),
+        ]
+        .concat();
         let (whole, _) = parse_all(input.as_bytes());
         let mut resumed = Parser::resume(input.as_bytes(), head.len() as u64);
         let tail = resumed.by_ref().collect::<io::Result<Vec<_>>>().unwrap();
-        assert_eq!(kinds_and_texts(&tail), [(ObservationKind::AgentOutput, "abc123 HEAD@{0}"), (ObservationKind::AgentCommand, "ls")]);
+        assert_eq!(
+            kinds_and_texts(&tail),
+            [
+                (ObservationKind::AgentOutput, "abc123 HEAD@{0}"),
+                (ObservationKind::AgentCommand, "ls")
+            ]
+        );
         assert_eq!(tail, whole[1..]);
         assert_eq!(resumed.stable_len(), input.len() as u64);
     }
@@ -474,28 +605,54 @@ mod tests {
         let (records, parser) = parse_all(input.as_bytes());
         assert_eq!(
             kinds_and_texts(&records),
-            [(ObservationKind::AgentTool, "Skill git-x stash"), (ObservationKind::AgentCommand, "git reflog")]
+            [
+                (ObservationKind::AgentTool, "Skill git-x stash"),
+                (ObservationKind::AgentCommand, "git reflog")
+            ]
         );
         assert_eq!(parser.unreadable(), 0);
     }
 
     #[test]
     fn parsing_stops_at_an_unknown_version_and_skips_only_unreadable_lines() {
-        let newer = line("assistant", "2.1.319", r#"[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]"#, "");
+        let newer = line(
+            "assistant",
+            "2.1.319",
+            r#"[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]"#,
+            "",
+        );
         let input = [
             bash("1", "one"),
             "{not json\n".to_string(),
             // A Bash call with no command is not a shape this parser knows.
-            line("assistant", "2.1.300", r#"[{"type":"tool_use","name":"Bash","input":{}}]"#, ""),
+            line(
+                "assistant",
+                "2.1.300",
+                r#"[{"type":"tool_use","name":"Bash","input":{}}]"#,
+                "",
+            ),
             bash("2", "two"),
             newer.clone(),
             bash("3", "three"),
         ]
         .concat();
         let (records, parser) = parse_all(input.as_bytes());
-        assert_eq!(kinds_and_texts(&records), [(ObservationKind::AgentCommand, "one"), (ObservationKind::AgentCommand, "two")]);
-        assert_eq!((parser.unreadable(), parser.unsupported()), (2, Some("2.1.319")));
-        assert_eq!(parser.stable_len() as usize, input.find(&newer).unwrap(), "a later Relic resumes at the newer record");
+        assert_eq!(
+            kinds_and_texts(&records),
+            [
+                (ObservationKind::AgentCommand, "one"),
+                (ObservationKind::AgentCommand, "two")
+            ]
+        );
+        assert_eq!(
+            (parser.unreadable(), parser.unsupported()),
+            (2, Some("2.1.319"))
+        );
+        assert_eq!(
+            parser.stable_len() as usize,
+            input.find(&newer).unwrap(),
+            "a later Relic resumes at the newer record"
+        );
         // An older version than any checked is as unknown.
         let older = line("assistant", "2.1.287", "[]", "");
         let (records, parser) = parse_all(older.as_bytes());
@@ -511,7 +668,13 @@ mod tests {
         assert_eq!(iso_seconds("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(iso_seconds("2000-03-01T00:00:01.5Z"), Some(951_868_801));
         assert_eq!(iso_seconds("2026-11-06T04:11:27.506Z"), Some(1_793_938_287));
-        for bad in ["2026-11-06 04:11:27Z", "2026-11-06T04:11:27+08:00", "2026-13-06T04:11:27Z", "2026-11-06T04:11:27.Z", ""] {
+        for bad in [
+            "2026-11-06 04:11:27Z",
+            "2026-11-06T04:11:27+08:00",
+            "2026-13-06T04:11:27Z",
+            "2026-11-06T04:11:27.Z",
+            "",
+        ] {
             assert_eq!(iso_seconds(bad), None, "{bad}");
         }
     }

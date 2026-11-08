@@ -127,7 +127,11 @@ impl<R: BufRead> Parser<R> {
                     seen.is_some_and(|seen| seen != entry)
                 }
             };
-            if !new || start < self.from || frame.command.is_empty() || frame.command.starts_with(b" ") {
+            if !new
+                || start < self.from
+                || frame.command.is_empty()
+                || frame.command.starts_with(b" ")
+            {
                 continue;
             }
             return Ok(Some(frame.into_record(start, end)));
@@ -167,14 +171,24 @@ impl Frame<'_> {
         let facts = match self.span {
             Some((started, ended)) => {
                 let took = (ended - started).max(0);
-                format!("exit {} · took {}.{} s · cwd: {cwd}", self.status, took / 1000, took % 1000 / 100)
+                format!(
+                    "exit {} · took {}.{} s · cwd: {cwd}",
+                    self.status,
+                    took / 1000,
+                    took % 1000 / 100
+                )
             }
             None => format!("exit {} · cwd after: {cwd}", self.status),
         };
         RawRecord {
             kind: ObservationKind::HookFrame,
-            timestamp: self.span.map(|(started, _)| started.div_euclid(1000)).or(self.prompt_at),
-            duration: self.span.map(|(started, ended)| (ended - started).max(0) / 1000),
+            timestamp: self
+                .span
+                .map(|(started, _)| started.div_euclid(1000))
+                .or(self.prompt_at),
+            duration: self
+                .span
+                .map(|(started, ended)| (ended - started).max(0) / 1000),
             command: format!("{command}\n{facts}"),
             start,
             end,
@@ -200,7 +214,9 @@ pub fn split_facts(text: &str) -> (&str, Option<&str>) {
 
 fn parse(frame: &[u8]) -> Option<Frame<'_>> {
     let fields: Vec<&[u8]> = frame.strip_suffix(b"\0")?.split(|&b| b == 0).collect();
-    let [b"rh1", shell, started, ended, status, cwd, command] = fields[..] else { return None };
+    let [b"rh1", shell, started, ended, status, cwd, command] = fields[..] else {
+        return None;
+    };
     let status = std::str::from_utf8(status).ok()?.parse().ok()?;
     match shell {
         b"zsh" => Some(Frame {
@@ -214,7 +230,14 @@ fn parse(frame: &[u8]) -> Option<Frame<'_>> {
         b"bash" if started.is_empty() => {
             let prompt_at = std::str::from_utf8(ended).ok()?.parse().ok()?;
             let (history, command) = history_line(command)?;
-            Some(Frame { span: None, prompt_at: Some(prompt_at), status, cwd, command, history: Some(history) })
+            Some(Frame {
+                span: None,
+                prompt_at: Some(prompt_at),
+                status,
+                cwd,
+                command,
+                history: Some(history),
+            })
         }
         _ => None,
     }
@@ -241,7 +264,9 @@ fn history_line(line: &[u8]) -> Option<(Option<u64>, &[u8])> {
     let line = line.strip_suffix(b"\n")?.trim_ascii_start();
     let digits = line.iter().take_while(|b| b.is_ascii_digit()).count();
     let number = std::str::from_utf8(&line[..digits]).ok()?.parse().ok()?;
-    let command = line[digits..].strip_prefix(b"  ").or_else(|| line[digits..].strip_prefix(b"* "))?;
+    let command = line[digits..]
+        .strip_prefix(b"  ")
+        .or_else(|| line[digits..].strip_prefix(b"* "))?;
     Some((Some(number), command))
 }
 
@@ -265,14 +290,29 @@ mod tests {
 
     #[test]
     fn a_zsh_frame_is_its_command_then_what_the_hook_saw() {
-        let input = zsh("1700000000.9871", "1700000003.2", "1", "/srv/app", "make deploy\n  --force");
+        let input = zsh(
+            "1700000000.9871",
+            "1700000003.2",
+            "1",
+            "/srv/app",
+            "make deploy\n  --force",
+        );
         let (records, parser) = records(&input, 0);
         assert_eq!(records.len(), 1);
         let r = &records[0];
-        assert_eq!(r.command, "make deploy\n  --force\nexit 1 · took 2.2 s · cwd: /srv/app");
+        assert_eq!(
+            r.command,
+            "make deploy\n  --force\nexit 1 · took 2.2 s · cwd: /srv/app"
+        );
         // The start, not the end: zsh history times a command by its start.
-        assert_eq!((r.timestamp, r.duration, r.kind), (Some(1_700_000_000), Some(2), ObservationKind::HookFrame));
-        assert_eq!((r.start, r.end, parser.stable_len(), r.lossy), (0, input.len() as u64, input.len() as u64, false));
+        assert_eq!(
+            (r.timestamp, r.duration, r.kind),
+            (Some(1_700_000_000), Some(2), ObservationKind::HookFrame)
+        );
+        assert_eq!(
+            (r.start, r.end, parser.stable_len(), r.lossy),
+            (0, input.len() as u64, input.len() as u64, false)
+        );
     }
 
     #[test]
@@ -290,24 +330,57 @@ mod tests {
         ]
         .concat();
         let (records, _) = records(&input, 0);
-        let got: Vec<_> = records.iter().map(|r| (r.timestamp, r.duration, r.command.as_str())).collect();
+        let got: Vec<_> = records
+            .iter()
+            .map(|r| (r.timestamp, r.duration, r.command.as_str()))
+            .collect();
         assert_eq!(
             got,
             [
-                (Some(1_700_000_005), None, "cd /srv && make\nexit 2 · cwd after: /srv"),
-                (Some(1_700_000_012), None, "git status\nexit 0 · cwd after: /srv"),
-                (Some(1_700_000_014), None, "make\nexit 127 · cwd after: /srv"),
+                (
+                    Some(1_700_000_005),
+                    None,
+                    "cd /srv && make\nexit 2 · cwd after: /srv"
+                ),
+                (
+                    Some(1_700_000_012),
+                    None,
+                    "git status\nexit 0 · cwd after: /srv"
+                ),
+                (
+                    Some(1_700_000_014),
+                    None,
+                    "make\nexit 127 · cwd after: /srv"
+                ),
             ]
         );
     }
 
     #[test]
     fn a_resumed_parse_still_knows_the_history_number_before_it() {
-        let first = [bash("1", "0", "/", "    1  a\n"), bash("2", "0", "/", "    2  b\n")].concat();
-        let input = [first.as_str(), &bash("3", "0", "/", "    2  b\n"), &bash("4", "1", "/", "    3  c\n")].concat();
+        let first = [
+            bash("1", "0", "/", "    1  a\n"),
+            bash("2", "0", "/", "    2  b\n"),
+        ]
+        .concat();
+        let input = [
+            first.as_str(),
+            &bash("3", "0", "/", "    2  b\n"),
+            &bash("4", "1", "/", "    3  c\n"),
+        ]
+        .concat();
         let (records, _) = records(&input, first.len() as u64);
-        assert_eq!(records.iter().map(|r| r.command.as_str()).collect::<Vec<_>>(), ["c\nexit 1 · cwd after: /"]);
-        assert_eq!(records[0].start, input.len() as u64 - bash("4", "1", "/", "    3  c\n").len() as u64);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.command.as_str())
+                .collect::<Vec<_>>(),
+            ["c\nexit 1 · cwd after: /"]
+        );
+        assert_eq!(
+            records[0].start,
+            input.len() as u64 - bash("4", "1", "/", "    3  c\n").len() as u64
+        );
     }
 
     #[test]
@@ -337,14 +410,23 @@ mod tests {
         .concat();
         let (records, parser) = records(&input, 0);
         // The fragment and the frame after it read as one frame of too many fields.
-        assert_eq!(records.iter().map(|r| r.command.lines().next().unwrap()).collect::<Vec<_>>(), ["kept"]);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.command.lines().next().unwrap())
+                .collect::<Vec<_>>(),
+            ["kept"]
+        );
         assert_eq!(parser.unreadable(), 3);
     }
 
     #[test]
     fn a_newline_in_the_directory_cannot_pass_for_the_facts_line() {
         let (records, _) = records(&zsh("1.0", "1.0", "0", "/tmp/a\nexit 0", "ls"), 0);
-        assert_eq!(records[0].command, "ls\nexit 0 · took 0.0 s · cwd: /tmp/a\\nexit 0");
+        assert_eq!(
+            records[0].command,
+            "ls\nexit 0 · took 0.0 s · cwd: /tmp/a\\nexit 0"
+        );
         assert!(records[0].lossy);
     }
 

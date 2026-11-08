@@ -11,7 +11,9 @@ use serde::Serialize;
 
 use crate::domain::{ObservationKind, Provenance, StoredObservation};
 use crate::redact::Redactor;
-use crate::rlm::coordinator::{InvestigationResult, InvestigationStatus, Progress, SkillSeed, run_investigation};
+use crate::rlm::coordinator::{
+    InvestigationResult, InvestigationStatus, Progress, SkillSeed, run_investigation,
+};
 use crate::rlm::model::ModelBoundary;
 use crate::rlm::model::egress::Role;
 use crate::rlm::protocol::{AnswerStatus, BudgetV1, FinishV1};
@@ -80,11 +82,16 @@ pub struct Budget {
 impl Budget {
     /// [`QUERY_DEADLINE`] from now.
     pub fn start() -> Self {
-        Self { deadline: Instant::now() + QUERY_DEADLINE, cancel: None }
+        Self {
+            deadline: Instant::now() + QUERY_DEADLINE,
+            cancel: None,
+        }
     }
 
     fn cancelled(&self) -> bool {
-        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
     }
 
     fn spent(&self) -> bool {
@@ -170,25 +177,42 @@ fn in_token(c: char) -> bool {
 
 /// The tokens FTS5 makes of `word`: "-m" has one, "src/main.rs" three.
 fn tokens(word: &str) -> impl Iterator<Item = &str> {
-    word.split(|c| !in_token(c)).filter(|t| t.chars().any(char::is_alphanumeric))
+    word.split(|c| !in_token(c))
+        .filter(|t| t.chars().any(char::is_alphanumeric))
 }
 
 /// Splits `word` before its last token: "src/main.r" is ("src/main.", "r").
 fn split_last_token(word: &str) -> (&str, &str) {
     let after = |(i, c): (usize, char)| i + c.len_utf8();
-    let end = word.char_indices().rev().find(|(_, c)| c.is_alphanumeric()).map_or(0, after);
-    let start = word[..end].char_indices().rev().find(|(_, c)| !in_token(*c)).map_or(0, after);
+    let end = word
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_alphanumeric())
+        .map_or(0, after);
+    let start = word[..end]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !in_token(*c))
+        .map_or(0, after);
     word.split_at(start)
 }
 
 /// One page for `req`, or [`SearchError::TooBroad`] / [`SearchError::Cancelled`]
 /// once `budget` runs out. Every search surface comes through here, so the
 /// caps and the budget hold for all of them.
-pub fn search(store: &Store, req: &SearchRequest, budget: &Budget) -> Result<SearchPage, SearchError> {
+pub fn search(
+    store: &Store,
+    req: &SearchRequest,
+    budget: &Budget,
+) -> Result<SearchPage, SearchError> {
     let limit = req.limit.clamp(1, MAX_PAGE);
     // A word with no letters or digits indexes to nothing: it cannot filter,
     // so it neither counts toward the cap nor is taken for the typed prefix.
-    let typed: Vec<&str> = req.query.split_whitespace().filter(|w| tokens(w).next().is_some()).collect();
+    let typed: Vec<&str> = req
+        .query
+        .split_whitespace()
+        .filter(|w| tokens(w).next().is_some())
+        .collect();
     let mut words: Vec<&str> = typed
         .iter()
         .copied()
@@ -219,7 +243,11 @@ pub fn search(store: &Store, req: &SearchRequest, budget: &Budget) -> Result<Sea
     }
     // Symbols alone index to nothing. The page still shows the most recent
     // commands as the user types them, so it must say they are not matches.
-    if req.mode == MatchMode::PrefixLast && words.is_empty() && words_dropped == 0 && deferred.is_none() {
+    if req.mode == MatchMode::PrefixLast
+        && words.is_empty()
+        && words_dropped == 0
+        && deferred.is_none()
+    {
         deferred = req.query.split_whitespace().last().map(String::from);
     }
     let prefix = typing && deferred.is_none();
@@ -230,7 +258,11 @@ pub fn search(store: &Store, req: &SearchRequest, budget: &Budget) -> Result<Sea
     // commands. Not when words were typed and dropped: those rows would pass
     // for matches of a query that was never run.
     let unfiltered = words.is_empty() && req.mode == MatchMode::PrefixLast && words_dropped == 0;
-    let order = if unfiltered { Order::RecentlyImported } else { req.order };
+    let order = if unfiltered {
+        Order::RecentlyImported
+    } else {
+        req.order
+    };
     let run = |store: &Store| match (words.is_empty(), order) {
         (true, _) if unfiltered => store.recent(limit + 1),
         (true, _) => Ok(vec![]),
@@ -296,8 +328,12 @@ pub fn open_evidence(
     let Some(observation) = store.get_observation(id)? else {
         return Ok(None);
     };
-    let timeline =
-        store.get_neighbors(observation.revision_id, observation.ordinal, context, context)?;
+    let timeline = store.get_neighbors(
+        observation.revision_id,
+        observation.ordinal,
+        context,
+        context,
+    )?;
     let mut bounds = HashMap::new();
     for o in timeline.iter().chain([&observation]) {
         if o.observed_at_ms.is_none()
@@ -307,7 +343,12 @@ pub fn open_evidence(
         }
     }
     let provenance = store.revision_provenance(observation.revision_id)?;
-    Ok(Some(EvidenceView { observation, timeline, bounds, provenance }))
+    Ok(Some(EvidenceView {
+        observation,
+        timeline,
+        bounds,
+        provenance,
+    }))
 }
 
 pub fn source_label(kind: ObservationKind) -> &'static str {
@@ -413,7 +454,11 @@ pub fn format_utc(ms: i64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02} {:02}:{:02}", rem / 3600, rem % 3600 / 60)
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60
+    )
 }
 
 pub const RECALL_SCHEMA: &str = "relic.recall/v1";
@@ -507,7 +552,11 @@ pub struct RecordsPage {
 }
 
 pub fn show(store: &Store, ids: &[i64]) -> Result<RecordsPage, rusqlite::Error> {
-    let mut page = RecordsPage { schema: RECORDS_SCHEMA, records: Vec::new(), missing: Vec::new() };
+    let mut page = RecordsPage {
+        schema: RECORDS_SCHEMA,
+        records: Vec::new(),
+        missing: Vec::new(),
+    };
     for &id in ids {
         match store.get_observation(id)? {
             Some(o) => page.records.push(CitedRecord {
@@ -547,7 +596,11 @@ struct RecallLog {
 impl RecallLog {
     fn open(path: &Path) -> std::io::Result<Self> {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let file = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)?;
         // One made by another tool, or before Relic set its umask.
         if file.metadata()?.permissions().mode() & 0o077 != 0 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -555,7 +608,11 @@ impl RecallLog {
         let mut id = [0u8; 8];
         getrandom::fill(&mut id).map_err(std::io::Error::other)?;
         let recall = id.iter().map(|b| format!("{b:02x}")).collect();
-        Ok(Self { file, recall, failed: None })
+        Ok(Self {
+            file,
+            recall,
+            failed: None,
+        })
     }
 
     fn line(&mut self, event: &str, fields: serde_json::Value) {
@@ -563,7 +620,9 @@ impl RecallLog {
         if self.failed.is_some() {
             return;
         }
-        let at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
         let mut line = serde_json::json!({"schema": RECALL_LOG_SCHEMA, "recall": self.recall, "at_ms": at_ms, "event": event});
         if let (Some(line), serde_json::Value::Object(fields)) = (line.as_object_mut(), fields) {
             line.extend(fields);
@@ -600,11 +659,14 @@ impl RecallLog {
     /// report's error, which can quote evidence the endpoint or the model
     /// echoed.
     fn finish(&mut self, r: &RecallReport) -> Option<std::io::Error> {
-        self.line("finish", serde_json::json!({
-            "outcome": r.outcome, "root_calls": r.root_calls, "child_calls": r.child_calls,
-            "cost_microusd": r.cost_microusd, "models": r.models,
-            "cited": r.evidence.iter().map(|e| e.id).collect::<Vec<_>>(),
-        }));
+        self.line(
+            "finish",
+            serde_json::json!({
+                "outcome": r.outcome, "root_calls": r.root_calls, "child_calls": r.child_calls,
+                "cost_microusd": r.cost_microusd, "models": r.models,
+                "cited": r.evidence.iter().map(|e| e.id).collect::<Vec<_>>(),
+            }),
+        );
         if self.failed.is_none()
             && let Err(e) = self.file.sync_data()
         {
@@ -631,7 +693,8 @@ pub fn recall(
 ) -> RecallReport {
     // Once, here: the report shows the question as it was sent.
     let question = Redactor::new().import(question);
-    let log_error = |e: std::io::Error| format!("could not write the recall log {}: {e}", log.display());
+    let log_error =
+        |e: std::io::Error| format!("could not write the recall log {}: {e}", log.display());
     let unlogged = |question, e| {
         let failed = InvestigationResult {
             status: InvestigationStatus::Failed(log_error(e)),
@@ -652,7 +715,10 @@ pub fn recall(
     // Before any request leaves, so the log shows the pick preceding them.
     let picked = crate::catalog::select(&question, skills);
     if let Some(s) = picked {
-        log.line("skill", serde_json::json!({"name": s.name, "bundle": s.bundle}));
+        log.line(
+            "skill",
+            serde_json::json!({"name": s.name, "bundle": s.bundle}),
+        );
     }
     if let Some(e) = log.failed.take() {
         return unlogged(question, e);
@@ -665,17 +731,35 @@ pub fn recall(
         if log.failed.is_some() {
             cancel.store(true, Ordering::SeqCst);
         }
-        if let Progress::Replied { returned_model: Some(m), .. } = &p
+        if let Progress::Replied {
+            returned_model: Some(m),
+            ..
+        } = &p
             && !models.contains(m)
         {
             models.push(m.clone());
         }
         progress(p)
     };
-    let seed = picked.map(|s| SkillSeed { name: &s.name, description: &s.description, records: &s.cites });
-    let r = run_investigation(&question, seed.as_ref(), store, model, BudgetV1::prototype_default(), cancel, &mut progress);
+    let seed = picked.map(|s| SkillSeed {
+        name: &s.name,
+        description: &s.description,
+        records: &s.cites,
+    });
+    let r = run_investigation(
+        &question,
+        seed.as_ref(),
+        store,
+        model,
+        BudgetV1::prototype_default(),
+        cancel,
+        &mut progress,
+    );
     let mut report = report(question, r, models);
-    report.skill = picked.map(|s| SkillUsed { name: s.name.clone(), bundle: s.bundle.clone() });
+    report.skill = picked.map(|s| SkillUsed {
+        name: s.name.clone(),
+        bundle: s.bundle.clone(),
+    });
     if let Some(e) = log.finish(&report) {
         report.outcome = RecallOutcome::Failed;
         report.error = Some(log_error(e));
@@ -724,12 +808,20 @@ fn report(question: String, r: InvestigationResult, models: Vec<String>) -> Reca
     let claims = finish
         .claims
         .iter()
-        .map(|c| CitedText { text: c.text.clone(), supports: ids(&c.supports), contradicts: ids(&c.contradicts) })
+        .map(|c| CitedText {
+            text: c.text.clone(),
+            supports: ids(&c.supports),
+            contradicts: ids(&c.contradicts),
+        })
         .collect();
     let procedure = finish
         .procedure
         .iter()
-        .map(|s| CitedText { text: s.text.clone(), supports: ids(&s.supports), contradicts: vec![] })
+        .map(|s| CitedText {
+            text: s.text.clone(),
+            supports: ids(&s.supports),
+            contradicts: vec![],
+        })
         .collect();
     RecallReport {
         schema: RECALL_SCHEMA,
@@ -750,11 +842,10 @@ fn report(question: String, r: InvestigationResult, models: Vec<String>) -> Reca
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::import::{import_file, SourceKind};
+    use crate::import::{SourceKind, import_file};
     use crate::redact::Redactor;
     use std::io::Write;
 
@@ -771,12 +862,20 @@ mod tests {
     }
 
     fn req(query: &str, limit: usize, mode: MatchMode) -> SearchRequest {
-        SearchRequest { query: query.into(), limit, mode, order: Order::RecentlyImported }
+        SearchRequest {
+            query: query.into(),
+            limit,
+            mode,
+            order: Order::RecentlyImported,
+        }
     }
 
     fn search(store: &Store, req: &SearchRequest) -> Result<SearchPage, SearchError> {
         // Far enough away that a loaded machine never turns a test's query TooBroad.
-        let budget = Budget { deadline: Instant::now() + Duration::from_secs(60), cancel: None };
+        let budget = Budget {
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: None,
+        };
         super::search(store, req, &budget)
     }
 
@@ -794,7 +893,12 @@ mod tests {
     #[test]
     fn prefix_mode_finds_partial_input() {
         let store = store_with(&["kubectl get pods", "ls"]);
-        assert!(search(&store, &req("kube", 10, MatchMode::Words)).unwrap().hits.is_empty());
+        assert!(
+            search(&store, &req("kube", 10, MatchMode::Words))
+                .unwrap()
+                .hits
+                .is_empty()
+        );
         let page = search(&store, &req("kube", 10, MatchMode::PrefixLast)).unwrap();
         assert_eq!(page.hits[0].text, "kubectl get pods");
         assert_eq!(page.hits[0].source, "zsh");
@@ -805,7 +909,10 @@ mod tests {
         let store = store_with(&["git", "git commit -m a long message here", "git push"]);
         let page = search(&store, &req("gi", 10, MatchMode::PrefixLast)).unwrap();
         let texts: Vec<&str> = page.hits.iter().map(|h| h.text.as_str()).collect();
-        assert_eq!(texts, ["git push", "git commit -m a long message here", "git"]);
+        assert_eq!(
+            texts,
+            ["git push", "git commit -m a long message here", "git"]
+        );
     }
 
     #[test]
@@ -849,13 +956,25 @@ mod tests {
         // BM25 would put the shortest row first; import order must not.
         let store = store_with(&["git", "git commit -m a long message here", "git push"]);
         let page = search(&store, &req("git", 10, MatchMode::Words)).unwrap();
-        assert_eq!(texts(&page), ["git push", "git commit -m a long message here", "git"]);
-        assert_eq!(serde_json::to_value(&page).unwrap()["order"], "recently_imported");
+        assert_eq!(
+            texts(&page),
+            ["git push", "git commit -m a long message here", "git"]
+        );
+        assert_eq!(
+            serde_json::to_value(&page).unwrap()["order"],
+            "recently_imported"
+        );
 
         for mode in [MatchMode::Words, MatchMode::PrefixLast] {
-            let ranked = SearchRequest { order: Order::Rank, ..req("git", 10, mode) };
+            let ranked = SearchRequest {
+                order: Order::Rank,
+                ..req("git", 10, mode)
+            };
             let page = search(&store, &ranked).unwrap();
-            assert_eq!(texts(&page), ["git", "git push", "git commit -m a long message here"]);
+            assert_eq!(
+                texts(&page),
+                ["git", "git push", "git commit -m a long message here"]
+            );
             assert_eq!(serde_json::to_value(&page).unwrap()["order"], "rank");
         }
     }
@@ -870,26 +989,41 @@ mod tests {
             assert_eq!(texts(&page), ["vim src/main.rs"], "{query}");
         }
         let page = search(&store, &req("main.rs", 10, MatchMode::PrefixLast)).unwrap();
-        assert_eq!((texts(&page), page.deferred.as_deref()), (vec!["vim src/main.rs"], None));
+        assert_eq!(
+            (texts(&page), page.deferred.as_deref()),
+            (vec!["vim src/main.rs"], None)
+        );
 
         // A decomposed accent is inside its word, as FTS5 has it: "cafés"
         // typed as e + U+0301 does not end in a one-letter "s".
         let store = store_with(&["echo cafe\u{301}s", "echo cafe"]);
         let page = search(&store, &req("cafe\u{301}s", 10, MatchMode::PrefixLast)).unwrap();
-        assert_eq!((texts(&page), page.deferred.as_deref()), (vec!["echo cafe\u{301}s"], None));
+        assert_eq!(
+            (texts(&page), page.deferred.as_deref()),
+            (vec!["echo cafe\u{301}s"], None)
+        );
 
         // Nor does a word of symbols: it filters nothing, and the page says so.
         let page = search(&store, &req("&&", 10, MatchMode::PrefixLast)).unwrap();
         assert_eq!((page.hits.len(), page.deferred.as_deref()), (2, Some("&&")));
 
         // The unfiltered page a short word gets is never a ranked one.
-        let ranked = SearchRequest { order: Order::Rank, ..req("g", 10, MatchMode::PrefixLast) };
-        assert_eq!(search(&store, &ranked).unwrap().order, Order::RecentlyImported);
+        let ranked = SearchRequest {
+            order: Order::Rank,
+            ..req("g", 10, MatchMode::PrefixLast)
+        };
+        assert_eq!(
+            search(&store, &ranked).unwrap().order,
+            Order::RecentlyImported
+        );
 
         // A trailing symbol neither filters nor makes "git" a prefix.
         let store = store_with(&["gitk --all", "git log"]);
         let page = search(&store, &req("git 🚀", 10, MatchMode::PrefixLast)).unwrap();
-        assert_eq!((texts(&page), page.deferred.as_deref()), (vec!["git log"], None));
+        assert_eq!(
+            (texts(&page), page.deferred.as_deref()),
+            (vec!["git log"], None)
+        );
     }
 
     #[test]
@@ -901,14 +1035,21 @@ mod tests {
         assert_eq!((texts(&page), page.words_dropped), (vec!["git push"], 3));
         // A dropped last word was not the one being typed: "git" stays whole.
         let page = search(&store, &req(&words.join(" "), 10, MatchMode::PrefixLast)).unwrap();
-        assert_eq!((texts(&page), page.words_dropped, page.deferred.as_deref()), (vec!["git push"], 3, None));
+        assert_eq!(
+            (texts(&page), page.words_dropped, page.deferred.as_deref()),
+            (vec!["git push"], 3, None)
+        );
 
         // One word, but a 17-token phrase to FTS5.
         let phrase = vec!["nomatch"; MAX_WORD_TOKENS + 1].join("/");
         let page = search(&store, &req(&format!("git {phrase}"), 10, MatchMode::Words)).unwrap();
         assert_eq!((texts(&page), page.words_dropped), (vec!["git push"], 1));
         // A word typed after a dropped one still matches as it is typed.
-        let page = search(&store, &req(&format!("git {phrase} pu"), 10, MatchMode::PrefixLast)).unwrap();
+        let page = search(
+            &store,
+            &req(&format!("git {phrase} pu"), 10, MatchMode::PrefixLast),
+        )
+        .unwrap();
         assert_eq!((texts(&page), page.words_dropped), (vec!["git push"], 1));
         let path = vec!["nomatch"; MAX_WORD_TOKENS].join("/");
         let page = search(&store, &req(&format!("git {path}"), 10, MatchMode::Words)).unwrap();
@@ -929,21 +1070,47 @@ mod tests {
         // Enough rows that ranking them takes SQLite past its first poll.
         let lines: Vec<String> = (0..2_000).map(|i| format!("git commit {i}")).collect();
         let store = store_with(&lines.iter().map(String::as_str).collect::<Vec<_>>());
-        let git = SearchRequest { order: Order::Rank, ..req("git", 10, MatchMode::Words) };
+        let git = SearchRequest {
+            order: Order::Rank,
+            ..req("git", 10, MatchMode::Words)
+        };
         let far = Instant::now() + Duration::from_secs(60);
 
         let cancel = Arc::new(AtomicBool::new(true));
-        let err = super::search(&store, &git, &Budget { deadline: far, cancel: Some(cancel.clone()) }).unwrap_err();
+        let err = super::search(
+            &store,
+            &git,
+            &Budget {
+                deadline: far,
+                cancel: Some(cancel.clone()),
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, SearchError::Cancelled), "{err}");
 
-        let err = super::search(&store, &git, &Budget { deadline: Instant::now(), cancel: None }).unwrap_err();
+        let err = super::search(
+            &store,
+            &git,
+            &Budget {
+                deadline: Instant::now(),
+                cancel: None,
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, SearchError::TooBroad), "{err}");
         assert!(err.to_string().contains("too broad"), "{err}");
 
         cancel.store(false, Ordering::Relaxed);
-        let page = super::search(&store, &git, &Budget { deadline: far, cancel: Some(cancel.clone()) }).unwrap();
+        let page = super::search(
+            &store,
+            &git,
+            &Budget {
+                deadline: far,
+                cancel: Some(cancel.clone()),
+            },
+        )
+        .unwrap();
         assert_eq!(page.hits.len(), 10);
-
     }
 
     #[test]
@@ -974,21 +1141,39 @@ mod tests {
     #[test]
     fn evidence_includes_surrounding_commands() {
         let store = store_with(&["cd /etc/nginx", "certbot renew", "systemctl reload nginx"]);
-        let id = search(&store, &req("certbot", 1, MatchMode::Words)).unwrap().hits[0].id;
+        let id = search(&store, &req("certbot", 1, MatchMode::Words))
+            .unwrap()
+            .hits[0]
+            .id;
         let view = open_evidence(&store, id, 1).unwrap().unwrap();
         assert_eq!(view.observation.safe_text, "certbot renew");
         let texts: Vec<&str> = view.timeline.iter().map(|o| o.safe_text.as_str()).collect();
-        assert_eq!(texts, ["cd /etc/nginx", "certbot renew", "systemctl reload nginx"]);
+        assert_eq!(
+            texts,
+            ["cd /etc/nginx", "certbot renew", "systemctl reload nginx"]
+        );
     }
 
     #[test]
     fn display_line_neutralizes_controls_and_invisible_reordering() {
         assert_eq!(display_line("a\tb\nc\rd\u{2028}e"), "a b c d e");
         assert_eq!(display_line("\x1b[31mred"), "\u{FFFD}[31mred");
-        assert_eq!(display_line("x\0y\u{7f}z\u{85}"), "x\u{FFFD}y\u{FFFD}z\u{FFFD}");
+        assert_eq!(
+            display_line("x\0y\u{7f}z\u{85}"),
+            "x\u{FFFD}y\u{FFFD}z\u{FFFD}"
+        );
         for c in [
-            '\u{061C}', '\u{200B}', '\u{200E}', '\u{202E}', '\u{2066}', '\u{FEFF}', '\u{FFF9}',
-            '\u{00AD}', '\u{180E}', '\u{0600}', '\u{E0041}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{200E}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{FEFF}',
+            '\u{FFF9}',
+            '\u{00AD}',
+            '\u{180E}',
+            '\u{0600}',
+            '\u{E0041}',
         ] {
             assert_eq!(display_line(&format!("a{c}b")), "a\u{FFFD}b", "{:?}", c);
         }
@@ -1073,15 +1258,38 @@ mod tests {
         let c_path = std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
         // SAFETY: mkfifo of a NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        let mut reader = Some(std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&log).unwrap());
+        let mut reader = Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&log)
+                .unwrap(),
+        );
         let model = Arc::new(crate::rlm::model::FakeModel::new());
-        let r = recall("q", &store_with(&["ls"]), &[], model.clone(), &log, &Arc::default(), &mut |p| {
-            if matches!(p, Progress::RootCall { .. }) {
-                drop(reader.take());
-            }
-        });
+        let r = recall(
+            "q",
+            &store_with(&["ls"]),
+            &[],
+            model.clone(),
+            &log,
+            &Arc::default(),
+            &mut |p| {
+                if matches!(p, Progress::RootCall { .. }) {
+                    drop(reader.take());
+                }
+            },
+        );
         assert_eq!(r.outcome, RecallOutcome::Failed);
-        assert!(r.error.as_deref().is_some_and(|e| e.contains("could not write the recall log")), "{:?}", r.error);
-        assert!(model.requests().is_empty(), "a request left without its audit");
+        assert!(
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not write the recall log")),
+            "{:?}",
+            r.error
+        );
+        assert!(
+            model.requests().is_empty(),
+            "a request left without its audit"
+        );
     }
 }

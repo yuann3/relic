@@ -262,9 +262,12 @@ mod tests {
 
     #[test]
     fn search_op_round_trips() {
-        let json = r#"{"op":"search","op_id":"s1","terms":["cargo","build"],"match":"any","limit":50}"#;
+        let json =
+            r#"{"op":"search","op_id":"s1","terms":["cargo","build"],"match":"any","limit":50}"#;
         let op: PlanOpV1 = serde_json::from_str(json).unwrap();
-        assert!(matches!(&op, PlanOpV1::Search(s) if s.op_id == "s1" && s.terms.len() == 2 && s.limit == 50));
+        assert!(
+            matches!(&op, PlanOpV1::Search(s) if s.op_id == "s1" && s.terms.len() == 2 && s.limit == 50)
+        );
         let rt: PlanOpV1 = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
         assert_eq!(op, rt);
     }
@@ -273,7 +276,9 @@ mod tests {
     fn expand_op_round_trips() {
         let json = r#"{"op":"expand","op_id":"e1","input":{"output":"s1"},"scope":"same_source","before":5,"after":10,"limit":100}"#;
         let op: PlanOpV1 = serde_json::from_str(json).unwrap();
-        assert!(matches!(&op, PlanOpV1::Expand(e) if e.op_id == "e1" && e.before == 5 && e.after == 10));
+        assert!(
+            matches!(&op, PlanOpV1::Expand(e) if e.op_id == "e1" && e.before == 5 && e.after == 10)
+        );
         let rt: PlanOpV1 = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
         assert_eq!(op, rt);
     }
@@ -314,10 +319,16 @@ mod tests {
     #[test]
     fn unknown_field_rejected_at_every_depth() {
         let op = r#"{"op":"search","op_id":"s1","terms":["git"],"match":"any","limit":5}"#;
-        let action = |op: &str| format!(r#"{{"version":1,"expected_state_version":0,"kind":"plan","plan":{{"ops":[{op}]}}}}"#);
-        let child = |claim: &str| format!(
-            r#"{{"version":1,"packet_id":"p","assessments":[{{"item_id":"i","verdict":"supports","confidence":"low","claims":[{claim}]}}]}}"#
-        );
+        let action = |op: &str| {
+            format!(
+                r#"{{"version":1,"expected_state_version":0,"kind":"plan","plan":{{"ops":[{op}]}}}}"#
+            )
+        };
+        let child = |claim: &str| {
+            format!(
+                r#"{{"version":1,"packet_id":"p","assessments":[{{"item_id":"i","verdict":"supports","confidence":"low","claims":[{claim}]}}]}}"#
+            )
+        };
         // The same documents parse without the extra field, so only it can fail them.
         assert!(serde_json::from_str::<RootActionV1>(&action(op)).is_ok());
         assert!(serde_json::from_str::<ChildResultV1>(&child(r#"{"text":"t"}"#)).is_ok());
@@ -325,11 +336,27 @@ mod tests {
         let op_extra = op.replace(r#""limit":5"#, r#""limit":5,"sql":"x""#);
         let action_extra = action(op).replacen('{', r#"{"note":"x","#, 1);
         let finish_extra = r#"{"version":1,"expected_state_version":0,"kind":"finish","finish":{"status":"partial","answer":"","claims":[{"text":"t","supports":[],"why":"x"}]}}"#;
-        assert!(serde_json::from_str::<RootActionV1>(&finish_extra.replace(r#","why":"x""#, "")).is_ok());
-        assert!(serde_json::from_str::<RootActionV1>(&action(&op_extra)).is_err(), "inside the tagged op");
-        assert!(serde_json::from_str::<RootActionV1>(&action_extra).is_err(), "on the action");
-        assert!(serde_json::from_str::<RootActionV1>(finish_extra).is_err(), "on a final claim");
-        assert!(serde_json::from_str::<ChildResultV1>(&child(r#"{"text":"t","evidence":"x"}"#)).is_err(), "on a child claim");
+        assert!(
+            serde_json::from_str::<RootActionV1>(&finish_extra.replace(r#","why":"x""#, ""))
+                .is_ok()
+        );
+        assert!(
+            serde_json::from_str::<RootActionV1>(&action(&op_extra)).is_err(),
+            "inside the tagged op"
+        );
+        assert!(
+            serde_json::from_str::<RootActionV1>(&action_extra).is_err(),
+            "on the action"
+        );
+        assert!(
+            serde_json::from_str::<RootActionV1>(finish_extra).is_err(),
+            "on a final claim"
+        );
+        assert!(
+            serde_json::from_str::<ChildResultV1>(&child(r#"{"text":"t","evidence":"x"}"#))
+                .is_err(),
+            "on a child claim"
+        );
     }
 
     // --- RootActionV1 round-trips ---
@@ -351,7 +378,8 @@ mod tests {
         assert_eq!(action.kind, RootActionKind::Plan);
         assert!(action.plan.is_some());
         assert!(action.finish.is_none());
-        let rt: RootActionV1 = serde_json::from_str(&serde_json::to_string(&action).unwrap()).unwrap();
+        let rt: RootActionV1 =
+            serde_json::from_str(&serde_json::to_string(&action).unwrap()).unwrap();
         assert_eq!(action, rt);
     }
 
@@ -435,7 +463,8 @@ mod tests {
         assert_eq!(result.assessments.len(), 2);
         assert_eq!(result.assessments[0].verdict, Verdict::Supports);
         assert_eq!(result.assessments[1].verdict, Verdict::Irrelevant);
-        let rt: ChildResultV1 = serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        let rt: ChildResultV1 =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
         assert_eq!(result, rt);
     }
 
