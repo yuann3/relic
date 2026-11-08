@@ -15,6 +15,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+/// A config directory with no `relic/env`: the developer's own model settings
+/// must not reach a test that scripts the model.
+const NO_SETTINGS: &str = "/nonexistent";
+
 const GATE: Duration = Duration::from_millis(250);
 
 /// Reads one HTTP request off `stream`; true if it was a child call.
@@ -95,6 +99,7 @@ fn interrupt(url: &str, said_enough: impl Fn(&str) -> bool, ready: impl Fn() -> 
     let mut child = Command::new(env!("CARGO_BIN_EXE_relic"))
         .args(["recall", "which command renewed the certificate?", "--db"])
         .arg(&db)
+        .env("XDG_CONFIG_HOME", NO_SETTINGS)
         .env("RELIC_MODEL_PROFILE", "llama_cpp")
         .env("RELIC_MODEL_URL", url)
         .env("RELIC_MODEL_NAME", "gate")

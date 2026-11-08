@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
+/// A config directory with no `relic/env`: the developer's own model settings
+/// must not reach a test that scripts the model.
+const NO_SETTINGS: &str = "/nonexistent";
+
 #[expect(dead_code, reason = "the gate builds only the answerable variant")]
 mod recovery;
 
@@ -133,6 +137,7 @@ fn relic(args: &[&str], db: &Path, url: &str) -> Output {
         .arg("--db")
         .arg(db)
         .env_remove("RELIC_MODEL_API_KEY")
+        .env("XDG_CONFIG_HOME", NO_SETTINGS)
         .env("RELIC_MODEL_PROFILE", "llama_cpp")
         .env("RELIC_MODEL_URL", url)
         .env("RELIC_MODEL_NAME", "scripted")
@@ -291,6 +296,7 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let remote = |extra: &[&str]| {
         let out = Command::new(env!("CARGO_BIN_EXE_relic"))
             .args([&["recall", "renew", "--json", "--db", db.to_str().unwrap()][..], extra].concat())
+            .env("XDG_CONFIG_HOME", NO_SETTINGS)
             .env("RELIC_MODEL_PROFILE", "llama_cpp")
             .env("RELIC_MODEL_URL", "https://127.0.0.1:9/v1")
             .env("RELIC_MODEL_NAME", "remote")
@@ -312,6 +318,7 @@ fn exit_codes_say_answered_nothing_citable_failed_and_unconfigured_apart() {
     let out = Command::new(env!("CARGO_BIN_EXE_relic"))
         .args(["recall", "renew", "--db"])
         .arg(&db)
+        .env("XDG_CONFIG_HOME", NO_SETTINGS)
         .env("RELIC_MODEL_PROFILE", "llama_cpp")
         .env("RELIC_MODEL_URL", "http://127.0.0.1:9/v1")
         .env_remove("RELIC_MODEL_NAME")
@@ -548,6 +555,7 @@ fn a_validated_recall_becomes_a_skill_the_host_step_picks_for_a_sibling_question
             .env("RELIC_DB", &db)
             .env("HOME", &home)
             .env_remove("RELIC_MODEL_API_KEY")
+            .env("XDG_CONFIG_HOME", NO_SETTINGS)
             .env("RELIC_MODEL_PROFILE", "llama_cpp")
             .env("RELIC_MODEL_URL", &url)
             .env("RELIC_MODEL_NAME", "scripted")
@@ -788,6 +796,7 @@ fn reuse_gate_a_skill_makes_the_held_out_sibling_cheaper_and_still_verified() {
             .env("RELIC_DB", &db)
             .env("HOME", &home)
             .env_remove("RELIC_MODEL_API_KEY")
+            .env("XDG_CONFIG_HOME", NO_SETTINGS)
             .env("RELIC_MODEL_PROFILE", "llama_cpp")
             .env("RELIC_MODEL_URL", &url)
             .env("RELIC_MODEL_NAME", "scripted")
