@@ -115,7 +115,7 @@ pub(crate) fn hex_hash(data: &[u8]) -> String {
     hex_encode(&content_hash(data))
 }
 
-fn hex_encode(data: &[u8]) -> String {
+pub(crate) fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 

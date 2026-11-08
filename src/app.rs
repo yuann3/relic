@@ -607,7 +607,7 @@ impl RecallLog {
         }
         let mut id = [0u8; 8];
         getrandom::fill(&mut id).map_err(std::io::Error::other)?;
-        let recall = id.iter().map(|b| format!("{b:02x}")).collect();
+        let recall = crate::rlm::evidence::hex_encode(&id);
         Ok(Self {
             file,
             recall,
