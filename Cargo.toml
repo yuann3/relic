@@ -45,6 +45,8 @@ explicit_iter_loop = "warn"
 stable_sort_primitive = "warn"
 # `.cloned()` on Copy items hides that they are Copy.
 cloned_instead_of_copied = "warn"
+# `format!("{}", x)` where `format!("{x}")` names the value in place.
+uninlined_format_args = "warn"
 
 [[bin]]
 name = "relic"

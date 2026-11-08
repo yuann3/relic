@@ -1175,7 +1175,7 @@ mod tests {
             '\u{0600}',
             '\u{E0041}',
         ] {
-            assert_eq!(display_line(&format!("a{c}b")), "a\u{FFFD}b", "{:?}", c);
+            assert_eq!(display_line(&format!("a{c}b")), "a\u{FFFD}b", "{c:?}");
         }
         assert_eq!(display_line("部署 café ✓"), "部署 café ✓");
     }
