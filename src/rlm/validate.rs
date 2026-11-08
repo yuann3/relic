@@ -142,7 +142,7 @@ impl std::error::Error for ValidationError {}
 
 const MAX_OPS_PER_PLAN: usize = 8;
 /// The one word cap every search shares (ADR 0006).
-const MAX_SEARCH_TERMS: usize = crate::app::MAX_QUERY_WORDS;
+const MAX_SEARCH_TERMS: usize = crate::search::MAX_QUERY_WORDS;
 const MAX_ASSESS_ITEMS: u32 = 64;
 /// Goes into every child packet beside its items; this leaves a lone item
 /// most of the packet cap, so truncation can always make it fit.

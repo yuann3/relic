@@ -6,7 +6,8 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use crate::app::{EvidenceView, RecallReport, SearchError, SearchPage};
+use crate::app::{EvidenceView, RecallReport};
+use crate::search::{SearchError, SearchPage};
 
 /// Rows asked of the index per keystroke. The picker and the list both work
 /// on this page; broad queries say "narrow it" instead of growing it.
@@ -156,7 +157,7 @@ pub struct SearchState {
     pub page: Option<SearchPage>,
     pub selected: usize,
     pub pending: bool,
-    /// Query time measured inside the worker, around `app::search` only.
+    /// Query time measured inside the worker, around `search::search` only.
     pub latency: Option<Duration>,
     pub error: Option<String>,
     /// The newest query ran out of its budget, and `page` is still the one
@@ -169,7 +170,7 @@ pub struct SearchState {
 }
 
 impl SearchState {
-    pub fn selected_hit(&self) -> Option<&crate::app::PageHit> {
+    pub fn selected_hit(&self) -> Option<&crate::search::PageHit> {
         self.page.as_ref()?.hits.get(self.selected)
     }
 
@@ -847,8 +848,8 @@ pub(crate) fn answered(cites: &[i64]) -> RecallReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{PageHit, SEARCH_SCHEMA};
     use crate::domain::{ObservationKind, Provenance, StoredObservation};
+    use crate::search::{PageHit, SEARCH_SCHEMA};
 
     fn hit(id: i64, text: &str) -> PageHit {
         PageHit {
@@ -868,7 +869,7 @@ mod tests {
             truncated: false,
             deferred: None,
             words_dropped: 0,
-            order: crate::app::Order::RecentlyImported,
+            order: crate::search::Order::RecentlyImported,
             filtered: true,
             hits: ids
                 .iter()

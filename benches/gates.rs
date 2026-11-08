@@ -342,7 +342,7 @@ fn search_gates(
 ) -> Result<(), String> {
     let hot = |n: usize| format!("{}ta", "task/".repeat(n - 1));
     let git_400 = vec!["git"; 400];
-    let (phrase_51, phrase_16) = (hot(51), hot(relic::app::MAX_WORD_TOKENS));
+    let (phrase_51, phrase_16) = (hot(51), hot(relic::search::MAX_WORD_TOKENS));
     // In the fixture `task` is in 93% of rows and never beside `git`.
     let whole_words: [&[&str]; 5] = [
         &["git"],
@@ -368,7 +368,7 @@ fn search_gates(
         ("one word of 51 hot tokens", vec!["--prefix", &phrase_51]),
         ("one word of 16 hot tokens", vec!["--prefix", &phrase_16]),
     ];
-    let deadline_ms = relic::app::QUERY_DEADLINE.as_secs_f64() * 1000.0;
+    let deadline_ms = relic::search::QUERY_DEADLINE.as_secs_f64() * 1000.0;
 
     let mut measure = |name: String, args: &[&str], limit: f64| -> Result<(), String> {
         let mut outcomes = std::collections::BTreeSet::new();

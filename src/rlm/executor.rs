@@ -1,10 +1,10 @@
-use crate::app::{self, Budget, Order, SearchRequest};
 use crate::domain::StoredObservation;
 use crate::rlm::budget::BudgetExhausted;
 use crate::rlm::evidence::{HandleId, HandleKind, HandleRegistry};
 use crate::rlm::model::egress::{self, Role};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, OutputError, parse_output};
 use crate::rlm::protocol::*;
+use crate::search::{self, Budget, Order, SearchRequest};
 use crate::store::{Store, is_interrupt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[derive(Debug)]
 pub enum ExecError {
     Store(rusqlite::Error),
-    Search(app::SearchError),
+    Search(search::SearchError),
     HandleNotFound(String),
     /// A handle reference named a set of the wrong kind for its operator.
     WrongKind {
@@ -107,18 +107,18 @@ pub fn execute_search(
         let req = SearchRequest {
             query,
             limit,
-            mode: app::MatchMode::Words,
+            mode: search::MatchMode::Words,
             order: Order::RecentlyImported,
         };
-        match app::search(store, &req, budget) {
+        match search::search(store, &req, budget) {
             Ok(page) => hits.extend(page.hits),
             // A step result, not a failed investigation: the root sees an
             // empty set and why, and can plan rarer terms (#26 handoff).
-            Err(e @ app::SearchError::TooBroad) => {
+            Err(e @ search::SearchError::TooBroad) => {
                 notes.push(format!("{}: {e}", search.op_id));
                 return Ok(registry.insert_evidence_set(Vec::new()));
             }
-            Err(app::SearchError::Cancelled) => return Err(ExecError::Cancelled),
+            Err(search::SearchError::Cancelled) => return Err(ExecError::Cancelled),
             Err(e) => return Err(ExecError::Search(e)),
         }
     }

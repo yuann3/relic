@@ -16,7 +16,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use crate::app::{self, PageHit, SearchPage};
+use crate::app;
+use crate::search::{PageHit, SearchPage};
 
 /// Lowest fzf this picker accepts. Every flag in [`ARGS`] exists from 0.17.4
 /// (`--layout`); 0.27.2 additionally fixed `--read0` mis-rendering long lines,
@@ -326,13 +327,13 @@ mod tests {
 
     fn page(hits: Vec<PageHit>) -> SearchPage {
         SearchPage {
-            schema: app::SEARCH_SCHEMA,
+            schema: crate::search::SEARCH_SCHEMA,
             query: "q".into(),
             limit: 10,
             truncated: false,
             deferred: None,
             words_dropped: 0,
-            order: app::Order::RecentlyImported,
+            order: crate::search::Order::RecentlyImported,
             filtered: true,
             hits,
         }

@@ -4,11 +4,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use relic::app::{self, Budget, MatchMode, Order, SearchRequest};
+use relic::app;
 use relic::cli::{self, Command, Output, SearchArgs};
 use relic::domain::SourceKind;
 use relic::import::{History, ImportError, ImportResult, Outcome};
 use relic::picker::{Pick, PickError, PickMode};
+use relic::search::{self, Budget, MatchMode, Order, SearchRequest};
 use relic::store::Store;
 use serde::Serialize;
 
@@ -684,7 +685,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
     };
     // fzf is for narrowing a broad page; 20 rows would defeat it.
     let default_limit = if args.output == Output::Fzf {
-        app::MAX_PAGE
+        search::MAX_PAGE
     } else {
         20
     };
@@ -695,7 +696,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
         mode,
         order,
     };
-    let page = app::search(&store, &req, &Budget::start())?;
+    let page = search::search(&store, &req, &Budget::start())?;
     // Recent commands are what a typing surface shows; to a script they would
     // pass for matches. A query that searched nothing is a usage error.
     if !page.filtered {
@@ -703,12 +704,12 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
             Some(w) if w.chars().any(char::is_alphanumeric) => format!(
                 "\"{}\" is too short; type {}+ characters",
                 app::display_line(w),
-                app::MIN_PREFIX_CHARS
+                search::MIN_PREFIX_CHARS
             ),
             _ if page.words_dropped > 0 => format!(
                 "every word was ignored: a query uses at most {} words of at most {} parts each",
-                app::MAX_QUERY_WORDS,
-                app::MAX_WORD_TOKENS
+                search::MAX_QUERY_WORDS,
+                search::MAX_WORD_TOKENS
             ),
             _ => "search matches words of letters or digits".into(),
         };
@@ -965,7 +966,7 @@ impl serde_json::ser::Formatter for TerminalSafe {
     }
 }
 
-fn print_page(out: &mut impl Write, page: &app::SearchPage) -> Result<()> {
+fn print_page(out: &mut impl Write, page: &search::SearchPage) -> Result<()> {
     for h in &page.hits {
         writeln!(
             out,
@@ -980,12 +981,12 @@ fn print_page(out: &mut impl Write, page: &app::SearchPage) -> Result<()> {
 }
 
 /// What the page left out, on stderr so stdout stays the results.
-fn page_notes(page: &app::SearchPage) {
+fn page_notes(page: &search::SearchPage) {
     if let Some(w) = &page.deferred {
         eprintln!(
             "(\"{}\" is too short to filter by; type {}+ characters)",
             app::display_line(w),
-            app::MIN_PREFIX_CHARS
+            search::MIN_PREFIX_CHARS
         );
     }
     if page.words_dropped > 0 {
@@ -993,8 +994,8 @@ fn page_notes(page: &app::SearchPage) {
             "({} word{} ignored: a query uses at most {} words of at most {} parts each)",
             page.words_dropped,
             if page.words_dropped == 1 { "" } else { "s" },
-            app::MAX_QUERY_WORDS,
-            app::MAX_WORD_TOKENS
+            search::MAX_QUERY_WORDS,
+            search::MAX_WORD_TOKENS
         );
     }
     if page.truncated {

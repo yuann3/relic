@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use relic::app::{PageHit, SEARCH_SCHEMA, SearchPage};
+use relic::search::{PageHit, SEARCH_SCHEMA, SearchPage};
 
 pub struct FakeFzf {
     pub dir: tempfile::TempDir,
@@ -79,7 +79,7 @@ pub fn page(ids: &[i64]) -> SearchPage {
         truncated: false,
         deferred: None,
         words_dropped: 0,
-        order: relic::app::Order::RecentlyImported,
+        order: relic::search::Order::RecentlyImported,
         filtered: true,
         hits: ids
             .iter()

@@ -497,9 +497,9 @@ fn execute_op(
                 })
                 .map_err(CoordinatorError::Budget)?;
 
-            let budget = crate::app::Budget {
+            let budget = crate::search::Budget {
                 cancel: Some(Arc::clone(cancel)),
-                ..crate::app::Budget::start()
+                ..crate::search::Budget::start()
             };
             let hid = executor::execute_search(store, s, registry, &budget, notes)
                 .map_err(CoordinatorError::Execution)?;

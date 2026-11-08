@@ -24,10 +24,11 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 
-use crate::app::{self, Budget, MatchMode, Order, SearchRequest};
+use crate::app;
 use crate::picker::{self, Pick, PickError, PickMode};
 use crate::rlm::model::ModelBoundary;
 use crate::rlm::model::chat::ChatCompletionsClient;
+use crate::search::{self, Budget, MatchMode, Order, SearchRequest};
 use crate::store::Store;
 use model::{PAGE_LIMIT, PickOutcome, UiAction, UiEffect, UiModel, update};
 use term::{InputReader, TerminalGuard};
@@ -502,7 +503,7 @@ fn search_worker(store: &Store, mailbox: &Mailbox, tx: &SyncSender<UiAction>, de
             order: Order::RecentlyImported,
         };
         let t = Instant::now();
-        let result = app::search(store, &req, &Budget::start());
+        let result = search::search(store, &req, &Budget::start());
         let elapsed = t.elapsed();
         if tx
             .send(UiAction::SearchDone {
@@ -637,7 +638,7 @@ mod tests {
         }
     }
 
-    use crate::app::SearchPage;
+    use crate::search::SearchPage;
     use ratatui::backend::TestBackend;
 
     #[test]

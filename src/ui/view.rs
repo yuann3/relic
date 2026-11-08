@@ -8,10 +8,11 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::model::{Focus, Modal, RecallState, RecallStatus, StepState, UiModel};
-use crate::app::{MIN_PREFIX_CHARS, RecallOutcome, display_line};
+use crate::app::{RecallOutcome, display_line};
 use crate::domain::When;
 use crate::domain::{ObservationKind, Provenance};
 use crate::rlm::protocol::BudgetV1;
+use crate::search::MIN_PREFIX_CHARS;
 
 /// Below this the panes cannot show a usable row, so say so instead.
 pub const MIN_WIDTH: u16 = 40;
@@ -558,7 +559,7 @@ fn status_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         (None, false, Some(_), _) if s.too_broad => Span::styled(
             format!(
                 "search: too broad, stopped after {} ms",
-                crate::app::QUERY_DEADLINE.as_millis()
+                crate::search::QUERY_DEADLINE.as_millis()
             ),
             t.bad,
         ),
@@ -693,10 +694,11 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     use super::*;
-    use crate::app::{self, MatchMode, SearchRequest};
+    use crate::app;
     use crate::domain::SourceKind;
     use crate::import::import_file;
     use crate::redact::Redactor;
+    use crate::search::{self, MatchMode, SearchRequest};
     use crate::store::Store;
     use crate::ui::model::{Key, RecallEvent, UiAction, UiEffect, update};
 
@@ -723,9 +725,9 @@ mod tests {
                             query,
                             limit: 200,
                             mode: MatchMode::PrefixLast,
-                            order: app::Order::RecentlyImported,
+                            order: search::Order::RecentlyImported,
                         };
-                        let result = app::search(store, &req, &app::Budget::start());
+                        let result = search::search(store, &req, &search::Budget::start());
                         let elapsed = Duration::from_micros(1500);
                         queue.push(UiAction::SearchDone {
                             generation,
@@ -886,7 +888,7 @@ mod tests {
     #[test]
     fn results_say_when_words_were_ignored_and_keep_the_order_label_on_a_full_page() {
         let store = store_with(NGINX);
-        let long = vec!["x"; crate::app::MAX_WORD_TOKENS + 1].join("/");
+        let long = vec!["x"; crate::search::MAX_WORD_TOKENS + 1].join("/");
         let s = text(&render(
             &typed(&store, &format!("certbot {long} "), false),
             120,
@@ -907,7 +909,7 @@ mod tests {
         let mut m = typed(&store, "certbot re", false);
         update(&mut m, UiAction::Key(Key::Char('n')));
         let generation = m.search.generation;
-        let result = Err(crate::app::SearchError::TooBroad);
+        let result = Err(crate::search::SearchError::TooBroad);
         update(
             &mut m,
             UiAction::SearchDone {
@@ -1173,8 +1175,9 @@ mod tests {
     /// Bypasses the importer: it currently mangles non-ASCII (redact.rs
     /// pushes bytes as chars), and this test is about rendering.
     fn showing(text: &str) -> UiModel {
-        use crate::app::{EvidenceView, PageHit, SEARCH_SCHEMA, SearchPage};
+        use crate::app::EvidenceView;
         use crate::domain::{ObservationKind, StoredObservation};
+        use crate::search::{PageHit, SEARCH_SCHEMA, SearchPage};
         let mut m = UiModel::new(false);
         update(&mut m, UiAction::Key(Key::Char('x')));
         let hit = PageHit {
@@ -1191,7 +1194,7 @@ mod tests {
             truncated: false,
             deferred: None,
             words_dropped: 0,
-            order: crate::app::Order::RecentlyImported,
+            order: crate::search::Order::RecentlyImported,
             filtered: true,
             hits: vec![hit],
         };

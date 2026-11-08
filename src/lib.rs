@@ -8,6 +8,7 @@ pub mod key;
 pub mod picker;
 pub mod redact;
 pub mod rlm;
+pub mod search;
 pub mod signal;
 pub mod source;
 pub mod store;

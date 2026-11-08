@@ -19,8 +19,8 @@ use std::time::Instant;
 use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
 
-use relic::app::{self, MatchMode, SearchRequest};
 use relic::fixture;
+use relic::search::{self, MatchMode, SearchRequest};
 use relic::store::Store;
 
 /// The TUI's page, and the page #8 measured.
@@ -752,7 +752,7 @@ fn end_to_end(path: &Path, name: &str, with_store: bool, runs: usize) {
             .to_owned();
     let mut sep = "|---|---|---|---|---|---|".to_owned();
     if with_store {
-        header.push_str(" app::search (real Store) |");
+        header.push_str(" search::search (real Store) |");
         sep.push_str("---|");
     }
     println!("{header}\n{sep}");
@@ -845,15 +845,15 @@ fn end_to_end(path: &Path, name: &str, with_store: bool, runs: usize) {
                     } else {
                         MatchMode::Words
                     },
-                    order: app::Order::Rank,
+                    order: search::Order::Rank,
                 };
                 // Measured to the end: the bench wants the cost, not the cut-off.
-                let far = || app::Budget {
+                let far = || search::Budget {
                     deadline: Instant::now() + std::time::Duration::from_secs(600),
                     cancel: None,
                 };
                 let (s, _) = measure(runs, || {
-                    app::search(store, &req, &far()).unwrap().hits.len()
+                    search::search(store, &req, &far()).unwrap().hits.len()
                 });
                 let _ = write!(line, " {} |", cell(s));
             } else if store.is_some() {
@@ -1016,7 +1016,7 @@ impl Keystroke {
     /// Whether the TUI sends it to FTS under its `MIN_PREFIX_CHARS` gate.
     fn sent_by_tui(&self) -> bool {
         self.prefix_chars()
-            .is_none_or(|n| n >= app::MIN_PREFIX_CHARS)
+            .is_none_or(|n| n >= search::MIN_PREFIX_CHARS)
     }
 }
 
@@ -1336,7 +1336,7 @@ fn hot_study(src: &Path, work: &Path, runs: usize, source_bytes: f64) {
         println!("\n### Summary: worst keystroke per schema\n");
         println!(
             "| variant | ratio to source | worst p95, keystrokes the TUI sends (last token >= {} chars or whole) | that query | worst p95, 1-char included | sent keystrokes > {GATE_MS} ms | sent keystrokes > 10 ms | rows differ |",
-            app::MIN_PREFIX_CHARS
+            search::MIN_PREFIX_CHARS
         );
         println!("|---|---|---|---|---|---|---|---|");
         for (row, &vi) in timed.iter().zip(&variants) {
