@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::redact::Redactor;
+use crate::rlm::Progress;
 use crate::rlm::budget::{BudgetExhausted, BudgetLedger, Reservation};
-use crate::rlm::coordinator::Progress;
 use crate::rlm::model::egress::{EgressError, EgressRequest, Role};
 use crate::rlm::model::{ModelBoundary, ModelError, Prices, Reply};
 

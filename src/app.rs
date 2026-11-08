@@ -10,8 +10,9 @@ use serde::Serialize;
 
 use crate::domain::{Provenance, StoredObservation, When};
 use crate::redact::Redactor;
+use crate::rlm::Progress;
 use crate::rlm::coordinator::{
-    InvestigationResult, InvestigationStatus, Progress, SkillSeed, run_investigation,
+    InvestigationResult, InvestigationStatus, SkillSeed, run_investigation,
 };
 use crate::rlm::model::ModelBoundary;
 use crate::rlm::model::egress::Role;

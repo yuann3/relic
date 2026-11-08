@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use super::model::{RecallEvent, UiAction};
 use crate::app;
-use crate::rlm::coordinator::Progress;
+use crate::rlm::Progress;
 use crate::rlm::model::ModelBoundary;
 use crate::store::Store;
 
