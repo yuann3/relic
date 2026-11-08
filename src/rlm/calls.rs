@@ -101,7 +101,7 @@ pub fn call_all(c: &mut Calls, jobs: Vec<Job>) -> Result<Replies, Stop> {
                 release_unspent(c, flight, &reply);
                 // Provider text: redacted once, here, for every sink after.
                 let returned_model = reply.returned_model.as_deref().map(|m| Redactor::new().redact(m));
-                (c.progress)(Progress::Replied { role: flight.req.role(), returned_model });
+                (c.progress)(Progress::Replied { role: flight.req.role(), returned_model, usage: reply.usage });
                 results[i] = Some(Ok(reply));
             }
             Err(e) => match retry(c, flight, &e) {

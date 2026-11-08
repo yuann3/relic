@@ -584,8 +584,9 @@ impl RecallLog {
                 "role": role(&a.role), "bytes": a.bytes, "origin": a.origin, "profile": a.profile,
                 "request_hash": a.request_hash, "redaction_revision": a.redaction_revision,
             })),
-            Progress::Replied { role: r, returned_model } => {
-                self.line("reply", serde_json::json!({"role": role(r), "model": returned_model}))
+            Progress::Replied { role: r, returned_model, usage } => {
+                let usage = usage.map(|u| serde_json::json!({"prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens}));
+                self.line("reply", serde_json::json!({"role": role(r), "model": returned_model, "usage": usage}))
             }
             Progress::Retry { role: r, attempt, reason } => {
                 self.line("retry", serde_json::json!({"role": role(r), "attempt": attempt, "reason": redact(reason)}))

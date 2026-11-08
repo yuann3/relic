@@ -58,7 +58,10 @@ fn answer(mut stream: TcpStream, model: &str, seen: &Bodies, script: &Script) {
     let user = user_message(&body);
     let (status, body) = match script(&user) {
         Some(content) => {
-            let reply = json!({"model": model, "choices": [{"message": {"content": content.to_string()}, "finish_reason": "stop"}]});
+            // Usage as a provider reports it, a token for every 4 bytes.
+            let content = content.to_string();
+            let usage = json!({"prompt_tokens": length / 4, "completion_tokens": content.len() / 4});
+            let reply = json!({"model": model, "choices": [{"message": {"content": content}, "finish_reason": "stop"}], "usage": usage});
             ("200 OK", reply.to_string())
         }
         None => ("500 Internal Server Error", json!({"error": {"message": "the scripted model is down"}}).to_string()),
@@ -203,6 +206,10 @@ fn an_answer_cites_the_records_it_rests_on_by_id() {
     assert!(lines.iter().all(|l| l["schema"] == "relic.recall-log/v1" && l["recall"] == lines[0]["recall"]), "{log}");
     assert_eq!((&lines[0]["origin"], &lines[0]["profile"]), (&json!(origin), &json!("llama_cpp")));
     assert_eq!((&lines[1]["role"], &lines[2]["model"]), (&json!("root"), &json!("scripted")));
+    // The tokens the provider said the call took, as it said them.
+    let sent = bodies.lock().unwrap()[0].len() as u64;
+    assert_eq!(lines[2]["usage"]["prompt_tokens"].as_u64(), Some(sent / 4), "{log}");
+    assert!(lines[2]["usage"]["completion_tokens"].as_u64() > Some(0), "{log}");
     let finish = &lines[5];
     assert_eq!((&finish["outcome"], &finish["cited"], &finish["cost_microusd"]), (&json!("answered"), &json!([renew, certs]), &json!(0)));
     assert!(!log.contains("certbot") && !log.contains("renew"), "{log}");

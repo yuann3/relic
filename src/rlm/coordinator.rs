@@ -52,8 +52,9 @@ pub enum Progress {
     /// A request is about to leave: what, where and how big (ADR 0004).
     Egress(PayloadAudit),
     /// A model call came back; `returned_model` is what actually answered,
-    /// redacted: the provider wrote it.
-    Replied { role: Role, returned_model: Option<String> },
+    /// redacted: the provider wrote it. `usage` is the tokens it says the
+    /// call took, if it says.
+    Replied { role: Role, returned_model: Option<String>, usage: Option<crate::rlm::model::Usage> },
     /// A failed call is sent again, as the retry rule allows once.
     Retry { role: Role, attempt: u8, reason: String },
 }
@@ -79,7 +80,7 @@ impl std::fmt::Display for Progress {
                 a.profile,
                 a.request_hash
             ),
-            Self::Replied { role: r, returned_model } => {
+            Self::Replied { role: r, returned_model, .. } => {
                 write!(f, "{} reply from {}", role(r), returned_model.as_deref().unwrap_or("an unnamed model"))
             }
             Self::Retry { role: r, attempt, reason } => write!(f, "retry the {} call (attempt {attempt}): {reason}", role(r)),
