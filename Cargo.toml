@@ -43,6 +43,8 @@ map_unwrap_or = "warn"
 explicit_iter_loop = "warn"
 # A stable sort of primitives pays for an order no one can see.
 stable_sort_primitive = "warn"
+# `.cloned()` on Copy items hides that they are Copy.
+cloned_instead_of_copied = "warn"
 
 [[bin]]
 name = "relic"

@@ -517,7 +517,7 @@ mod tests {
         for (ev, want) in cases {
             assert_eq!(
                 keys(ev.clone()),
-                want.iter().cloned().collect::<Vec<_>>(),
+                want.iter().copied().collect::<Vec<_>>(),
                 "{ev:?}"
             );
         }
