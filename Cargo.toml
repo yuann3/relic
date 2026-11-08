@@ -41,6 +41,8 @@ cast_lossless = "warn"
 map_unwrap_or = "warn"
 # `for x in v.iter()` is `for x in &v`.
 explicit_iter_loop = "warn"
+# A stable sort of primitives pays for an order no one can see.
+stable_sort_primitive = "warn"
 
 [[bin]]
 name = "relic"

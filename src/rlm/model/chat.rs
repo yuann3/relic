@@ -907,7 +907,7 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect();
-            keys.sort();
+            keys.sort_unstable();
             let mut expected = vec![
                 "messages",
                 "model",
@@ -916,7 +916,7 @@ mod tests {
                 "stream",
                 token_field,
             ];
-            expected.sort();
+            expected.sort_unstable();
             assert_eq!(keys, expected, "{profile:?}");
             assert_eq!(
                 (

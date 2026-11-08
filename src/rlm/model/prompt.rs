@@ -136,8 +136,8 @@ mod tests {
                         .map(|v| v.as_str().unwrap())
                         .collect();
                     let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
-                    required.sort();
-                    keys.sort();
+                    required.sort_unstable();
+                    keys.sort_unstable();
                     assert_eq!(required, keys, "{path}");
                     assert_eq!(o["additionalProperties"], false, "{path}");
                 }
