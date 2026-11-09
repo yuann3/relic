@@ -269,13 +269,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
                 .and_then(|mut store| {
                     relic::import::import_git(&mut store, repo, &relic::redact::Redactor::new())
                 }) {
-                Err(ImportError::Busy) => {
-                    eprintln!(
-                        "relic: busy: another import is writing {}; try again",
-                        shown(&db)
-                    );
-                    return Ok(ExitCode::from(2));
-                }
+                Err(ImportError::Busy) => return Ok(busy(&db)),
                 r => r?,
             };
             store_notes(r.rescrubbed, r.scrub_blocked, r.checkpoint_blocked);
@@ -310,13 +304,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
             }
             tighten(&db, owns_dir);
             let r = match import(&db, &history, shell) {
-                Err(ImportError::Busy) => {
-                    eprintln!(
-                        "relic: busy: another import is writing {}; try again",
-                        shown(&db)
-                    );
-                    return Ok(ExitCode::from(2));
-                }
+                Err(ImportError::Busy) => return Ok(busy(&db)),
                 r => r?,
             };
             let (name, n) = (shown(&path), r.records_stored);
@@ -482,13 +470,7 @@ fn import_sessions(
         kind,
         &relic::redact::Redactor::new(),
     ) {
-        Err(ImportError::Busy) => {
-            eprintln!(
-                "relic: busy: another import is writing {}; try again",
-                shown(&db)
-            );
-            return Ok(ExitCode::from(2));
-        }
+        Err(ImportError::Busy) => return Ok(busy(&db)),
         r => r?,
     };
     for warning in &r.key_warnings {
@@ -893,6 +875,15 @@ fn could_not_look(e: &dyn std::error::Error) -> ExitCode {
 }
 
 /// A path as it may reach the terminal.
+/// Exit 2: another import holds the store's write lock.
+fn busy(db: &Path) -> ExitCode {
+    eprintln!(
+        "relic: busy: another import is writing {}; try again",
+        shown(db)
+    );
+    ExitCode::from(2)
+}
+
 fn shown(path: &Path) -> String {
     app::display_line(&path.display().to_string())
 }
