@@ -116,7 +116,7 @@ pub fn execute_search(
             // empty set and why, and can plan rarer terms (#26 handoff).
             Err(e @ search::SearchError::TooBroad) => {
                 notes.push(format!("{}: {e}", search.op_id));
-                return Ok(registry.insert_evidence_set(Vec::new()));
+                return Ok(registry.insert_evidence_set(Vec::<StoredObservation>::new()));
             }
             Err(search::SearchError::Cancelled) => return Err(ExecError::Cancelled),
             Err(e) => return Err(ExecError::Search(e)),
@@ -376,7 +376,10 @@ pub fn execute_assess(
         }
     }
 
-    let assessed_obs = source_obs[..selected_count].to_vec();
+    let assessed_obs: Vec<_> = source_obs[..selected_count]
+        .iter()
+        .map(Arc::clone)
+        .collect();
     Ok(registry.insert_assessment_set(assessed_obs, assessments))
 }
 
@@ -401,14 +404,14 @@ pub fn execute_select(
     }
     let observations = registry.get_observations(source).unwrap_or_default();
     let assessments = registry.get_assessments(source).unwrap_or_default();
-    let picked = observations
+    let picked: Vec<_> = observations
         .iter()
         .zip(assessments)
         .filter(|(_, a)| {
             a.as_ref()
                 .is_some_and(|a| select.verdicts.contains(&a.verdict))
         })
-        .map(|(o, _)| o.clone())
+        .map(|(o, _)| Arc::clone(o))
         .take(select.limit as usize)
         .collect();
     Ok(registry.insert_evidence_set(picked))

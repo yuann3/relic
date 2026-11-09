@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::domain::StoredObservation;
 use crate::rlm::protocol::ItemAssessmentV1;
@@ -140,7 +141,9 @@ pub struct ResultHandleV1 {
 /// Entry stored in the registry.
 struct RegistryEntry {
     handle: ResultHandleV1,
-    observations: Vec<StoredObservation>,
+    /// Shared with every other set holding the same records, and with the
+    /// investigation's result once they are cited.
+    observations: Vec<Arc<StoredObservation>>,
     evidence_handles: Vec<EvidenceHandleV1>,
     /// One per observation in an assessment set; `None` is unassessed.
     /// Empty for an evidence set.
@@ -174,7 +177,12 @@ impl HandleRegistry {
     }
 
     /// Insert an evidence set. Returns the handle ID.
-    pub fn insert_evidence_set(&mut self, observations: Vec<StoredObservation>) -> HandleId {
+    /// Takes records fresh from the store or shared with another set.
+    pub fn insert_evidence_set(
+        &mut self,
+        observations: impl IntoIterator<Item = impl Into<Arc<StoredObservation>>>,
+    ) -> HandleId {
+        let observations = observations.into_iter().map(Into::into).collect();
         self.insert(HandleKind::EvidenceSet, observations, Vec::new())
     }
 
@@ -182,16 +190,17 @@ impl HandleRegistry {
     /// `observations[i]`. Returns the handle ID.
     pub fn insert_assessment_set(
         &mut self,
-        observations: Vec<StoredObservation>,
+        observations: impl IntoIterator<Item = impl Into<Arc<StoredObservation>>>,
         assessments: Vec<Option<ItemAssessmentV1>>,
     ) -> HandleId {
+        let observations = observations.into_iter().map(Into::into).collect();
         self.insert(HandleKind::AssessmentSet, observations, assessments)
     }
 
     fn insert(
         &mut self,
         kind: HandleKind,
-        observations: Vec<StoredObservation>,
+        observations: Vec<Arc<StoredObservation>>,
         assessments: Vec<Option<ItemAssessmentV1>>,
     ) -> HandleId {
         let id = format!("h_{}", self.next_handle);
@@ -236,7 +245,7 @@ impl HandleRegistry {
     }
 
     /// Get the observations for a handle.
-    pub fn get_observations(&self, handle_id: &str) -> Option<&[StoredObservation]> {
+    pub fn get_observations(&self, handle_id: &str) -> Option<&[Arc<StoredObservation>]> {
         self.entries
             .get(handle_id)
             .map(|e| e.observations.as_slice())
@@ -260,7 +269,7 @@ impl HandleRegistry {
     pub fn resolve_evidence_id(
         &self,
         evidence_id: &str,
-    ) -> Option<(&EvidenceHandleV1, &StoredObservation)> {
+    ) -> Option<(&EvidenceHandleV1, &Arc<StoredObservation>)> {
         for entry in self.entries.values() {
             for (i, eh) in entry.evidence_handles.iter().enumerate() {
                 if eh.id == evidence_id {

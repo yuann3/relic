@@ -23,7 +23,7 @@ pub struct InvestigationResult {
     /// Past the finish gate: every citation in it resolves.
     pub finish: Option<FinishV1>,
     /// The observation behind each evidence id `finish` cites.
-    pub cited: HashMap<EvidenceId, StoredObservation>,
+    pub cited: HashMap<EvidenceId, Arc<StoredObservation>>,
     /// At most this many micro-US-dollars; `None` when the model has no
     /// prices, so the cost is unknown.
     pub cost_microusd: Option<u64>,
@@ -155,7 +155,12 @@ pub fn run_investigation(
                 .flat_map(|c| c.supports.iter().chain(&c.contradicts));
             claims.chain(f.procedure.iter().flat_map(|s| &s.supports))
         })
-        .filter_map(|id| Some((id.clone(), run.registry.resolve_evidence_id(id)?.1.clone())))
+        .filter_map(|id| {
+            Some((
+                id.clone(),
+                Arc::clone(run.registry.resolve_evidence_id(id)?.1),
+            ))
+        })
         .collect();
     let cost_microusd = run.model.prices().map(|_| run.ledger.cost_spent());
     InvestigationResult {
