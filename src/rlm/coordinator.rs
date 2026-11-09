@@ -320,7 +320,7 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
                 }
 
                 // Execute ops sequentially.
-                let mut plan_outputs: HashMap<String, HandleId> = HashMap::new();
+                let mut plan_outputs = executor::PlanOutputs::new();
                 for op in &validated.ops {
                     if run.cancelled() {
                         return (InvestigationStatus::Cancelled, None);
@@ -334,8 +334,8 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
                         (run.progress)(Progress::Note(note.clone()));
                     }
                     match out {
-                        Ok(Some((op_id, handle_id))) => {
-                            plan_outputs.insert(op_id, handle_id);
+                        Ok(Some(handle_id)) => {
+                            plan_outputs.insert(validate::op_id(op), handle_id);
                         }
                         Ok(None) => {}
                         Err(CoordinatorError::Execution(ExecError::Cancelled)) => {
@@ -391,8 +391,8 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
 fn execute_op(
     run: &mut Run,
     op: &Op,
-    plan_outputs: &HashMap<String, HandleId>,
-) -> Result<Option<(String, HandleId)>, CoordinatorError> {
+    plan_outputs: &executor::PlanOutputs,
+) -> Result<Option<HandleId>, CoordinatorError> {
     let Run {
         store,
         model,
@@ -432,7 +432,7 @@ fn execute_op(
                 ledger.release_rows(reserved - actual);
             }
 
-            Ok(Some((s.op_id.clone(), hid)))
+            Ok(Some(hid))
         }
 
         Op::Expand(e) => {
@@ -453,7 +453,7 @@ fn execute_op(
                 ledger.release_rows(reserved - actual);
             }
 
-            Ok(Some((e.op_id.clone(), hid)))
+            Ok(Some(hid))
         }
 
         Op::Assess(a) => {
@@ -500,7 +500,7 @@ fn execute_op(
                 executor::execute_assess(a, registry, plan_outputs, &mut call_children, notes)
                     .map_err(CoordinatorError::Execution)?;
 
-            Ok(Some((a.op_id.clone(), hid)))
+            Ok(Some(hid))
         }
 
         Op::Inspect(i) => {
@@ -509,7 +509,7 @@ fn execute_op(
             let packet_id = format!("inspect_{}", i.op_id);
             *last_inspection = Some(packet(
                 registry,
-                &source_hid,
+                source_hid,
                 i.limit as usize,
                 i.max_item_bytes,
                 packet_id,
@@ -529,7 +529,7 @@ fn execute_op(
             let hid = executor::execute_select(k, registry, plan_outputs)
                 .map_err(CoordinatorError::Execution)?;
 
-            Ok(Some((k.op_id.clone(), hid)))
+            Ok(Some(hid))
         }
     }
 }

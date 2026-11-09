@@ -143,13 +143,13 @@ pub fn execute_expand(
     store: &Store,
     expand: &ExpandV1,
     registry: &mut HandleRegistry,
-    plan_outputs: &std::collections::HashMap<String, HandleId>,
+    plan_outputs: &PlanOutputs,
     cancel: &Arc<AtomicBool>,
 ) -> Result<HandleId, ExecError> {
     let source_handle_id = resolve_input(&expand.input, plan_outputs)?;
     let seed_obs = registry
-        .get_observations(&source_handle_id)
-        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.clone()))?;
+        .get_observations(source_handle_id)
+        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.to_owned()))?;
 
     let stop = {
         let cancel = Arc::clone(cancel);
@@ -325,18 +325,18 @@ pub type CallChildren<'a> =
 pub fn execute_assess(
     assess: &AssessV1,
     registry: &mut HandleRegistry,
-    plan_outputs: &std::collections::HashMap<String, HandleId>,
+    plan_outputs: &PlanOutputs,
     call_children: &mut CallChildren,
     notes: &mut Vec<String>,
 ) -> Result<HandleId, ExecError> {
     let source_handle_id = resolve_input(&assess.input, plan_outputs)?;
     let source_obs = registry
-        .get_observations(&source_handle_id)
-        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.clone()))?;
+        .get_observations(source_handle_id)
+        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.to_owned()))?;
 
     let evidence_handles = registry
-        .get_evidence_handles(&source_handle_id)
-        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.clone()))?;
+        .get_evidence_handles(source_handle_id)
+        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.to_owned()))?;
 
     // Select up to max_items observations.
     let selected_count = source_obs.len().min(assess.max_items as usize);
@@ -385,22 +385,22 @@ pub fn execute_assess(
 pub fn execute_select(
     select: &SelectV1,
     registry: &mut HandleRegistry,
-    plan_outputs: &std::collections::HashMap<String, HandleId>,
+    plan_outputs: &PlanOutputs,
 ) -> Result<HandleId, ExecError> {
     let source = resolve_input(&select.input, plan_outputs)?;
     let handle = registry
-        .get(&source)
-        .ok_or_else(|| ExecError::HandleNotFound(source.clone()))?;
+        .get(source)
+        .ok_or_else(|| ExecError::HandleNotFound(source.to_owned()))?;
     // Plan admission checks plan outputs; a handle from an earlier turn
     // is checked here.
     if handle.kind != HandleKind::AssessmentSet {
         return Err(ExecError::WrongKind {
-            handle: source,
+            handle: source.to_owned(),
             expected: HandleKind::AssessmentSet,
         });
     }
-    let observations = registry.get_observations(&source).unwrap_or_default();
-    let assessments = registry.get_assessments(&source).unwrap_or_default();
+    let observations = registry.get_observations(source).unwrap_or_default();
+    let assessments = registry.get_assessments(source).unwrap_or_default();
     let picked = observations
         .iter()
         .zip(assessments)
@@ -414,17 +414,20 @@ pub fn execute_select(
     Ok(registry.insert_evidence_set(picked))
 }
 
-/// Resolve an InputRefV1 to a HandleId.
-pub fn resolve_input(
-    input: &InputRefV1,
-    plan_outputs: &std::collections::HashMap<String, HandleId>,
-) -> Result<HandleId, ExecError> {
+/// The handle each op of the running plan made, by its op_id.
+pub type PlanOutputs<'p> = std::collections::HashMap<&'p str, HandleId>;
+
+/// Resolve an InputRefV1 to the id of the handle it names.
+pub fn resolve_input<'a>(
+    input: &'a InputRefV1,
+    plan_outputs: &'a PlanOutputs,
+) -> Result<&'a str, ExecError> {
     match input {
         InputRefV1::Output(op_id) => plan_outputs
             .get(op_id.as_str())
-            .cloned()
+            .map(String::as_str)
             .ok_or_else(|| ExecError::HandleNotFound(op_id.clone())),
-        InputRefV1::Handle(handle_id) => Ok(handle_id.clone()),
+        InputRefV1::Handle(handle_id) => Ok(handle_id),
     }
 }
 
@@ -652,7 +655,7 @@ mod tests {
             limit: 100,
         };
         let mut plan_outputs = HashMap::new();
-        plan_outputs.insert("s1".to_string(), s_hid);
+        plan_outputs.insert("s1", s_hid);
 
         let e_hid = execute_expand(
             &store,
@@ -713,7 +716,7 @@ mod tests {
             limit: 100,
         };
         let mut plan_outputs = HashMap::new();
-        plan_outputs.insert("s1".to_string(), s_hid);
+        plan_outputs.insert("s1", s_hid);
 
         let e_hid = execute_expand(
             &store,
@@ -892,7 +895,7 @@ mod tests {
         };
 
         let mut plan_outputs = HashMap::new();
-        plan_outputs.insert("s1".to_string(), s_hid);
+        plan_outputs.insert("s1", s_hid);
 
         let mut child_calls = 0;
         let a_hid = execute_assess(
