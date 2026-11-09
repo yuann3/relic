@@ -3,6 +3,7 @@
 //! the user chose, under the umask the user started Relic with, with its
 //! time and output bounded. Relic never runs a recalled procedure.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -135,17 +136,17 @@ pub fn run(argv: &[String], cwd: &Path) -> std::io::Result<(ValidationRecord, Op
 /// `argv` as one shell-quoted line: redacting each argument alone would
 /// never see `--password` beside its value.
 fn command_line(argv: &[String]) -> String {
-    let quote = |a: &String| {
+    fn quote(a: &str) -> Cow<'_, str> {
         if !a.is_empty()
             && a.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"@%+=:,./_-".contains(&b))
         {
-            a.clone()
+            Cow::Borrowed(a)
         } else {
-            format!("'{}'", a.replace('\'', r"'\''"))
+            Cow::Owned(format!("'{}'", a.replace('\'', r"'\''")))
         }
-    };
-    argv.iter().map(quote).collect::<Vec<_>>().join(" ")
+    }
+    argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
