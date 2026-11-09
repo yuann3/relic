@@ -371,10 +371,10 @@ impl Catalog {
     fn install(&self, name: &str, description: &str, md: &str) -> Result<Bundle, CatalogError> {
         let hash = blake3::hash(md.as_bytes()).to_hex().to_string();
         let bundle = Bundle {
-            hash: hash.clone(),
+            path: self.dir.join(&hash).join(name),
+            hash,
             name: name.into(),
             description: description.into(),
-            path: self.dir.join(&hash).join(name),
         };
         if bundle.path.join("SKILL.md").exists() {
             return Ok(bundle);
@@ -390,7 +390,7 @@ impl Catalog {
         fs::File::open(&file)?.sync_all()?;
         sync_dir(&tmp.join(name))?;
         sync_dir(&tmp)?;
-        match fs::rename(&tmp, self.dir.join(&hash)) {
+        match fs::rename(&tmp, self.dir.join(&bundle.hash)) {
             Ok(()) => {}
             // Another compile of the same content got there first.
             Err(_) if bundle.path.join("SKILL.md").exists() => fs::remove_dir_all(&tmp)?,
@@ -519,13 +519,13 @@ impl Catalog {
     /// that could not be.
     fn put_back(
         &self,
-        swapped: &[(&PathBuf, Option<String>, Option<String>)],
+        swapped: &[(&Path, Option<&str>, Option<&str>)],
         error: CatalogError,
     ) -> CatalogError {
         let stranded: Vec<PathBuf> = swapped
             .iter()
-            .filter(|(link, was, is)| self.point(link, was.as_deref(), is.as_deref()).is_err())
-            .map(|(link, _, _)| (*link).clone())
+            .filter(|(link, was, is)| self.point(link, *was, *is).is_err())
+            .map(|(link, _, _)| link.to_path_buf())
             .collect();
         if stranded.is_empty() {
             error
@@ -537,23 +537,27 @@ impl Catalog {
     /// Point every link at `bundle`, or none of them: links are checked first,
     /// and a failed swap or commit puts back those already made.
     pub fn activate(&self, bundle: &Bundle, links: &[PathBuf]) -> Result<(), CatalogError> {
-        let previous: Vec<(&PathBuf, Option<String>, Option<String>)> = links
+        let previous: Vec<(&PathBuf, Option<String>)> = links
             .iter()
-            .map(|l| Ok((l, self.current(l)?, Some(bundle.hash.clone()))))
+            .map(|l| Ok((l, self.current(l)?)))
             .collect::<Result<_, CatalogError>>()?;
+        let swapped: Vec<(&Path, Option<&str>, Option<&str>)> = previous
+            .iter()
+            .map(|(link, was)| (link.as_path(), was.as_deref(), Some(bundle.hash.as_str())))
+            .collect();
         let tx = self.conn.unchecked_transaction()?;
-        for (link, previous, _) in &previous {
+        for (link, previous) in &previous {
             tx.execute(
                 "INSERT INTO activation (link, bundle, previous, at_ms) VALUES (?1, ?2, ?3, ?4)",
                 params![link.as_os_str().as_bytes(), bundle.hash, previous, now_ms()],
             )?;
         }
-        for (i, (link, was, _)) in previous.iter().enumerate() {
+        for (i, (link, was)) in previous.iter().enumerate() {
             if let Err(e) = self.point(link, Some(&bundle.hash), was.as_deref()) {
-                return Err(self.put_back(&previous[..i], e));
+                return Err(self.put_back(&swapped[..i], e));
             }
         }
-        tx.commit().map_err(|e| self.put_back(&previous, e.into()))
+        tx.commit().map_err(|e| self.put_back(&swapped, e.into()))
     }
 
     /// Undo each link's newest activation not yet undone: point it back at
@@ -585,16 +589,16 @@ impl Catalog {
                 params![link.as_os_str().as_bytes(), previous, now, undoes, now_ms()],
             )?;
         }
-        let was: Vec<(&PathBuf, Option<String>, Option<String>)> = back
+        let swapped: Vec<(&Path, Option<&str>, Option<&str>)> = back
             .iter()
-            .map(|(link, _, now, previous)| (*link, now.clone(), previous.clone()))
+            .map(|(link, _, now, previous)| (link.as_path(), now.as_deref(), previous.as_deref()))
             .collect();
         for (i, (link, _, now, previous)) in back.iter().enumerate() {
             if let Err(e) = self.point(link, previous.as_deref(), now.as_deref()) {
-                return Err(self.put_back(&was[..i], e));
+                return Err(self.put_back(&swapped[..i], e));
             }
         }
-        tx.commit().map_err(|e| self.put_back(&was, e.into()))?;
+        tx.commit().map_err(|e| self.put_back(&swapped, e.into()))?;
         Ok(back
             .into_iter()
             .map(|(_, _, _, previous)| previous)
