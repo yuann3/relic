@@ -30,6 +30,7 @@ Status: Accepted · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture]
 - Only the import writer runs migrations. They are numbered, forward-only, and each runs in an exclusive transaction.
 - A reader refuses a mismatched version and prints a hint.
 - Prototype DBs are discarded. v0.1 ships at version 1 with zero migrations.
+- Version 2 adds the first migration, the `forgotten_ref` table ([S13](https://github.com/yuann3/relic/issues/38)). Any writer migrates, `relic forget` included, since forget must write a mark. A reader meeting an older store tells the user that the next import or forget upgrades it.
 
 **Durability and corruption**
 - `synchronous=NORMAL` stays. Power loss in WAL mode can lose the last committed transaction, but its content is still in the source file (shells trim the oldest lines), so the next import restores it.

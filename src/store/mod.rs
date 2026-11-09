@@ -24,7 +24,13 @@ pub enum StoreError {
     /// Not SQLite, another program's database, or a store from a pre-release
     /// build, which ADR 0005 discards.
     NotRelic(PathBuf),
-    /// A store written under another schema version.
+    /// A store an older relic wrote, which a reader leaves for the next
+    /// import to migrate.
+    Older {
+        path: PathBuf,
+        found: u32,
+    },
+    /// A store a newer relic wrote.
     Version {
         path: PathBuf,
         found: i64,
@@ -57,6 +63,12 @@ impl std::fmt::Display for StoreError {
                 f,
                 "{} is not a store this relic can read: it is another program's file, or a \
                  pre-release relic wrote it. Move it away and run `relic import` again",
+                path.display()
+            ),
+            Self::Older { path, found } => write!(
+                f,
+                "{} is store version {found}, older than the {SCHEMA_VERSION} this relic reads. Any \
+                 `relic import` or `relic forget` with this relic upgrades it",
                 path.display()
             ),
             Self::Version { path, found } => write!(
@@ -391,17 +403,25 @@ impl Store {
         // is recovering after a crashed write: measured on bundled SQLite
         // 3.49.1, that is SQLITE_BUSY_RECOVERY once busy_timeout runs out.
         // One retry, said out loud, and no loop (ADR 0005).
-        let is_store = match schema::is_store(&conn, path) {
+        let found = match schema::store_version(&conn, path) {
             Err(StoreError::Busy) => {
                 eprintln!(
                     "relic: note: the store was busy, as it is while another relic recovers it; trying once more"
                 );
-                schema::is_store(&conn, path)?
+                schema::store_version(&conn, path)?
             }
-            is_store => is_store?,
+            found => found?,
         };
-        if !is_store {
-            return Err(StoreError::NoStoreYet(path.to_path_buf()));
+        match found {
+            None => return Err(StoreError::NoStoreYet(path.to_path_buf())),
+            // A reader never migrates: the next import does.
+            Some(v) if v < SCHEMA_VERSION => {
+                return Err(StoreError::Older {
+                    path: path.to_path_buf(),
+                    found: v,
+                });
+            }
+            Some(_) => {}
         }
         schema::configure_reader(&conn)?;
         Ok(Self {
@@ -1509,6 +1529,34 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn a_reader_leaves_an_older_store_for_the_next_writer_to_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("relic.db");
+        let mut store = Store::open(&db).unwrap();
+        let ids = insert(&mut store, &[make_observation(0, "git status")]);
+        drop(store);
+        // Version 1 is the base schema, before any migration.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("DROP TABLE forgotten_ref; PRAGMA user_version = 1;")
+            .unwrap();
+
+        let err = Store::open_read_only(&db).err().expect("must refuse");
+        assert!(matches!(err, StoreError::Older { found: 1, .. }), "{err}");
+        assert!(err.to_string().contains("`relic import`"), "{err}");
+
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.schema_version().unwrap(), i64::from(SCHEMA_VERSION));
+        assert!(store.has_table("forgotten_ref").unwrap());
+        drop(store);
+        let read = Store::open_read_only(&db).unwrap();
+        assert_eq!(
+            read.get_observation(ids[0]).unwrap().unwrap().safe_text,
+            "git status"
+        );
     }
 
     #[test]
