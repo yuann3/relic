@@ -403,39 +403,41 @@ pub fn check(client: &ChatCompletionsClient) -> (Value, Result<(), String>) {
                     .call(Arc::new(req), Instant::now() + CHECK_DEADLINE)
                     .map_err(|e| e.to_string())
             });
-        let checked = outcome
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|reply| match role {
-                Role::Child => check_child_result(&packet, &reply.body)
-                    .map(drop)
-                    .map_err(|e| e.to_string()),
-                Role::Root => parse_output::<RootActionV1>(
-                    &reply.body,
-                    crate::rlm::coordinator::ROOT_RESULT_MAX,
-                )
-                .map_err(|e| format!("{e:?}"))
-                .and_then(|a| match a.kind {
-                    RootActionKind::Plan => crate::rlm::validate::validate_plan(a, 0)
+        let (checked, returned_model, usage_reported) = match outcome {
+            Err(e) => (Err(e), None, false),
+            Ok(reply) => {
+                let checked = match role {
+                    Role::Child => check_child_result(&packet, &reply.body)
                         .map(drop)
                         .map_err(|e| e.to_string()),
-                    RootActionKind::Finish if a.finish.is_some() => Ok(()),
-                    RootActionKind::Finish => Err("a finish without its body".into()),
-                }),
-            });
-        let reply = outcome.as_ref().ok();
-        roles.insert(
-            name.clone(),
-            json!({
-                "ok": checked.is_ok(),
-                "returned_model": reply.and_then(|r| r.returned_model.clone()),
-                "usage_reported": reply.is_some_and(|r| r.usage.is_some()),
-                "error": checked.as_ref().err(),
-            }),
-        );
-        if let (Err(e), Ok(())) = (checked, &verdict) {
+                    Role::Root => parse_output::<RootActionV1>(
+                        &reply.body,
+                        crate::rlm::coordinator::ROOT_RESULT_MAX,
+                    )
+                    .map_err(|e| format!("{e:?}"))
+                    .and_then(|a| match a.kind {
+                        RootActionKind::Plan => crate::rlm::validate::validate_plan(a, 0)
+                            .map(drop)
+                            .map_err(|e| e.to_string()),
+                        RootActionKind::Finish if a.finish.is_some() => Ok(()),
+                        RootActionKind::Finish => Err("a finish without its body".into()),
+                    }),
+                };
+                (checked, reply.returned_model, reply.usage.is_some())
+            }
+        };
+        if let (Err(e), Ok(())) = (&checked, &verdict) {
             verdict = Err(format!("{name} call: {e}"));
         }
+        roles.insert(
+            name,
+            json!({
+                "ok": checked.is_ok(),
+                "returned_model": returned_model,
+                "usage_reported": usage_reported,
+                "error": checked.err(),
+            }),
+        );
     }
     let receipt = json!({
         "schema": "relic.model-check/v1",
