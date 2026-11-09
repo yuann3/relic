@@ -9,7 +9,7 @@ use crate::domain::{FLAG_LOSSY, Observation, ObservationKind, Provenance, Source
 use crate::key::{self, InstallationKey};
 use crate::redact::{REDACTION_REVISION, Redactor};
 use crate::source::{self, RawRecord};
-use crate::store::{Cursor, RevisionTx, StatHint, Store, StoreError};
+use crate::store::{self, Cursor, RevisionTx, StatHint, Store, StoreError};
 
 /// How an import related the file to what the store already held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -362,6 +362,7 @@ pub fn import_git(
         records: raw,
     } = repo;
     let (rescrubbed, scrubbed) = store.rescrub(REDACTION_REVISION, |safe| redactor.redact(safe))?;
+    let installation_key = store.installation_key().map_err(ImportError::Io)?;
     let source = store.lock_source(git_dir.as_os_str().as_bytes())?;
     if let Some(kind) = source.stored_kind().filter(|k| *k != SourceKind::Git) {
         return Err(ImportError::Io(io::Error::other(format!(
@@ -387,6 +388,7 @@ pub fn import_git(
     // storing it again would undo `relic forget`. One forgotten in that very
     // second comes back, as a move Git makes later in it must be stored.
     let forgotten_before = source.newest().map_or(0, |n| n.cursor.stable_len);
+    let forgotten_refs = source.forgotten_refs()?;
     let mut high_water = forgotten_before;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -413,9 +415,11 @@ pub fn import_git(
             *n -= 1;
             continue;
         }
-        if kind == ObservationKind::GitReflog
-            && observed_at_ms.is_some_and(|at| at < forgotten_before)
-        {
+        let forgotten = match kind {
+            ObservationKind::GitReflog => observed_at_ms.is_some_and(|at| at < forgotten_before),
+            _ => forgotten_refs.contains(&store::ref_mark(&installation_key, &safe_text)),
+        };
+        if forgotten {
             continue;
         }
         let flags = if r.lossy { FLAG_LOSSY } else { 0 };
@@ -2343,6 +2347,55 @@ mod tests {
             panic!("{:#?}", git_texts(&store))
         };
         assert_eq!(at, Some(1_700_000_200_000));
+    }
+
+    #[test]
+    fn a_forgotten_ref_stays_forgotten_until_it_points_somewhere_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(repo, &["branch", "side"]);
+        let mut store = Store::open_memory().unwrap();
+        let redactor = Redactor::new();
+        import_git(&mut store, read_git(repo), &redactor).unwrap();
+        let side = |store: &Store| {
+            store
+                .recent(1000)
+                .unwrap()
+                .into_iter()
+                .filter(|h| {
+                    h.kind == ObservationKind::GitRef
+                        && h.safe_text.starts_with("git ref refs/heads/side ")
+                })
+                .map(|h| (h.id, h.safe_text))
+                .collect::<Vec<_>>()
+        };
+        let [(id, _)] = side(&store)[..] else {
+            panic!("{:#?}", git_texts(&store))
+        };
+        store.forget(&[id]).unwrap();
+
+        let again = import_git(&mut store, read_git(repo), &redactor).unwrap();
+        assert_eq!(
+            (again.outcome, again.reflog_stored, again.refs_stored),
+            (Outcome::Unchanged, 0, 0)
+        );
+        assert_eq!(side(&store), []);
+
+        // Where it points now is new evidence.
+        git_at(
+            repo,
+            1_700_000_100,
+            &["commit", "-q", "--allow-empty", "-m", "two"],
+        );
+        git_at(repo, 1_700_000_200, &["branch", "-f", "side", "main"]);
+        let moved = import_git(&mut store, read_git(repo), &redactor).unwrap();
+        assert_eq!((moved.reflog_stored, moved.refs_stored), (3, 2));
+        let [(_, text)] = &side(&store)[..] else {
+            panic!("{:#?}", git_texts(&store))
+        };
+        assert!(text.ends_with(" two"), "{text}");
     }
 
     #[test]

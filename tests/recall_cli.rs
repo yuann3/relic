@@ -607,11 +607,36 @@ fn privacy_canary_gate() {
     std::fs::write(repo.join("f"), "x").unwrap();
     git(&["add", "f"]);
     git(&["stash", "-q", "-m", "certbot wip token=Zq9CanaryStash15"]);
+    // A branch whose name redaction keeps, and with no reflog: once its ref
+    // is forgotten, importing Git again must not bring the name back.
+    git(&[
+        "-c",
+        "core.logAllRefUpdates=false",
+        "branch",
+        "Zq9CanaryRef32",
+    ]);
     let out = relic(&["import", repo.to_str().unwrap()], &db, "");
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    let found = relic(&["search", "Zq9CanaryRef32", "--json"], &db, "");
+    let found: Value = serde_json::from_slice(&found.stdout).unwrap();
+    let [hit] = &found["hits"].as_array().unwrap()[..] else {
+        panic!("{found}")
+    };
+    assert_eq!(hit["source"], "git", "{found}");
+    assert!(
+        relic(&["forget", &hit["id"].to_string()], &db, "")
+            .status
+            .success()
+    );
+    let out = relic(&["import", repo.to_str().unwrap()], &db, "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stderr.ends_with("no new reflog entries or refs\n"),
+        "{stderr}"
     );
     // A Claude Code session: secrets in what Relic keeps (a command, its
     // output, a skill's args), and in every field it must not keep at all.

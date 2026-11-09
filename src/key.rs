@@ -1,8 +1,10 @@
 //! The installation key: 32 random bytes in a 0600 file beside the database.
-//! It keys only the import boundary guard, so a leaked database alone cannot
-//! be used to brute-force the raw bytes a guard covers. Losing it is harmless:
-//! the next import cannot verify its guard and anchor-aligns instead
-//! (ADR 0002).
+//! It keys the import boundary guard, a skill's durable citations and the
+//! marks of forgotten Git refs, so a leaked database alone cannot be used to
+//! brute-force the bytes any of them cover. Losing it costs little: the next
+//! import anchor-aligns instead of verifying its guard (ADR 0002), citations
+//! go stale, and a forgotten Git ref comes back on the next import of its
+//! repository until it is forgotten again.
 
 use std::fs;
 use std::io::{self, Write};

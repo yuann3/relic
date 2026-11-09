@@ -44,6 +44,9 @@ pub enum StoreError {
     Sqlite(rusqlite::Error),
     /// The OS random source failed while minting a source's logical id.
     Entropy(getrandom::Error),
+    /// The installation key could not be read or written, so a forgotten
+    /// Git ref could not be marked; nothing was forgotten.
+    Key(std::io::Error),
 }
 
 impl From<rusqlite::Error> for StoreError {
@@ -59,6 +62,10 @@ impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Busy => write!(f, "busy: another relic is using the store; try again"),
+            Self::Key(e) => write!(
+                f,
+                "installation key: {e}; forgot nothing, as a forgotten Git ref would come back"
+            ),
             Self::NotRelic(path) => write!(
                 f,
                 "{} is not a store this relic can read: it is another program's file, or a \
@@ -273,6 +280,18 @@ impl<'a> SourceLock<'a> {
         Ok(out)
     }
 
+    /// The marks of this source's forgotten Git refs (see [`ref_mark`]).
+    pub fn forgotten_refs(&self) -> Result<std::collections::HashSet<[u8; 16]>, StoreError> {
+        let mut stmt = self.tx.prepare(
+            "SELECT mark FROM forgotten_ref
+             WHERE source_id = (SELECT id FROM source WHERE private_locator = ?1)",
+        )?;
+        let marks = stmt
+            .query_map([self.locator], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(marks)
+    }
+
     /// Reopen the newest revision to append records after its last one. A
     /// source with no revision yet gets its first.
     pub fn append(self, kind: SourceKind) -> Result<RevisionTx<'a>, StoreError> {
@@ -462,10 +481,7 @@ impl Store {
     /// The installation key, written fresh if it is missing. An in-memory
     /// store has no file to keep one in, so its key is all zeros.
     pub fn installation_key(&self) -> std::io::Result<crate::key::InstallationKey> {
-        match &self.key_path {
-            Some(path) => Ok(crate::key::load_or_create(path)?.0),
-            None => Ok([0; 32]),
-        }
+        installation_key(self.key_path.as_deref())
     }
 
     /// Check whether a table exists in the database.
@@ -655,7 +671,31 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut forgotten = Vec::new();
+        let mut key = None;
         for id in ids {
+            // A ref's observed-at is when it was imported, so nothing else
+            // tells it from a new sighting: its mark keeps it forgotten.
+            let git_ref: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT sr.source_id, o.safe_text FROM observation o
+                     JOIN source_revision sr ON sr.id = o.revision_id
+                     WHERE o.id = ?1 AND o.kind = ?2",
+                    [*id, ObservationKind::GitRef.as_i64()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((source_id, text)) = git_ref {
+                let key = match key {
+                    Some(key) => key,
+                    None => *key.insert(
+                        installation_key(self.key_path.as_deref()).map_err(StoreError::Key)?,
+                    ),
+                };
+                tx.execute(
+                    "INSERT OR IGNORE INTO forgotten_ref (source_id, mark) VALUES (?1, ?2)",
+                    rusqlite::params![source_id, ref_mark(&key, &text).as_slice()],
+                )?;
+            }
             // The index entry goes first and by its text: see `replace_kind`.
             let indexed = tx.execute(
                 "INSERT INTO observation_fts (observation_fts, rowid, safe_text)
@@ -888,6 +928,26 @@ impl Store {
 /// returned true.
 pub fn is_interrupt(e: &rusqlite::Error) -> bool {
     e.sqlite_error_code() == Some(ErrorCode::OperationInterrupted)
+}
+
+fn installation_key(path: Option<&Path>) -> std::io::Result<crate::key::InstallationKey> {
+    match path {
+        Some(path) => Ok(crate::key::load_or_create(path)?.0),
+        None => Ok([0; 32]),
+    }
+}
+
+/// What `forget` keeps of a Git ref: a keyed hash of its safe text, so a
+/// later import can tell the ref again without the store holding its text.
+/// Keyed, so the store file alone cannot confirm a guessed ref.
+pub fn ref_mark(key: &crate::key::InstallationKey, safe_text: &str) -> [u8; 16] {
+    let hash = blake3::Hasher::new_keyed(key)
+        .update(b"relic forgotten git ref\0")
+        .update(safe_text.as_bytes())
+        .finalize();
+    let mut mark = [0; 16];
+    mark.copy_from_slice(&hash.as_bytes()[..16]);
+    mark
 }
 
 fn key_path(db: &Path) -> PathBuf {
