@@ -467,6 +467,90 @@ pub fn import_git(
     Ok(result)
 }
 
+/// `path` if it is a file, else every `*.<extension>` file below it, in path
+/// order. Links are not followed: a session is a file its tool wrote.
+pub fn session_files(path: &Path, extension: &str) -> std::io::Result<Vec<PathBuf>> {
+    // Sessions sit two levels down, subagents four or six: room to spare.
+    const DEPTH: usize = 8;
+    if std::fs::symlink_metadata(path)?.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let (mut found, mut dirs) = (Vec::new(), vec![(path.to_path_buf(), 0)]);
+    while let Some((dir, depth)) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let p = entry.path();
+            if kind.is_dir() && depth < DEPTH {
+                dirs.push((p, depth + 1));
+            } else if kind.is_file() && p.extension().is_some_and(|e| e == extension) {
+                found.push(p);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// What importing a set of session files did, summed over them.
+#[derive(Debug, Default)]
+pub struct SessionsImport {
+    pub records_stored: usize,
+    /// Sessions that stored at least one record.
+    pub grew: usize,
+    pub unchanged: usize,
+    pub unreadable: usize,
+    pub lossy_records: usize,
+    /// Sessions whose last line was still being written.
+    pub incomplete_tails: usize,
+    pub rescrubbed: usize,
+    pub scrub_blocked: bool,
+    pub checkpoint_blocked: bool,
+    /// How many sessions reach each Claude Code version this relic does not know.
+    pub unsupported: std::collections::BTreeMap<String, usize>,
+    pub key_warnings: Vec<String>,
+    /// Sessions that failed, and why. The others were imported.
+    pub failed: Vec<(PathBuf, ImportError)>,
+}
+
+/// Import each of `sessions` as `kind`, one transaction each. A busy store
+/// stops it; a session that vanished is skipped; any other failure is
+/// recorded and the rest are still imported.
+pub fn import_sessions(
+    store: &mut Store,
+    sessions: &[PathBuf],
+    kind: SourceKind,
+    redactor: &Redactor,
+) -> Result<SessionsImport, ImportError> {
+    let mut sum = SessionsImport::default();
+    for session in sessions {
+        let r = match History::open(session).and_then(|h| import(store, &h, Some(kind), redactor)) {
+            Ok(r) => r,
+            Err(ImportError::Busy) => return Err(ImportError::Busy),
+            // Claude Code deletes old sessions, and so may the user.
+            Err(ImportError::Io(e)) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                sum.failed.push((session.clone(), e));
+                continue;
+            }
+        };
+        sum.records_stored += r.records_stored;
+        sum.grew += usize::from(r.records_stored > 0);
+        sum.unchanged += usize::from(r.outcome == Outcome::Unchanged);
+        sum.unreadable += r.unreadable;
+        sum.lossy_records += r.lossy_records;
+        sum.incomplete_tails += usize::from(r.incomplete_tail);
+        sum.rescrubbed += r.rescrubbed;
+        sum.scrub_blocked |= r.scrub_blocked;
+        sum.checkpoint_blocked |= r.checkpoint_blocked;
+        if let Some(version) = r.unsupported {
+            *sum.unsupported.entry(version).or_default() += 1;
+        }
+        sum.key_warnings.extend(r.key_warning);
+    }
+    Ok(sum)
+}
+
 /// What a pass over a file's records learned besides the records.
 struct Scan {
     /// Byte end of the last complete record, from the start of the file.
