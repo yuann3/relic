@@ -57,18 +57,18 @@ impl Role {
 }
 
 /// Where a request goes, as the audit records it. Never a secret.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct Target {
-    pub profile: String,
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Target<'a> {
+    pub profile: &'a str,
     /// Scheme, host and port; no path, query or userinfo.
-    pub origin: String,
+    pub origin: &'a str,
 }
 
 /// What left, recorded before it is sent (research, security boundary 2).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct PayloadAudit {
-    pub profile: String,
-    pub origin: String,
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct PayloadAudit<'a> {
+    pub profile: &'a str,
+    pub origin: &'a str,
     pub role: Role,
     pub bytes: usize,
     pub request_hash: String,
@@ -109,12 +109,12 @@ pub struct EgressRequest {
 impl EgressRequest {
     /// `payload` becomes the user message. Every string in it goes through
     /// the current redactor again; keys are the host's and stay as they are.
-    pub fn new(
+    pub fn new<'t>(
         role: Role,
         payload: Value,
-        target: &Target,
+        target: Target<'t>,
         ledger: &mut BudgetLedger,
-        audit: &mut dyn FnMut(PayloadAudit),
+        audit: &mut dyn FnMut(PayloadAudit<'t>),
     ) -> Result<Self, EgressError> {
         let payload = redact_strings(payload, &Redactor::new());
         let user = payload.to_string();
@@ -133,10 +133,10 @@ impl EgressRequest {
             })
             .map_err(EgressError::Budget)?;
         let mut evidence_ids = Vec::new();
-        collect_evidence_ids(&payload, &mut evidence_ids);
+        collect_evidence_ids(payload, &mut evidence_ids);
         audit(PayloadAudit {
-            profile: target.profile.clone(),
-            origin: target.origin.clone(),
+            profile: target.profile,
+            origin: target.origin,
             role,
             bytes,
             request_hash: crate::rlm::evidence::hex_hash(
@@ -210,17 +210,18 @@ pub fn redact_strings(value: Value, redactor: &Redactor) -> Value {
     }
 }
 
-fn collect_evidence_ids(value: &Value, out: &mut Vec<String>) {
+/// Takes the payload once it is serialized, so the ids move out of it.
+fn collect_evidence_ids(value: Value, out: &mut Vec<String>) {
     match value {
         Value::Object(o) => {
             for (k, v) in o {
                 match (k.as_str(), v) {
-                    ("evidence_id", Value::String(id)) => out.push(id.clone()),
-                    _ => collect_evidence_ids(v, out),
+                    ("evidence_id", Value::String(id)) => out.push(id),
+                    (_, v) => collect_evidence_ids(v, out),
                 }
             }
         }
-        Value::Array(a) => a.iter().for_each(|v| collect_evidence_ids(v, out)),
+        Value::Array(a) => a.into_iter().for_each(|v| collect_evidence_ids(v, out)),
         _ => {}
     }
 }
@@ -232,10 +233,10 @@ mod tests {
 
     const SECRET: &str = "hunter2hunter2";
 
-    fn target() -> Target {
+    fn target() -> Target<'static> {
         Target {
-            profile: "openai".into(),
-            origin: "https://api.example.com".into(),
+            profile: "openai",
+            origin: "https://api.example.com",
         }
     }
 
@@ -248,7 +249,7 @@ mod tests {
         });
         let mut ledger = BudgetLedger::new(BudgetV1::prototype_default());
         let mut audits = Vec::new();
-        let req = EgressRequest::new(Role::Child, payload, &target(), &mut ledger, &mut |a| {
+        let req = EgressRequest::new(Role::Child, payload, target(), &mut ledger, &mut |a| {
             audits.push(a);
         })
         .unwrap();
@@ -271,7 +272,7 @@ mod tests {
             )
         );
         assert_eq!(
-            (audit.profile.as_str(), audit.origin.as_str()),
+            (audit.profile, audit.origin),
             ("openai", "https://api.example.com")
         );
         assert!(!audit.preview.contains(SECRET));
@@ -293,20 +294,16 @@ mod tests {
         let mut ledger = BudgetLedger::new(BudgetV1::prototype_default());
         let mut audits = 0;
         let big = json!({"objective": "x".repeat(CHILD_MAX)});
-        let err = EgressRequest::new(
-            Role::Child,
-            big.clone(),
-            &target(),
-            &mut ledger,
-            &mut |_| audits += 1,
-        )
+        let err = EgressRequest::new(Role::Child, big.clone(), target(), &mut ledger, &mut |_| {
+            audits += 1;
+        })
         .unwrap_err();
         assert!(
             matches!(err, EgressError::TooLarge { max: CHILD_MAX, .. }),
             "{err}"
         );
         // The same payload fits a root request, whose cap is larger.
-        EgressRequest::new(Role::Root, big, &target(), &mut ledger, &mut |_| {
+        EgressRequest::new(Role::Root, big, target(), &mut ledger, &mut |_| {
             audits += 1;
         })
         .unwrap();
@@ -315,7 +312,7 @@ mod tests {
         let mut budget = BudgetV1::prototype_default();
         budget.model_egress_bytes = 1000;
         let mut ledger = BudgetLedger::new(budget);
-        let err = EgressRequest::new(Role::Child, json!({}), &target(), &mut ledger, &mut |_| {
+        let err = EgressRequest::new(Role::Child, json!({}), target(), &mut ledger, &mut |_| {
             audits += 1;
         })
         .unwrap_err();

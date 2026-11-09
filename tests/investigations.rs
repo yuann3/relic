@@ -547,7 +547,7 @@ impl Metered {
 }
 
 impl ModelBoundary for Metered {
-    fn target(&self) -> Target {
+    fn target(&self) -> Target<'_> {
         self.model.target()
     }
 
@@ -684,7 +684,8 @@ fn run(
             }));
         }
     }
-    let target = model(false).target();
+    let configured_model = model(false);
+    let target = configured_model.target();
     let header = json!({
         "schema": "relic.investigations/v1", "seed": SEED, "relic": versions(),
         "model": {"configured": configured, "profile": target.profile, "origin": target.origin, "returned": returned},

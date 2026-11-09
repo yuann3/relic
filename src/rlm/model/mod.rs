@@ -30,7 +30,7 @@ pub struct EvidenceItem {
 /// rule, the same for every adapter (ADR 0010).
 pub trait ModelBoundary: Send + Sync {
     /// Where requests go, for the payload audit.
-    fn target(&self) -> Target;
+    fn target(&self) -> Target<'_>;
 
     /// The model's reply body, unparsed: the kernel caps and checks it.
     /// Must give up by `deadline`. The request is shared, so a boundary
@@ -272,10 +272,10 @@ impl FakeModel {
 }
 
 impl ModelBoundary for FakeModel {
-    fn target(&self) -> Target {
+    fn target(&self) -> Target<'_> {
         Target {
-            profile: "fake".into(),
-            origin: "fake:".into(),
+            profile: "fake",
+            origin: "fake:",
         }
     }
 

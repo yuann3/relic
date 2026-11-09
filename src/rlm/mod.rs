@@ -12,23 +12,24 @@ use model::Usage;
 use model::egress::{PayloadAudit, Role};
 
 /// What an investigation is doing, for a progress display; the UI maps it
-/// to its own events (ADR 0009).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Progress {
+/// to its own events (ADR 0009). It borrows what it names from the
+/// investigation, so a sink keeps only what it turns into its own.
+#[derive(Debug, PartialEq)]
+pub enum Progress<'a> {
     RootCall {
         turn: u32,
     },
     Op {
-        op_id: String,
+        op_id: &'a str,
     },
     ChildCall {
-        op_id: String,
-        packet_id: String,
+        op_id: &'a str,
+        packet_id: &'a str,
     },
     /// A note to the root: a rejected child result or a too-broad search.
-    Note(String),
+    Note(&'a str),
     /// A request is about to leave: what, where and how big (ADR 0004).
-    Egress(PayloadAudit),
+    Egress(PayloadAudit<'a>),
     /// A model call came back; `returned_model` is what actually answered,
     /// redacted: the provider wrote it. `usage` is the tokens it says the
     /// call took, if it says.
@@ -46,7 +47,7 @@ pub enum Progress {
 }
 
 /// One line for a person watching: the CLI's stderr, the TUI's steps.
-impl std::fmt::Display for Progress {
+impl std::fmt::Display for Progress<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let role = |r: &Role| match r {
             Role::Root => "root",

@@ -291,10 +291,10 @@ impl ChatCompletionsClient {
 }
 
 impl ModelBoundary for ChatCompletionsClient {
-    fn target(&self) -> Target {
+    fn target(&self) -> Target<'_> {
         Target {
-            profile: self.config.profile.name().into(),
-            origin: self.origin.clone(),
+            profile: self.config.profile.name(),
+            origin: &self.origin,
         }
     }
 
@@ -396,7 +396,7 @@ pub fn check(client: &ChatCompletionsClient) -> (Value, Result<(), String>) {
     let mut verdict = Ok(());
     for (role, payload) in probes {
         let name = format!("{role:?}").to_lowercase();
-        let outcome = EgressRequest::new(role, payload, &client.target(), &mut ledger, &mut |_| {})
+        let outcome = EgressRequest::new(role, payload, client.target(), &mut ledger, &mut |_| {})
             .map_err(|e| e.to_string())
             .and_then(|req| {
                 client
@@ -692,7 +692,7 @@ mod tests {
         EgressRequest::new(
             Role::Child,
             json!({"objective": "o"}),
-            &client.target(),
+            client.target(),
             &mut ledger,
             &mut |_| {},
         )

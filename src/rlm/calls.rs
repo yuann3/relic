@@ -24,11 +24,11 @@ const RETRY_AFTER_MAX: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(10);
 
 /// One logical call to admit.
-pub struct Job {
+pub struct Job<'a> {
     pub role: Role,
     pub payload: Value,
     /// Emitted when the call is admitted.
-    pub admitted: Progress,
+    pub admitted: Progress<'a>,
 }
 
 /// Each job's reply, in job order, or why it has none.
@@ -64,7 +64,7 @@ struct Flight {
 
 /// Every job's reply, in job order, or why it has none. Stops at once on
 /// cancel, budget exhaustion or the wall-clock deadline.
-pub fn call_all(c: &mut Calls, jobs: Vec<Job>) -> Result<Replies, Stop> {
+pub fn call_all(c: &mut Calls, jobs: Vec<Job<'_>>) -> Result<Replies, Stop> {
     let mut results: Vec<Option<Result<Reply, String>>> = jobs.iter().map(|_| None).collect();
     let mut flights: Vec<Option<Flight>> = jobs.iter().map(|_| None).collect();
     let (tx, rx) = mpsc::channel::<(usize, Result<Reply, ModelError>)>();
@@ -132,7 +132,7 @@ pub fn call_all(c: &mut Calls, jobs: Vec<Job>) -> Result<Replies, Stop> {
 }
 
 /// Reserve everything one logical call can spend, before anything leaves.
-fn admit(c: &mut Calls, job: Job) -> Result<Result<Flight, String>, Stop> {
+fn admit(c: &mut Calls, job: Job<'_>) -> Result<Result<Flight, String>, Stop> {
     if c.cancel.load(Ordering::Relaxed) {
         return Err(Stop::Cancelled);
     }
@@ -152,7 +152,7 @@ fn admit(c: &mut Calls, job: Job) -> Result<Result<Flight, String>, Stop> {
     c.ledger.reserve(&logical).map_err(Stop::Budget)?;
     let target = c.model.target();
     let mut audit = None;
-    let req = match EgressRequest::new(job.role, job.payload, &target, c.ledger, &mut |a| {
+    let req = match EgressRequest::new(job.role, job.payload, target, c.ledger, &mut |a| {
         audit = Some(a);
     }) {
         Ok(req) => req,
@@ -276,10 +276,10 @@ mod tests {
     }
 
     impl ModelBoundary for Script {
-        fn target(&self) -> Target {
+        fn target(&self) -> Target<'_> {
             Target {
-                profile: "script".into(),
-                origin: "script:".into(),
+                profile: "script",
+                origin: "script:",
             }
         }
 
@@ -312,23 +312,25 @@ mod tests {
         })
     }
 
-    fn jobs(n: usize) -> Vec<Job> {
+    fn jobs(n: usize) -> Vec<Job<'static>> {
+        const NAMES: [&str; 6] = ["job 0", "job 1", "job 2", "job 3", "job 4", "job 5"];
         (0..n)
             .map(|i| Job {
                 role: Role::Child,
                 payload: serde_json::json!({"n": i}),
-                admitted: Progress::Note(format!("job {i}")),
+                admitted: Progress::Note(NAMES[i]),
             })
             .collect()
     }
 
-    /// `call_all` over `jobs` with `budget`; the outcome and every event.
+    /// `call_all` over `jobs` with `budget`; the outcome and every event:
+    /// a note as its text, an audit as `send` and its bytes.
     fn run(
         model: Arc<Script>,
         budget: BudgetV1,
         jobs: Vec<Job>,
         cancel: &Arc<AtomicBool>,
-    ) -> (Result<Replies, Stop>, Vec<Progress>, BudgetLedger, u16) {
+    ) -> (Result<Replies, Stop>, Vec<String>, BudgetLedger, u16) {
         let model: Arc<dyn ModelBoundary> = model;
         let mut ledger = BudgetLedger::new(budget);
         let mut events = Vec::new();
@@ -337,7 +339,13 @@ mod tests {
             model: &model,
             ledger: &mut ledger,
             cancel,
-            progress: &mut |p| events.push(p),
+            progress: &mut |p| {
+                events.push(match p {
+                    Progress::Note(n) => n.to_owned(),
+                    Progress::Egress(a) => format!("send {}", a.bytes),
+                    other => other.to_string(),
+                });
+            },
             deadline: Instant::now() + Duration::from_millis(budget.wall_ms),
             concurrency: usize::from(budget.max_concurrency),
             child_calls: &mut child_calls,
@@ -346,11 +354,8 @@ mod tests {
         (out, events, ledger, child_calls)
     }
 
-    fn retries(events: &[Progress]) -> usize {
-        events
-            .iter()
-            .filter(|e| matches!(e, Progress::Retry { .. }))
-            .count()
+    fn retries(events: &[String]) -> usize {
+        events.iter().filter(|e| e.starts_with("retry ")).count()
     }
 
     #[test]
@@ -361,24 +366,17 @@ mod tests {
                 ..Reply::default()
             })
         };
-        let label = |e: &Progress| match e {
-            Progress::Note(n) => Some(n.clone()),
-            Progress::Egress(a) => Some(format!("send {}", a.bytes)),
-            _ => None,
-        };
+        let label = |e: &&str| e.starts_with("job ") || e.starts_with("send ");
         let budget = BudgetV1 {
             max_concurrency: 1,
             ..BudgetV1::prototype_default()
         };
         let (out, events, _, _) = run(script(vec![ok(), ok()]), budget, jobs(2), &Arc::default());
         assert!(out.is_ok());
-        let seen: Vec<String> = events.iter().filter_map(label).collect();
-        let send = seen[1].clone();
+        let seen: Vec<&str> = events.iter().map(String::as_str).filter(label).collect();
+        let send = seen[1];
         assert!(send.starts_with("send "), "{seen:?}");
-        assert_eq!(
-            seen,
-            ["job 0".to_string(), send.clone(), "job 1".into(), send]
-        );
+        assert_eq!(seen, ["job 0", send, "job 1", send]);
 
         // Out of output tokens after the bytes were counted: nothing leaves,
         // so nothing is audited as leaving.
@@ -388,7 +386,10 @@ mod tests {
         };
         let (out, events, _, _) = run(script(vec![ok()]), budget, jobs(1), &Arc::default());
         assert!(out.is_err());
-        assert!(events.iter().all(|e| label(e).is_none()), "{events:?}");
+        assert!(
+            !events.iter().map(String::as_str).any(|e| label(&e)),
+            "{events:?}"
+        );
     }
 
     #[test]

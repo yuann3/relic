@@ -191,7 +191,7 @@ fn seed(run: &mut Run, skill: &SkillSeed) -> Result<(), InvestigationStatus> {
         }
     }
     for note in &run.notes {
-        (run.progress)(Progress::Note(note.clone()));
+        (run.progress)(Progress::Note(note));
     }
     let rows = Reservation {
         rows_returned: observations.len() as u64,
@@ -331,12 +331,12 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
                         return (InvestigationStatus::Cancelled, None);
                     }
                     (run.progress)(Progress::Op {
-                        op_id: validate::op_id(op).to_string(),
+                        op_id: validate::op_id(op),
                     });
                     let noted = run.notes.len();
                     let out = execute_op(run, op, &plan_outputs);
                     for note in &run.notes[noted..] {
-                        (run.progress)(Progress::Note(note.clone()));
+                        (run.progress)(Progress::Note(note));
                     }
                     match out {
                         Ok(Some(handle_id)) => {
@@ -378,7 +378,7 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
                 let finish = match refused {
                     None => finish,
                     Some(why) => {
-                        (run.progress)(Progress::Note(why.clone()));
+                        (run.progress)(Progress::Note(&why));
                         finish::force_abstention(finish, vec![why])
                     }
                 };
@@ -478,8 +478,8 @@ fn execute_op(
                         role: Role::Child,
                         payload: executor::child_payload(objective, p),
                         admitted: Progress::ChildCall {
-                            op_id: a.op_id.clone(),
-                            packet_id: p.packet_id.clone(),
+                            op_id: &a.op_id,
+                            packet_id: &p.packet_id,
                         },
                     })
                     .collect();
@@ -686,7 +686,7 @@ mod tests {
             &Arc::default(),
             &mut |p| {
                 if let Progress::Note(n) = p {
-                    notes.push(n);
+                    notes.push(n.to_owned());
                 }
             },
         );
@@ -887,7 +887,7 @@ mod tests {
             &Arc::default(),
             &mut |p| {
                 if let Progress::Note(n) = p {
-                    notes.push(n);
+                    notes.push(n.to_owned());
                 }
             },
         );
@@ -1079,7 +1079,7 @@ mod tests {
             model.clone(),
             BudgetV1::prototype_default(),
             &cancel,
-            &mut |p| events.push(p),
+            &mut |p| events.push(p.to_string()),
         );
         assert_eq!(
             (result.status, result.turns),
@@ -1159,23 +1159,21 @@ mod tests {
             ..BudgetV1::prototype_default()
         };
         let result = run_investigation("q", None, &store, model, budget, &cancel, &mut |p| {
-            events.push(p);
+            if !matches!(p, Progress::Egress(_) | Progress::Replied { .. }) {
+                events.push(p.to_string());
+            }
         });
         assert_eq!(
             (result.status, result.child_calls),
             (InvestigationStatus::Cancelled, 1)
         );
-        events.retain(|e| !matches!(e, Progress::Egress(_) | Progress::Replied { .. }));
         assert_eq!(
             events,
             [
-                Progress::RootCall { turn: 1 },
-                Progress::Op { op_id: "s1".into() },
-                Progress::Op { op_id: "a1".into() },
-                Progress::ChildCall {
-                    op_id: "a1".into(),
-                    packet_id: "pkt_00".into()
-                },
+                "root call 1: plan the next step",
+                "run s1",
+                "run a1",
+                "child call for a1, pkt_00",
             ]
         );
     }

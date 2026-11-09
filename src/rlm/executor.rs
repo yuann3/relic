@@ -454,7 +454,7 @@ mod tests {
             let req = egress::EgressRequest::new(
                 Role::Child,
                 child_payload(objective, p),
-                &model.target(),
+                model.target(),
                 &mut ledger,
                 &mut |_| {},
             )
