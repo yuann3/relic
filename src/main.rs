@@ -460,9 +460,10 @@ fn import_sessions(
     }
     tighten(&db, owns_dir);
     let mut store = Store::open(&db)?;
+    let total = sessions.len();
     let r = match relic::import::import_sessions(
         &mut store,
-        &sessions,
+        sessions,
         kind,
         &relic::redact::Redactor::new(),
     ) {
@@ -494,7 +495,7 @@ fn import_sessions(
         shown(&root),
         r.records_stored,
         r.grew,
-        sessions.len(),
+        total,
         r.unchanged
     );
     for (i, (session, why)) in r.failed.iter().enumerate() {

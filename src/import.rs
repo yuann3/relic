@@ -407,14 +407,12 @@ pub fn import_git(
         if kind == ObservationKind::GitReflog {
             high_water = high_water.max(observed_at_ms.unwrap_or(0));
         }
-        let safe_text = redactor.import(&r.text);
-        if let Some(n) = known
-            .get_mut(&key(kind, observed_at_ms, safe_text.clone()))
-            .filter(|n| **n > 0)
-        {
+        let known_key = key(kind, observed_at_ms, redactor.import(&r.text));
+        if let Some(n) = known.get_mut(&known_key).filter(|n| **n > 0) {
             *n -= 1;
             continue;
         }
+        let (_, _, safe_text) = known_key;
         let forgotten = match kind {
             ObservationKind::GitReflog => observed_at_ms.is_some_and(|at| at < forgotten_before),
             _ => forgotten_refs.contains(&store::ref_mark(&installation_key, &safe_text)),
@@ -515,19 +513,20 @@ pub struct SessionsImport {
 /// recorded and the rest are still imported.
 pub fn import_sessions(
     store: &mut Store,
-    sessions: &[PathBuf],
+    sessions: Vec<PathBuf>,
     kind: SourceKind,
     redactor: &Redactor,
 ) -> Result<SessionsImport, ImportError> {
     let mut sum = SessionsImport::default();
     for session in sessions {
-        let r = match History::open(session).and_then(|h| import(store, &h, Some(kind), redactor)) {
+        let r = match History::open(&session).and_then(|h| import(store, &h, Some(kind), redactor))
+        {
             Ok(r) => r,
             Err(ImportError::Busy) => return Err(ImportError::Busy),
             // Claude Code deletes old sessions, and so may the user.
             Err(ImportError::Io(e)) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => {
-                sum.failed.push((session.clone(), e));
+                sum.failed.push((session, e));
                 continue;
             }
         };
