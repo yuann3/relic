@@ -497,7 +497,7 @@ fn search_worker(store: &Store, mailbox: &Mailbox, tx: &SyncSender<UiAction>, de
             return;
         }
         let req = SearchRequest {
-            query: job.query,
+            query: &job.query,
             limit: PAGE_LIMIT,
             mode: MatchMode::PrefixLast,
             order: Order::RecentlyImported,

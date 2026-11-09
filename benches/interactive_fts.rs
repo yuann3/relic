@@ -838,7 +838,7 @@ fn end_to_end(path: &Path, name: &str, with_store: bool, runs: usize) {
             );
             if let (Some(store), Order::Rank) = (&store, order) {
                 let req = SearchRequest {
-                    query: text.to_owned(),
+                    query: text,
                     limit: page,
                     mode: if prefix {
                         MatchMode::PrefixLast

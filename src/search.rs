@@ -36,7 +36,7 @@ pub const MAX_WORD_TOKENS: usize = 16;
 /// How long one query may run before it is stopped as too broad.
 pub const QUERY_DEADLINE: Duration = Duration::from_millis(100);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchMode {
     /// Every word must match whole. Used by scripts and recall.
     Words,
@@ -54,9 +54,11 @@ pub enum Order {
     Rank,
 }
 
-#[derive(Debug, Clone)]
-pub struct SearchRequest {
-    pub query: String,
+/// What to search for. It borrows the query: the page owns its copy, and
+/// a caller can run one request again.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchRequest<'q> {
+    pub query: &'q str,
     pub limit: usize,
     pub mode: MatchMode,
     pub order: Order,
@@ -274,7 +276,7 @@ pub fn search(
     hits.truncate(limit);
     Ok(SearchPage {
         schema: SEARCH_SCHEMA,
-        query: req.query.clone(),
+        query: req.query.to_owned(),
         limit,
         truncated,
         deferred,
@@ -314,9 +316,9 @@ pub(crate) mod tests {
         store
     }
 
-    pub(crate) fn req(query: &str, limit: usize, mode: MatchMode) -> SearchRequest {
+    pub(crate) fn req(query: &str, limit: usize, mode: MatchMode) -> SearchRequest<'_> {
         SearchRequest {
-            query: query.into(),
+            query,
             limit,
             mode,
             order: Order::RecentlyImported,

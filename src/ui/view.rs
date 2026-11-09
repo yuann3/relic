@@ -722,7 +722,7 @@ mod tests {
                 match e {
                     UiEffect::Search { generation, query } => {
                         let req = SearchRequest {
-                            query,
+                            query: &query,
                             limit: 200,
                             mode: MatchMode::PrefixLast,
                             order: search::Order::RecentlyImported,

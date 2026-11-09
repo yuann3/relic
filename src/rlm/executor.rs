@@ -94,9 +94,13 @@ pub fn execute_search(
 ) -> Result<HandleId, ExecError> {
     // The shared search has no OR: a word matches whole and every word must
     // match. So `any` is one search per term, merged newest first.
-    let queries = match search.match_mode {
-        MatchMode::Any => search.terms.clone(),
-        MatchMode::All => vec![search.terms.join(" ")],
+    let all;
+    let queries: Vec<&str> = match search.match_mode {
+        MatchMode::Any => search.terms.iter().map(String::as_str).collect(),
+        MatchMode::All => {
+            all = search.terms.join(" ");
+            vec![&all]
+        }
     };
     let limit = search.limit as usize;
     let mut hits = Vec::new();

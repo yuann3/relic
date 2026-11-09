@@ -611,7 +611,7 @@ fn search(args: SearchArgs) -> Result<ExitCode> {
     };
     let limit = args.limit.unwrap_or(default_limit);
     let req = SearchRequest {
-        query: args.query,
+        query: &args.query,
         limit,
         mode,
         order,
