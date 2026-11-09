@@ -185,7 +185,7 @@ mod tests {
             serde_json::from_value(json!({"version": 1, "expected_state_version": 0,
             "kind": "plan", "finish": null, "plan": {"ops": plan}}))
             .unwrap();
-        if let Err(e) = crate::rlm::validate::validate_plan(&action, 0) {
+        if let Err(e) = crate::rlm::validate::validate_plan(action, 0) {
             panic!("{e}");
         }
     }

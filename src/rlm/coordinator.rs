@@ -296,7 +296,7 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
 
         match action.kind {
             RootActionKind::Plan => {
-                let validated = match validate::validate_plan(&action, state_version) {
+                let validated = match validate::validate_plan(action, state_version) {
                     Ok(v) => v,
                     Err(e) => {
                         return (

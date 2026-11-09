@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::rlm::evidence::HandleKind;
 use crate::rlm::protocol::*;
@@ -149,9 +149,10 @@ const MAX_ASSESS_ITEMS: u32 = 64;
 pub const MAX_OBJECTIVE_BYTES: usize = 1024;
 const MAX_EXPAND_PER_SIDE: u32 = 32;
 
-/// Validate a plan structurally and semantically.
+/// Validate a plan structurally and semantically. Takes the action because
+/// the plan's ops become the validated plan's ops.
 pub fn validate_plan(
-    action: &RootActionV1,
+    action: RootActionV1,
     current_state_version: u32,
 ) -> Result<ValidatedPlan, ValidationError> {
     if action.expected_state_version != current_state_version {
@@ -161,7 +162,7 @@ pub fn validate_plan(
         });
     }
 
-    let plan = action.plan.as_ref().ok_or(ValidationError::EmptyPlan)?;
+    let plan = action.plan.ok_or(ValidationError::EmptyPlan)?;
 
     if plan.ops.is_empty() {
         return Err(ValidationError::EmptyPlan);
@@ -175,73 +176,54 @@ pub fn validate_plan(
 
     let ops = plan
         .ops
-        .iter()
-        .map(|op| match op.clone() {
-            PlanOpV1::Search(s) => Ok(Op::Search(s)),
-            PlanOpV1::Expand(e) => Ok(Op::Expand(e)),
-            PlanOpV1::Assess(a) => Ok(Op::Assess(a)),
-            PlanOpV1::Select(s) => Ok(Op::Select(s)),
-            PlanOpV1::Inspect(i) => Ok(Op::Inspect(i)),
-            PlanOpV1::Relate => Err(ValidationError::NotExecuted("relate")),
-            PlanOpV1::Combine => Err(ValidationError::NotExecuted("combine")),
-        })
+        .into_iter()
+        .map(admit_op)
         .collect::<Result<Vec<_>, _>>()?;
 
     // Check for duplicate op_ids and build index.
-    let mut seen_ids = HashSet::new();
     let mut op_index: HashMap<&str, usize> = HashMap::new();
     for (i, op) in ops.iter().enumerate() {
         let id = op_id(op);
-        if !seen_ids.insert(id) {
+        if op_index.insert(id, i).is_some() {
             return Err(ValidationError::DuplicateOpId(id.to_string()));
         }
-        op_index.insert(id, i);
     }
 
-    // Validate each op: resolve inputs, check kinds, check limits.
+    // Resolve inputs and check their kinds.
     let mut output_kinds: HashMap<&str, HandleKind> = HashMap::new();
 
     for (i, op) in ops.iter().enumerate() {
         let id = op_id(op);
 
-        // Validate operator-specific limits.
-        validate_op_limits(op)?;
-
-        // Resolve inputs and check for forward references.
-        for input in op_inputs(op) {
-            if let InputRefV1::Output(ref_id) = input {
-                match op_index.get(ref_id.as_str()) {
-                    None => {
-                        return Err(ValidationError::UnknownInputRef {
-                            op_id: id.to_string(),
-                            ref_id: ref_id.clone(),
-                        });
-                    }
-                    Some(&ref_pos) if ref_pos >= i => {
-                        return Err(ValidationError::ForwardReference {
-                            op_id: id.to_string(),
-                            ref_id: ref_id.clone(),
-                        });
-                    }
-                    Some(_) => {}
+        // Handle references are validated at execution time (they refer to
+        // pre-existing handles in the registry, not plan outputs).
+        if let Some(InputRefV1::Output(ref_id)) = op_input(op) {
+            match op_index.get(ref_id.as_str()) {
+                None => {
+                    return Err(ValidationError::UnknownInputRef {
+                        op_id: id.to_string(),
+                        ref_id: ref_id.to_string(),
+                    });
                 }
-
-                // Check input kind compatibility.
-                if let Some(&input_kind) = output_kinds.get(ref_id.as_str()) {
-                    let expected = expected_input_kind(op);
-                    if let Some(exp) = expected
-                        && exp != input_kind
-                    {
-                        return Err(ValidationError::WrongInputKind {
-                            op_id: id.to_string(),
-                            expected: exp,
-                            got: input_kind,
-                        });
-                    }
+                Some(&ref_pos) if ref_pos >= i => {
+                    return Err(ValidationError::ForwardReference {
+                        op_id: id.to_string(),
+                        ref_id: ref_id.to_string(),
+                    });
                 }
+                Some(_) => {}
             }
-            // Handle references are validated at execution time (they refer to
-            // pre-existing handles in the registry, not plan outputs).
+
+            if let Some(&input_kind) = output_kinds.get(ref_id.as_str())
+                && let Some(expected) = expected_input_kind(op)
+                && expected != input_kind
+            {
+                return Err(ValidationError::WrongInputKind {
+                    op_id: id.to_string(),
+                    expected,
+                    got: input_kind,
+                });
+            }
         }
 
         output_kinds.insert(id, output_kind(op));
@@ -260,13 +242,13 @@ pub fn op_id(op: &Op) -> &str {
     }
 }
 
-fn op_inputs(op: &Op) -> Vec<&InputRefV1> {
+fn op_input(op: &Op) -> Option<&InputRefV1> {
     match op {
-        Op::Search(_) => vec![],
-        Op::Expand(e) => vec![&e.input],
-        Op::Assess(a) => vec![&a.input],
-        Op::Select(s) => vec![&s.input],
-        Op::Inspect(i) => vec![&i.input],
+        Op::Search(_) => None,
+        Op::Expand(e) => Some(&e.input),
+        Op::Assess(a) => Some(&a.input),
+        Op::Select(s) => Some(&s.input),
+        Op::Inspect(i) => Some(&i.input),
     }
 }
 
@@ -291,85 +273,76 @@ fn expected_input_kind(op: &Op) -> Option<HandleKind> {
     }
 }
 
-fn validate_op_limits(op: &Op) -> Result<(), ValidationError> {
+/// Turns a wire op into an executable one, refusing what this version does
+/// not run and what is over its limits. The op moves into either result.
+fn admit_op(op: PlanOpV1) -> Result<Op, ValidationError> {
     match op {
-        Op::Search(s) => {
+        PlanOpV1::Search(s) => {
             if s.terms.is_empty() {
-                return Err(ValidationError::SearchNoTerms {
-                    op_id: s.op_id.clone(),
-                });
+                return Err(ValidationError::SearchNoTerms { op_id: s.op_id });
             }
             if s.terms.len() > MAX_SEARCH_TERMS {
                 return Err(ValidationError::SearchTooManyTerms {
-                    op_id: s.op_id.clone(),
+                    op_id: s.op_id,
                     count: s.terms.len(),
                     max: MAX_SEARCH_TERMS,
                 });
             }
             if s.limit == 0 {
-                return Err(ValidationError::LimitZero {
-                    op_id: s.op_id.clone(),
-                });
+                return Err(ValidationError::LimitZero { op_id: s.op_id });
             }
+            Ok(Op::Search(s))
         }
-        Op::Expand(e) => {
+        PlanOpV1::Expand(e) => {
             if e.limit == 0 {
-                return Err(ValidationError::LimitZero {
-                    op_id: e.op_id.clone(),
-                });
+                return Err(ValidationError::LimitZero { op_id: e.op_id });
             }
-            if e.before > MAX_EXPAND_PER_SIDE {
-                return Err(ValidationError::ExpandWindowExceeded {
-                    op_id: e.op_id.clone(),
-                    per_side: e.before,
-                    max: MAX_EXPAND_PER_SIDE,
-                });
+            for per_side in [e.before, e.after] {
+                if per_side > MAX_EXPAND_PER_SIDE {
+                    return Err(ValidationError::ExpandWindowExceeded {
+                        op_id: e.op_id,
+                        per_side,
+                        max: MAX_EXPAND_PER_SIDE,
+                    });
+                }
             }
-            if e.after > MAX_EXPAND_PER_SIDE {
-                return Err(ValidationError::ExpandWindowExceeded {
-                    op_id: e.op_id.clone(),
-                    per_side: e.after,
-                    max: MAX_EXPAND_PER_SIDE,
-                });
-            }
+            Ok(Op::Expand(e))
         }
-        Op::Assess(a) => {
+        PlanOpV1::Assess(a) => {
             if a.objective.len() > MAX_OBJECTIVE_BYTES {
                 return Err(ValidationError::AssessObjectiveTooLong {
-                    op_id: a.op_id.clone(),
+                    op_id: a.op_id,
                     bytes: a.objective.len(),
                     max: MAX_OBJECTIVE_BYTES,
                 });
             }
             if a.max_items > MAX_ASSESS_ITEMS {
                 return Err(ValidationError::AssessMaxItemsExceeded {
-                    op_id: a.op_id.clone(),
+                    op_id: a.op_id,
                     count: a.max_items,
                     max: MAX_ASSESS_ITEMS,
                 });
             }
             if a.max_items == 0 {
-                return Err(ValidationError::LimitZero {
-                    op_id: a.op_id.clone(),
-                });
+                return Err(ValidationError::LimitZero { op_id: a.op_id });
             }
+            Ok(Op::Assess(a))
         }
-        Op::Select(s) => {
+        PlanOpV1::Select(s) => {
             if s.limit == 0 {
-                return Err(ValidationError::LimitZero {
-                    op_id: s.op_id.clone(),
-                });
+                return Err(ValidationError::LimitZero { op_id: s.op_id });
             }
+            Ok(Op::Select(s))
         }
-        Op::Inspect(i) => {
+        PlanOpV1::Inspect(i) => {
             if i.limit == 0 {
-                return Err(ValidationError::LimitZero {
-                    op_id: i.op_id.clone(),
-                });
+                return Err(ValidationError::LimitZero { op_id: i.op_id });
             }
+            Ok(Op::Inspect(i))
         }
+        PlanOpV1::Relate => Err(ValidationError::NotExecuted("relate")),
+        PlanOpV1::Combine => Err(ValidationError::NotExecuted("combine")),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -445,7 +418,7 @@ mod tests {
                 inspect("i1", "k1"),
             ],
         );
-        assert!(validate_plan(&action, 0).is_ok());
+        assert!(validate_plan(action, 0).is_ok());
     }
 
     #[test]
@@ -466,7 +439,7 @@ mod tests {
             );
             let action: RootActionV1 = serde_json::from_str(&json).unwrap();
             assert_eq!(
-                validate_plan(&action, 0).unwrap_err(),
+                validate_plan(action, 0).unwrap_err(),
                 ValidationError::NotExecuted(name)
             );
         }
@@ -476,7 +449,7 @@ mod tests {
     fn empty_plan_rejected() {
         let action = make_action(0, vec![]);
         assert_eq!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::EmptyPlan
         );
     }
@@ -488,7 +461,7 @@ mod tests {
             .collect();
         let action = make_action(0, ops);
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::TooManyOps { count: 9, max: 8 }
         ));
     }
@@ -500,7 +473,7 @@ mod tests {
             vec![search("s1", &["cargo"], 50), search("s1", &["git"], 50)],
         );
         assert_eq!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::DuplicateOpId("s1".to_string())
         );
     }
@@ -509,7 +482,7 @@ mod tests {
     fn forward_reference_rejected() {
         let action = make_action(0, vec![expand("e1", "s1"), search("s1", &["cargo"], 50)]);
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::ForwardReference { .. }
         ));
     }
@@ -518,7 +491,7 @@ mod tests {
     fn unknown_input_ref_rejected() {
         let action = make_action(0, vec![expand("e1", "nonexistent")]);
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::UnknownInputRef { .. }
         ));
     }
@@ -528,7 +501,7 @@ mod tests {
         // select expects assessment_set, but search produces evidence_set
         let action = make_action(0, vec![search("s1", &["cargo"], 50), select("k1", "s1")]);
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::WrongInputKind {
                 expected: HandleKind::AssessmentSet,
                 got: HandleKind::EvidenceSet,
@@ -541,7 +514,7 @@ mod tests {
     fn stale_state_version_rejected() {
         let action = make_action(2, vec![search("s1", &["cargo"], 50)]);
         assert_eq!(
-            validate_plan(&action, 5).unwrap_err(),
+            validate_plan(action, 5).unwrap_err(),
             ValidationError::StaleStateVersion {
                 expected: 5,
                 got: 2
@@ -554,7 +527,7 @@ mod tests {
         let terms: Vec<&str> = (0..13).map(|_| "x").collect();
         let action = make_action(0, vec![search("s1", &terms, 50)]);
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::SearchTooManyTerms { .. }
         ));
     }
@@ -563,7 +536,7 @@ mod tests {
     fn search_no_terms_rejected() {
         let action = make_action(0, vec![search("s1", &[], 50)]);
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::SearchNoTerms { .. }
         ));
     }
@@ -572,7 +545,7 @@ mod tests {
     fn limit_zero_rejected() {
         let action = make_action(0, vec![search("s1", &["cargo"], 0)]);
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::LimitZero { .. }
         ));
     }
@@ -593,9 +566,9 @@ mod tests {
                 ],
             )
         };
-        assert!(validate_plan(&action(MAX_OBJECTIVE_BYTES), 0).is_ok());
+        assert!(validate_plan(action(MAX_OBJECTIVE_BYTES), 0).is_ok());
         assert!(matches!(
-            validate_plan(&action(MAX_OBJECTIVE_BYTES + 1), 0).unwrap_err(),
+            validate_plan(action(MAX_OBJECTIVE_BYTES + 1), 0).unwrap_err(),
             ValidationError::AssessObjectiveTooLong { bytes: 1025, .. }
         ));
     }
@@ -615,7 +588,7 @@ mod tests {
             ],
         );
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::AssessMaxItemsExceeded { .. }
         ));
     }
@@ -637,7 +610,7 @@ mod tests {
             ],
         );
         assert!(matches!(
-            validate_plan(&action, 0).unwrap_err(),
+            validate_plan(action, 0).unwrap_err(),
             ValidationError::ExpandWindowExceeded { .. }
         ));
     }

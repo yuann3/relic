@@ -415,7 +415,7 @@ pub fn check(client: &ChatCompletionsClient) -> (Value, Result<(), String>) {
                 )
                 .map_err(|e| format!("{e:?}"))
                 .and_then(|a| match a.kind {
-                    RootActionKind::Plan => crate::rlm::validate::validate_plan(&a, 0)
+                    RootActionKind::Plan => crate::rlm::validate::validate_plan(a, 0)
                         .map(drop)
                         .map_err(|e| e.to_string()),
                     RootActionKind::Finish if a.finish.is_some() => Ok(()),
