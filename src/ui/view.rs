@@ -189,13 +189,13 @@ fn query_bar(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
         &display_line(&m.query),
         usize::from(inner.width).saturating_sub(3),
     );
-    let mut spans = vec![Span::styled("> ", t.title), Span::raw(shown.clone())];
+    let mut spans = vec![Span::styled("> ", t.title), Span::raw(shown.as_str())];
     if m.query.is_empty() {
         spans.push(Span::styled("type to search your history", t.dim));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     if focused && m.modal.is_none() {
-        let x = inner.x + 2 + Line::raw(shown).width() as u16;
+        let x = inner.x + 2 + Line::raw(shown.as_str()).width() as u16;
         frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
     }
 }
@@ -309,7 +309,7 @@ fn timeline(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let Some(v) = &m.evidence.view else {
         let block = pane(t, "Timeline".into(), focused);
         let msg = match &m.evidence.error {
-            Some(e) => Line::styled(e.clone(), t.bad),
+            Some(e) => Line::styled(e.as_str(), t.bad),
             None => Line::styled("select a result to see what ran around it", t.dim),
         };
         frame.render_widget(Paragraph::new(msg).block(block), area);
@@ -351,7 +351,7 @@ fn evidence(frame: &mut Frame, m: &UiModel, t: &Theme, area: Rect) {
     let block = pane(t, "Evidence".into(), m.focus == Focus::Evidence);
     let Some(o) = m.evidence.shown() else {
         let msg = match &m.evidence.error {
-            Some(e) => Line::styled(e.clone(), t.bad),
+            Some(e) => Line::styled(e.as_str(), t.bad),
             None => Line::styled("Enter opens the selected result", t.dim),
         };
         frame.render_widget(Paragraph::new(msg).block(block), area);
