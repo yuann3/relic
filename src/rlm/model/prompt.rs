@@ -67,13 +67,15 @@ pub fn root_schema() -> Value {
         object(props)
     };
     let int = json!({"type": "integer", "minimum": 0});
+    // Plan admission refuses a limit of 0, so the schema must not offer it.
+    let limit = json!({"type": "integer", "minimum": 1});
     let ops = json!({"anyOf": [
-        op("search", json!({"terms": strings(), "match": enumerated(&["any", "all"]), "limit": int})),
+        op("search", json!({"terms": strings(), "match": enumerated(&["any", "all"]), "limit": limit})),
         op("expand", json!({"input": input(), "scope": enumerated(&["same_source", "same_session"]),
-            "before": int, "after": int, "limit": int})),
-        op("assess", json!({"input": input(), "objective": {"type": "string"}, "max_items": int})),
-        op("select", json!({"input": input(), "verdicts": {"type": "array", "items": verdict()}, "limit": int})),
-        op("inspect", json!({"input": input(), "limit": int, "max_item_bytes": int})),
+            "before": int, "after": int, "limit": limit})),
+        op("assess", json!({"input": input(), "objective": {"type": "string"}, "max_items": limit})),
+        op("select", json!({"input": input(), "verdicts": {"type": "array", "items": verdict()}, "limit": limit})),
+        op("inspect", json!({"input": input(), "limit": limit, "max_item_bytes": int})),
     ]});
     let cited = |extra: Value| {
         let mut props = json!({"text": {"type": "string"}, "supports": strings()});
@@ -146,6 +148,45 @@ mod tests {
             }
             Value::Array(a) => a.iter().for_each(|v| assert_strict(v, path)),
             _ => {}
+        }
+    }
+
+    #[test]
+    fn plan_admission_takes_every_op_at_the_schemas_minimums() {
+        // A value the schema allows and admission refuses fails the whole
+        // investigation, on a reply the model was told was valid.
+        let schema = root_schema();
+        let ops = schema["properties"]["plan"]["anyOf"][0]["properties"]["ops"]["items"]["anyOf"]
+            .as_array()
+            .unwrap();
+        let at_minimum = |mut op: Value| {
+            let props = &ops
+                .iter()
+                .find(|s| s["properties"]["op"]["const"] == op["op"])
+                .unwrap()["properties"];
+            for (field, p) in props.as_object().unwrap() {
+                if let Some(min) = p.get("minimum") {
+                    op[field] = min.clone();
+                }
+            }
+            op
+        };
+        let plan: Vec<Value> = [
+            json!({"op": "search", "op_id": "s1", "terms": ["certbot"], "match": "any", "limit": 10}),
+            json!({"op": "expand", "op_id": "e1", "input": {"output": "s1"}, "scope": "same_source", "before": 2, "after": 2, "limit": 20}),
+            json!({"op": "assess", "op_id": "a1", "input": {"output": "e1"}, "objective": "o", "max_items": 8}),
+            json!({"op": "select", "op_id": "k1", "input": {"output": "a1"}, "verdicts": ["supports"], "limit": 4}),
+            json!({"op": "inspect", "op_id": "i1", "input": {"output": "k1"}, "limit": 4, "max_item_bytes": 512}),
+        ]
+        .into_iter()
+        .map(at_minimum)
+        .collect();
+        let action: RootActionV1 =
+            serde_json::from_value(json!({"version": 1, "expected_state_version": 0,
+            "kind": "plan", "finish": null, "plan": {"ops": plan}}))
+            .unwrap();
+        if let Err(e) = crate::rlm::validate::validate_plan(&action, 0) {
+            panic!("{e}");
         }
     }
 
