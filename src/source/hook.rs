@@ -123,8 +123,12 @@ impl<R: BufRead> Parser<R> {
                 None => true,
                 Some(number) => {
                     let entry = number.map(|n| (n, frame.command.to_vec()));
-                    let seen = self.last_history.replace(entry.clone());
-                    seen.is_some_and(|seen| seen != entry)
+                    let new = self
+                        .last_history
+                        .as_ref()
+                        .is_some_and(|seen| *seen != entry);
+                    self.last_history = Some(entry);
+                    new
                 }
             };
             if !new
