@@ -330,7 +330,7 @@ mod tests {
         cancel: &Arc<AtomicBool>,
     ) -> (Result<Replies, Stop>, Vec<Progress>, BudgetLedger, u16) {
         let model: Arc<dyn ModelBoundary> = model;
-        let mut ledger = BudgetLedger::new(budget.clone());
+        let mut ledger = BudgetLedger::new(budget);
         let mut events = Vec::new();
         let mut child_calls = 0;
         let mut c = Calls {
@@ -370,12 +370,7 @@ mod tests {
             max_concurrency: 1,
             ..BudgetV1::prototype_default()
         };
-        let (out, events, _, _) = run(
-            script(vec![ok(), ok()]),
-            budget.clone(),
-            jobs(2),
-            &Arc::default(),
-        );
+        let (out, events, _, _) = run(script(vec![ok(), ok()]), budget, jobs(2), &Arc::default());
         assert!(out.is_ok());
         let seen: Vec<String> = events.iter().filter_map(label).collect();
         let send = seen[1].clone();

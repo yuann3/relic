@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 // --- Plan operators ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PlanOpV1 {
     Search(SearchV1),
@@ -19,7 +19,7 @@ pub enum PlanOpV1 {
     Inspect(InspectV1),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SearchV1 {
     pub op_id: String,
@@ -36,7 +36,7 @@ pub enum MatchMode {
     All,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExpandV1 {
     pub op_id: String,
@@ -54,7 +54,7 @@ pub enum ExpandScope {
     SameSession,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AssessV1 {
     pub op_id: String,
@@ -65,13 +65,13 @@ pub struct AssessV1 {
 
 /// Marks an item the host cut to fit its packet. Truncated evidence cannot
 /// support a claim about what was cut (research, evidence sufficiency 5).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TruncationV1 {
     pub original_bytes: usize,
     pub sent_bytes: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SelectV1 {
     pub op_id: String,
@@ -80,7 +80,7 @@ pub struct SelectV1 {
     pub limit: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct InspectV1 {
     pub op_id: String,
@@ -89,7 +89,7 @@ pub struct InspectV1 {
     pub max_item_bytes: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum InputRefV1 {
     Handle(String),
@@ -98,13 +98,13 @@ pub enum InputRefV1 {
 
 // --- Plan and root action ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PlanV1 {
     pub ops: Vec<PlanOpV1>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RootActionV1 {
     pub version: u8,
@@ -125,7 +125,7 @@ pub enum RootActionKind {
 
 // --- Finish and claims ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FinishV1 {
     pub status: AnswerStatus,
@@ -139,7 +139,7 @@ pub struct FinishV1 {
     pub missing: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AnswerStatus {
     Answered,
@@ -147,7 +147,7 @@ pub enum AnswerStatus {
     Abstained,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FinalClaimV1 {
     pub text: String,
@@ -156,7 +156,7 @@ pub struct FinalClaimV1 {
     pub contradicts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProcedureStepV1 {
     pub text: String,
@@ -165,7 +165,7 @@ pub struct ProcedureStepV1 {
 
 // --- Child result ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ChildResultV1 {
     pub version: u8,
@@ -173,7 +173,7 @@ pub struct ChildResultV1 {
     pub assessments: Vec<ItemAssessmentV1>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ItemAssessmentV1 {
     pub item_id: String,
@@ -201,7 +201,7 @@ pub enum Confidence {
     High,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimV1 {
     pub text: String,
@@ -213,7 +213,7 @@ pub struct ClaimV1 {
 
 // --- Budget ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BudgetV1 {
     pub wall_ms: u64,
     pub root_calls: u16,

@@ -12,13 +12,13 @@ use crate::rlm::protocol::*;
 use egress::{EgressRequest, Role, Target};
 
 /// Packet of evidence items sent to a child model call.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct EvidencePacket {
     pub packet_id: String,
     pub items: Vec<EvidenceItem>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct EvidenceItem {
     pub item_id: String,
     pub evidence_id: String,

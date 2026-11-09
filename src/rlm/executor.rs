@@ -213,7 +213,7 @@ pub fn check_child_result(
     if result.packet_id != packet.packet_id {
         return Err(ChildRejection::PacketId(result.packet_id));
     }
-    let mut slots: Vec<Option<ItemAssessmentV1>> = vec![None; packet.items.len()];
+    let mut slots: Vec<Option<ItemAssessmentV1>> = packet.items.iter().map(|_| None).collect();
     for a in result.assessments {
         let Some(i) = packet
             .items
@@ -795,12 +795,14 @@ mod tests {
     #[test]
     fn packets_hold_at_most_four_items_and_24_kib_in_order() {
         let sizes = [10, 10, 9000, 9000, 9000, 10, 30_000, 10, 10, 10, 10, 10];
-        let items: Vec<_> = sizes
-            .iter()
-            .enumerate()
-            .map(|(i, &n)| item(i, "x".repeat(n)))
-            .collect();
-        let packets = packets("objective", items.clone());
+        let items = || -> Vec<_> {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| item(i, "x".repeat(n)))
+                .collect()
+        };
+        let packets = packets("objective", items());
 
         // Worked by hand: a 5th item or a 3rd 9000-byte one starts a packet,
         // and the 30 000-byte item fills one alone.
@@ -814,7 +816,7 @@ mod tests {
             );
         }
         let sent: Vec<&EvidenceItem> = packets.iter().flat_map(|p| &p.items).collect();
-        for (sent, original) in sent.iter().zip(&items) {
+        for (sent, original) in sent.iter().zip(&items()) {
             assert_eq!(sent.item_id, original.item_id);
             if sent.item_id != "item_6" {
                 assert_eq!(
