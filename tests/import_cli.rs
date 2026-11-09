@@ -585,7 +585,8 @@ fn claude_code_sessions_import_by_directory_and_grow_without_duplicates() {
     );
 
     // The call's result arrives after the import that stored the call, then
-    // a version this relic does not know, and a call after that.
+    // a call from a later Claude Code than the fixture's, and one after it:
+    // every version is read.
     let result = claude_line(
         "user",
         "2.1.300",
@@ -604,15 +605,15 @@ fn claude_code_sessions_import_by_directory_and_grow_without_duplicates() {
     std::fs::write(&agent, [call.as_str(), &result, &newer, &after].concat()).unwrap();
     let (code, stderr) = import();
     assert_eq!(code, Some(0), "{stderr}");
-    assert!(stderr.contains("relic: warning: 1 sessions reach Claude Code 2.1.400, which this relic was not checked against (2.1.288 to 2.1.318)"), "{stderr}");
+    assert!(!stderr.contains("warning"), "{stderr}");
     assert!(
-        stderr.ends_with("added 1 records from 1 of 2 sessions; 1 unchanged since last import\n"),
+        stderr.ends_with("added 3 records from 1 of 2 sessions; 1 unchanged since last import\n"),
         "{stderr}"
     );
     assert_eq!(
         kinds(),
-        [(7, 3), (8, 3), (9, 2)],
-        "the output once, and nothing from 2.1.400 on"
+        [(7, 5), (8, 3), (9, 2)],
+        "the output once, and both later calls"
     );
 
     // One session alone is known by its content.

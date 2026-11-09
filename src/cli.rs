@@ -64,9 +64,9 @@ OPTIONS:
                   ~/.claude/projects. Relic keeps the commands its Bash tool
                   ran, the start and end of what each printed, and which
                   skill, file or search other tool calls named; never
-                  prompts, replies or thinking. Read for Claude Code
-                  2.1.288 to 2.1.318; a session's records from any other
-                  version wait for a relic that knows it
+                  prompts, replies or thinking. Any Claude Code version is
+                  read; a line in a shape relic does not know is skipped
+                  and counted
     --hooks       Import what relic's shell hooks recorded: every *.frames
                   under DIR, default $XDG_STATE_HOME/relic/hooks
                   (~/.local/state/relic/hooks)

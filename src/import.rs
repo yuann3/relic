@@ -64,9 +64,6 @@ pub struct ImportResult {
     /// Claude Code lines that were not the JSON the parser knows, or hook
     /// frames that were not what `relic hook` writes. Skipped.
     pub unreadable: usize,
-    /// The Claude Code version parsing stopped at, unread with everything
-    /// after it until a Relic that knows it imports the file.
-    pub unsupported: Option<String>,
 }
 
 impl ImportResult {
@@ -86,7 +83,6 @@ impl ImportResult {
             dangling_meta: 0,
             incomplete_tail: false,
             unreadable: 0,
-            unsupported: None,
         }
     }
 }
@@ -336,7 +332,6 @@ pub fn import(
         dangling_meta: scan.dangling_meta,
         incomplete_tail: scan.incomplete_tail,
         unreadable: scan.unreadable,
-        unsupported: scan.unsupported,
     })
 }
 
@@ -506,8 +501,6 @@ pub struct SessionsImport {
     pub rescrubbed: usize,
     pub scrub_blocked: bool,
     pub checkpoint_blocked: bool,
-    /// How many sessions reach each Claude Code version this relic does not know.
-    pub unsupported: std::collections::BTreeMap<String, usize>,
     pub key_warnings: Vec<String>,
     /// Sessions that failed, and why. The others were imported.
     pub failed: Vec<(PathBuf, ImportError)>,
@@ -543,9 +536,6 @@ pub fn import_sessions(
         sum.rescrubbed += r.rescrubbed;
         sum.scrub_blocked |= r.scrub_blocked;
         sum.checkpoint_blocked |= r.checkpoint_blocked;
-        if let Some(version) = r.unsupported {
-            *sum.unsupported.entry(version).or_default() += 1;
-        }
         sum.key_warnings.extend(r.key_warning);
     }
     Ok(sum)
@@ -558,7 +548,6 @@ struct Scan {
     dangling_meta: u32,
     incomplete_tail: bool,
     unreadable: usize,
-    unsupported: Option<String>,
 }
 
 /// Parse `file` from byte `from`, which must be where a record starts, and
@@ -588,7 +577,7 @@ fn scan<T>(
             raw
         })
     };
-    let (mut unreadable, mut unsupported) = (0, None);
+    let mut unreadable = 0;
     let (out, stable_len, dangling_meta, incomplete_tail) = match kind {
         SourceKind::Zsh => {
             let mut parser = source::zsh::Parser::new(reader);
@@ -614,10 +603,7 @@ fn scan<T>(
         SourceKind::Claude => {
             let mut parser = source::claude::Parser::resume(reader, from);
             let out = run(&mut parser.by_ref().map(absolute))?;
-            (unreadable, unsupported) = (
-                parser.unreadable(),
-                parser.unsupported().map(str::to_string),
-            );
+            unreadable = parser.unreadable();
             (out, parser.stable_len(), 0, parser.incomplete_tail())
         }
         SourceKind::Hook => {
@@ -635,7 +621,6 @@ fn scan<T>(
             dangling_meta,
             incomplete_tail,
             unreadable,
-            unsupported,
         },
     ))
 }

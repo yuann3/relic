@@ -333,11 +333,7 @@ fn run(cmd: Command) -> Result<ExitCode> {
             if let Some(warning) = &r.key_warning {
                 eprintln!("relic: note: {}", app::display_line(warning));
             }
-            unread_notes(
-                r.kind,
-                r.unreadable,
-                r.unsupported.iter().map(|v| (v.as_str(), 1)),
-            );
+            unread_notes(r.kind, r.unreadable);
             let what = if r.kind == SourceKind::Claude {
                 "records"
             } else {
@@ -477,11 +473,7 @@ fn import_sessions(
         eprintln!("relic: note: {}", app::display_line(warning));
     }
     store_notes(r.rescrubbed, r.scrub_blocked, r.checkpoint_blocked);
-    unread_notes(
-        kind,
-        r.unreadable,
-        r.unsupported.iter().map(|(v, n)| (v.as_str(), *n)),
-    );
+    unread_notes(kind, r.unreadable);
     let (lossy, writing) = (r.lossy_records, r.incomplete_tails);
     if lossy > 0 && kind == SourceKind::Hook {
         eprintln!(
@@ -523,12 +515,7 @@ fn import_sessions(
 }
 
 /// What a Claude Code or shell hook import left unread.
-fn unread_notes<'a>(
-    kind: SourceKind,
-    unreadable: usize,
-    unsupported: impl Iterator<Item = (&'a str, usize)>,
-) {
-    use relic::source::claude::{NEWEST, OLDEST};
+fn unread_notes(kind: SourceKind, unreadable: usize) {
     if kind == SourceKind::Hook && unreadable > 0 {
         eprintln!(
             "relic: warning: {unreadable} shell hook frames were skipped: over 1 MiB, or not what relic hook writes"
@@ -536,13 +523,6 @@ fn unread_notes<'a>(
     } else if unreadable > 0 {
         eprintln!(
             "relic: warning: {unreadable} Claude Code records were skipped: over 1 MiB, or not the JSON this relic knows"
-        );
-    }
-    for (version, sessions) in unsupported {
-        eprintln!(
-            "relic: warning: {sessions} sessions reach Claude Code {}, which this relic was not checked against \
-             ({OLDEST} to {NEWEST}); their records from it on were not read",
-            app::display_line(version)
         );
     }
 }

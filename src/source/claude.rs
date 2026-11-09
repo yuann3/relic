@@ -1,8 +1,8 @@
 //! Claude Code session transcripts, `~/.claude/projects/<project>/*.jsonl`,
-//! as a source. Claude Code documents the format as internal and changing
-//! between versions, so this parser is pinned to the versions it was
-//! checked against and stops at the first record from any other: a Relic
-//! that knows that version resumes there, and nothing is guessed meanwhile
+//! as a source, from any Claude Code version. Claude Code documents the
+//! format as internal and changing between versions, so a `user` or
+//! `assistant` line in a shape this parser does not know is counted as
+//! unreadable and skipped, never guessed at
 //! (docs/research/source-evidence-contracts.md).
 //!
 //! Only structured tool fields become records: what a Bash call ran and what
@@ -18,13 +18,8 @@ use super::{Lines, RawRecord};
 use crate::domain::ObservationKind;
 
 /// v1: Bash calls and their results, and the tool calls in [`TOOLS`], from
-/// the `user` and `assistant` records of Claude Code 2.1.288–2.1.318.
+/// the `user` and `assistant` records.
 pub const PARSER_CONTRACT: &str = "claude-code-v1";
-
-/// The versions this parser was checked against: the recorded fixture in
-/// tests/fixtures/claude-code, and real sessions from 2.1.288 on.
-pub const OLDEST: Version = Version(2, 1, 288);
-pub const NEWEST: Version = Version(2, 1, 318);
 
 /// Most bytes kept of what a Bash call printed: how it began and ended,
 /// not the log in between.
@@ -46,26 +41,6 @@ const TOOLS: &[(&str, &str)] = &[
     ("Agent", "description"),
 ];
 
-/// A Claude Code version, as every `user` and `assistant` record carries it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Version(pub u32, pub u32, pub u32);
-
-impl Version {
-    fn parse(s: &str) -> Option<Self> {
-        let mut parts = s.split('.').map(|p| p.parse().ok());
-        match (parts.next()?, parts.next()?, parts.next()?, parts.next()) {
-            (Some(a), Some(b), Some(c), None) => Some(Self(a, b, c)),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.0, self.1, self.2)
-    }
-}
-
 /// Whether the first bytes of a file are a JSONL record.
 pub fn looks_like(head: &[u8]) -> bool {
     head.starts_with(b"{\"")
@@ -78,7 +53,6 @@ pub struct Parser<R> {
     stable_len: u64,
     incomplete_tail: bool,
     unreadable: usize,
-    unsupported: Option<String>,
     /// Bash calls not yet answered: a result says only which call it
     /// answers, and most carry nothing else that marks them as Bash's.
     pending: std::collections::HashSet<String>,
@@ -103,7 +77,6 @@ impl<R: BufRead> Parser<R> {
             stable_len: 0,
             incomplete_tail: false,
             unreadable: 0,
-            unsupported: None,
             pending: std::collections::HashSet::new(),
             from,
         }
@@ -126,14 +99,8 @@ impl<R: BufRead> Parser<R> {
         self.unreadable
     }
 
-    /// The version of the record parsing stopped at, if one was outside
-    /// [`OLDEST`]..=[`NEWEST`]: it and everything after it are left unread.
-    pub fn unsupported(&self) -> Option<&str> {
-        self.unsupported.as_deref()
-    }
-
     fn next_record(&mut self) -> io::Result<Option<RawRecord>> {
-        while self.unsupported.is_none() {
+        loop {
             let start = self.lines.offset;
             self.line.clear();
             let Some(line) = self.lines.read_into(&mut self.line)? else {
@@ -164,10 +131,8 @@ impl<R: BufRead> Parser<R> {
                     self.unreadable += 1;
                     self.stable_len = end;
                 }
-                Parsed::Unsupported(version) => self.unsupported = Some(version),
             }
         }
-        Ok(None)
     }
 }
 
@@ -185,16 +150,14 @@ enum Parsed {
     /// of a tool not kept.
     Nothing,
     Unreadable,
-    Unsupported(String),
 }
 
 /// What decides whether a line is read further. Every line has a `type`;
-/// only `user` and `assistant` lines are versioned and parsed whole.
+/// only `user` and `assistant` lines are parsed whole.
 #[derive(Deserialize)]
 struct Head {
     #[serde(rename = "type")]
     kind: Option<String>,
-    version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -260,12 +223,6 @@ fn parse(line: &[u8], pending: &mut std::collections::HashSet<String>) -> Parsed
     if !matches!(head.kind.as_deref(), Some("user" | "assistant")) {
         return Parsed::Nothing;
     }
-    let Some(version) = head.version else {
-        return Parsed::Unreadable;
-    };
-    if !Version::parse(&version).is_some_and(|v| (OLDEST..=NEWEST).contains(&v)) {
-        return Parsed::Unsupported(version);
-    }
     let Ok(envelope) = serde_json::from_slice::<Envelope>(line) else {
         return Parsed::Unreadable;
     };
@@ -273,7 +230,7 @@ fn parse(line: &[u8], pending: &mut std::collections::HashSet<String>) -> Parsed
         return Parsed::Nothing;
     };
     let timestamp = envelope.timestamp.as_deref().and_then(iso_seconds);
-    // One tool block per record in every version checked.
+    // One tool block per record, as every version seen writes them.
     for block in blocks {
         match block {
             Block::ToolUse { id, name, input } if name == "Bash" => {
@@ -452,14 +409,7 @@ mod tests {
         // 2026-11-06T04:11:27.506Z, as `date -u -d` gives it.
         assert_eq!(records[0].timestamp, Some(1_793_938_287));
         assert!(records.iter().all(|r| !r.lossy));
-        assert_eq!(
-            (
-                parser.unreadable(),
-                parser.unsupported(),
-                parser.incomplete_tail()
-            ),
-            (0, None, false)
-        );
+        assert_eq!((parser.unreadable(), parser.incomplete_tail()), (0, false));
         assert_eq!(parser.stable_len(), fixture.len() as u64);
         // Each record spans exactly its own line.
         for r in &records {
@@ -614,13 +564,13 @@ mod tests {
     }
 
     #[test]
-    fn parsing_stops_at_an_unknown_version_and_skips_only_unreadable_lines() {
-        let newer = line(
-            "assistant",
-            "2.1.319",
-            r#"[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]"#,
-            "",
-        );
+    fn every_version_is_read_and_only_unreadable_lines_are_skipped() {
+        let call = |version: &str, id: &str, command: &str| {
+            let block = format!(
+                r#"[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"{command}"}}}}]"#
+            );
+            line("assistant", version, &block, "")
+        };
         let input = [
             bash("1", "one"),
             "{not json\n".to_string(),
@@ -631,9 +581,9 @@ mod tests {
                 r#"[{"type":"tool_use","name":"Bash","input":{}}]"#,
                 "",
             ),
-            bash("2", "two"),
-            newer.clone(),
-            bash("3", "three"),
+            call("2.1.400", "2", "newer"),
+            call("2.0.1", "3", "older"),
+            call("3.0.0-beta", "4", "unparsed version"),
         ]
         .concat();
         let (records, parser) = parse_all(input.as_bytes());
@@ -641,22 +591,13 @@ mod tests {
             kinds_and_texts(&records),
             [
                 (ObservationKind::AgentCommand, "one"),
-                (ObservationKind::AgentCommand, "two")
+                (ObservationKind::AgentCommand, "newer"),
+                (ObservationKind::AgentCommand, "older"),
+                (ObservationKind::AgentCommand, "unparsed version"),
             ]
         );
-        assert_eq!(
-            (parser.unreadable(), parser.unsupported()),
-            (2, Some("2.1.319"))
-        );
-        assert_eq!(
-            parser.stable_len() as usize,
-            input.find(&newer).unwrap(),
-            "a later Relic resumes at the newer record"
-        );
-        // An older version than any checked is as unknown.
-        let older = line("assistant", "2.1.287", "[]", "");
-        let (records, parser) = parse_all(older.as_bytes());
-        assert!(records.is_empty() && parser.unsupported() == Some("2.1.287"));
+        assert_eq!(parser.unreadable(), 2);
+        assert_eq!(parser.stable_len() as usize, input.len());
 
         let partial = bash("4", "four");
         let (records, parser) = parse_all(partial.trim_end().as_bytes());
