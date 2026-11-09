@@ -2,6 +2,7 @@
 //! (ADR 0010). Profiles are presets of two wire choices, not separate
 //! clients. One request is one attempt; the kernel owns retries.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -306,7 +307,7 @@ impl ModelBoundary for ChatCompletionsClient {
         }))
     }
 
-    fn call(&self, req: &EgressRequest, deadline: Instant) -> Result<Reply, ModelError> {
+    fn call(&self, req: Arc<EgressRequest>, deadline: Instant) -> Result<Reply, ModelError> {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(ModelError::BeforeSend(
@@ -323,7 +324,7 @@ impl ModelBoundary for ChatCompletionsClient {
         if let Some(Secret(key)) = &self.config.api_key {
             request = request.header("authorization", format!("Bearer {key}"));
         }
-        let response = request.send_json(self.body(req)).map_err(classify)?;
+        let response = request.send_json(self.body(&req)).map_err(classify)?;
         let status = response.status().as_u16();
         if status == 429 {
             let retry_after = response
@@ -399,7 +400,7 @@ pub fn check(client: &ChatCompletionsClient) -> (Value, Result<(), String>) {
             .map_err(|e| e.to_string())
             .and_then(|req| {
                 client
-                    .call(&req, Instant::now() + CHECK_DEADLINE)
+                    .call(Arc::new(req), Instant::now() + CHECK_DEADLINE)
                     .map_err(|e| e.to_string())
             });
         let checked = outcome
@@ -708,7 +709,7 @@ mod tests {
     fn call_with(act: Act, wait: Duration) -> Result<Reply, ModelError> {
         let (url, _rx) = serve(vec![act]);
         let client = ChatCompletionsClient::new(config(Profile::LlamaCpp, url)).unwrap();
-        client.call(&request(&client), Instant::now() + wait)
+        client.call(Arc::new(request(&client)), Instant::now() + wait)
     }
 
     fn answer(status: u16, headers: &'static str, body: String) -> Act {
@@ -734,7 +735,7 @@ mod tests {
         ))
         .unwrap();
         assert!(matches!(
-            client.call(&request(&client), Instant::now() + long),
+            client.call(Arc::new(request(&client)), Instant::now() + long),
             Err(ModelError::BeforeSend(_))
         ));
 
@@ -885,9 +886,9 @@ mod tests {
         for (profile, token_field, format) in cases {
             let (url, rx) = serve(vec![answer(200, "", completion("{}", "stop"))]);
             let client = ChatCompletionsClient::new(config(profile, url)).unwrap();
-            let req = request(&client);
+            let req = Arc::new(request(&client));
             client
-                .call(&req, Instant::now() + Duration::from_secs(5))
+                .call(Arc::clone(&req), Instant::now() + Duration::from_secs(5))
                 .unwrap();
             let sent = rx.recv().unwrap();
             let (head, body) = sent.split_once("\r\n\r\n").unwrap();

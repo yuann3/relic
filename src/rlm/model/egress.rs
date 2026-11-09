@@ -98,7 +98,7 @@ impl std::fmt::Display for EgressError {
 impl std::error::Error for EgressError {}
 
 /// A model request that has been redacted, capped, paid for and audited.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EgressRequest {
     role: Role,
     user: String,

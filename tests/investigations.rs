@@ -555,7 +555,7 @@ impl ModelBoundary for Metered {
         self.model.prices()
     }
 
-    fn call(&self, req: &EgressRequest, deadline: Instant) -> Result<Reply, ModelError> {
+    fn call(&self, req: Arc<EgressRequest>, deadline: Instant) -> Result<Reply, ModelError> {
         if req.role() == Role::Root
             && let Some(turn) = self.turns.lock().unwrap().pop_front()
         {
@@ -565,10 +565,11 @@ impl ModelBoundary for Metered {
                 ..Reply::default()
             });
         }
+        let bytes = req.bytes() as u64;
         let reply = self.model.call(req, deadline);
         let mut m = self.meter.lock().unwrap();
         m.calls += 1;
-        m.egress_bytes += req.bytes() as u64;
+        m.egress_bytes += bytes;
         match reply.as_ref().ok().and_then(|r| r.usage) {
             Some(u) => {
                 m.prompt_tokens += u.prompt_tokens;

@@ -2,6 +2,7 @@ pub mod chat;
 pub mod egress;
 pub mod prompt;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
@@ -32,8 +33,9 @@ pub trait ModelBoundary: Send + Sync {
     fn target(&self) -> Target;
 
     /// The model's reply body, unparsed: the kernel caps and checks it.
-    /// Must give up by `deadline`.
-    fn call(&self, req: &EgressRequest, deadline: Instant) -> Result<Reply, ModelError>;
+    /// Must give up by `deadline`. The request is shared, so a boundary
+    /// that keeps it, as a fake does, need not copy it.
+    fn call(&self, req: Arc<EgressRequest>, deadline: Instant) -> Result<Reply, ModelError>;
 
     /// What a token costs, when the profile says; `None` leaves the cost
     /// unknown rather than zero.
@@ -178,7 +180,7 @@ type RootHandler = Box<dyn Fn(&serde_json::Value) -> String + Send>;
 pub struct FakeModel {
     child_responses: std::sync::Mutex<Vec<ChildHandler>>,
     root_responses: std::sync::Mutex<Vec<RootHandler>>,
-    requests: std::sync::Mutex<Vec<EgressRequest>>,
+    requests: std::sync::Mutex<Vec<Arc<EgressRequest>>>,
 }
 
 impl FakeModel {
@@ -197,8 +199,13 @@ impl FakeModel {
     }
 
     /// Every request it was sent, in order.
-    pub fn requests(&self) -> Vec<EgressRequest> {
-        self.requests.lock().unwrap().clone()
+    pub fn requests(&self) -> Vec<Arc<EgressRequest>> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Arc::clone)
+            .collect()
     }
 
     /// Add a child response generator. Called in FIFO order for each batch.
@@ -272,8 +279,7 @@ impl ModelBoundary for FakeModel {
         }
     }
 
-    fn call(&self, req: &EgressRequest, _deadline: Instant) -> Result<Reply, ModelError> {
-        self.requests.lock().unwrap().push(req.clone());
+    fn call(&self, req: Arc<EgressRequest>, _deadline: Instant) -> Result<Reply, ModelError> {
         let body = match req.role() {
             Role::Root => {
                 let mut responses = self.root_responses.lock().unwrap();
@@ -302,6 +308,7 @@ impl ModelBoundary for FakeModel {
                 responses.remove(0)(&sent.packet)
             }
         };
+        self.requests.lock().unwrap().push(req);
         Ok(Reply {
             body,
             returned_model: Some("fake".into()),

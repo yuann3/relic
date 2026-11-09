@@ -454,7 +454,7 @@ mod tests {
             )
             .unwrap();
             model
-                .call(&req, std::time::Instant::now())
+                .call(std::sync::Arc::new(req), std::time::Instant::now())
                 .map(|r| r.body)
                 .map_err(|e| e.to_string())
         };

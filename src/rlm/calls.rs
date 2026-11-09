@@ -53,9 +53,10 @@ pub struct Calls<'r> {
     pub child_calls: &'r mut u16,
 }
 
-/// A call in flight: what to resend on a retry and what to give back.
+/// A call in flight: what to resend on a retry and what to give back. The
+/// request is shared with the thread sending it, which a retry may outlive.
 struct Flight {
-    req: EgressRequest,
+    req: Arc<EgressRequest>,
     attempt: u8,
     tokens: u64,
     cost: u64,
@@ -182,7 +183,7 @@ fn admit(c: &mut Calls, job: Job) -> Result<Result<Flight, String>, Stop> {
         (c.progress)(Progress::Egress(audit));
     }
     Ok(Ok(Flight {
-        req,
+        req: Arc::new(req),
         attempt: 1,
         tokens,
         cost,
@@ -218,12 +219,12 @@ fn send(
     c: &Calls,
     tx: &mpsc::Sender<(usize, Result<Reply, ModelError>)>,
     i: usize,
-    req: &EgressRequest,
+    req: &Arc<EgressRequest>,
     delay: Duration,
 ) -> Result<(), String> {
     let (model, req, tx, deadline, cancel) = (
         Arc::clone(c.model),
-        req.clone(),
+        Arc::clone(req),
         tx.clone(),
         c.deadline,
         Arc::clone(c.cancel),
@@ -234,7 +235,7 @@ fn send(
         // A stop while waiting out a Retry-After: `call_all` has returned,
         // and nothing may leave after it.
         if !cancel.load(Ordering::Relaxed) {
-            let _ = tx.send((i, model.call(&req, deadline)));
+            let _ = tx.send((i, model.call(req, deadline)));
         }
     })
     .map(drop)
@@ -282,7 +283,7 @@ mod tests {
             }
         }
 
-        fn call(&self, req: &EgressRequest, _deadline: Instant) -> Result<Reply, ModelError> {
+        fn call(&self, req: Arc<EgressRequest>, _deadline: Instant) -> Result<Reply, ModelError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.most_live.fetch_max(live, Ordering::SeqCst);
