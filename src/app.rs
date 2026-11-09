@@ -415,21 +415,15 @@ fn report(question: String, r: InvestigationResult, models: Vec<String>) -> Reca
         contradictions: vec![],
         missing: vec![],
     });
-    let mut evidence: Vec<CitedRecord> = Vec::new();
+    // Each record's place is where it is first cited.
+    let mut order: Vec<i64> = Vec::new();
     let mut ids = |cites: &[String]| -> Vec<i64> {
         cites
             .iter()
             .filter_map(|c| r.cited.get(c))
             .map(|o| {
-                if !evidence.iter().any(|e| e.id == o.id) {
-                    evidence.push(CitedRecord {
-                        id: o.id,
-                        revision: o.revision_id,
-                        ordinal: o.ordinal,
-                        source: o.kind.source_label(),
-                        observed_at_ms: o.observed_at_ms,
-                        text: o.safe_text.clone(),
-                    });
+                if !order.contains(&o.id) {
+                    order.push(o.id);
                 }
                 o.id
             })
@@ -437,20 +431,36 @@ fn report(question: String, r: InvestigationResult, models: Vec<String>) -> Reca
     };
     let claims = finish
         .claims
-        .iter()
+        .into_iter()
         .map(|c| CitedText {
-            text: c.text.clone(),
             supports: ids(&c.supports),
             contradicts: ids(&c.contradicts),
+            text: c.text,
         })
         .collect();
     let procedure = finish
         .procedure
-        .iter()
+        .into_iter()
         .map(|s| CitedText {
-            text: s.text.clone(),
             supports: ids(&s.supports),
             contradicts: vec![],
+            text: s.text,
+        })
+        .collect();
+    // The investigation is over, so the result holds the only share of
+    // each record and its text moves into the report.
+    let mut records: Vec<StoredObservation> =
+        r.cited.into_values().map(Arc::unwrap_or_clone).collect();
+    records.sort_by_key(|o| order.iter().position(|&id| id == o.id));
+    let evidence = records
+        .into_iter()
+        .map(|o| CitedRecord {
+            id: o.id,
+            revision: o.revision_id,
+            ordinal: o.ordinal,
+            source: o.kind.source_label(),
+            observed_at_ms: o.observed_at_ms,
+            text: o.safe_text,
         })
         .collect();
     RecallReport {
