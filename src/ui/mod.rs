@@ -343,7 +343,7 @@ where
                     old.store(true, Ordering::SeqCst);
                 }
                 // `update` asks only when a model is configured.
-                let Some(model) = self.model.clone() else {
+                let Some(model) = self.model.as_ref().map(Arc::clone) else {
                     return Ok(Some(vec![]));
                 };
                 let store = Store::open_read_only(&self.db)?;
