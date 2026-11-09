@@ -449,7 +449,7 @@ mod tests {
             let label = format!("{outcomes:?}");
             let model = script(outcomes);
             let (out, events, ledger, _) = run(
-                model.clone(),
+                Arc::clone(&model),
                 BudgetV1::prototype_default(),
                 jobs(1),
                 &Arc::default(),
@@ -476,7 +476,7 @@ mod tests {
             ..Script::default()
         });
         let (out, _, _, _) = run(
-            model.clone(),
+            Arc::clone(&model),
             BudgetV1::prototype_default(),
             jobs(6),
             &Arc::default(),
@@ -503,7 +503,7 @@ mod tests {
         });
         let t = Instant::now();
         let (out, _, _, _) = run(
-            model.clone(),
+            Arc::clone(&model),
             BudgetV1::prototype_default(),
             jobs(4),
             &cancel,
@@ -534,7 +534,7 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
         });
         let (out, _, _, _) = run(
-            model.clone(),
+            Arc::clone(&model),
             BudgetV1::prototype_default(),
             jobs(1),
             &cancel,

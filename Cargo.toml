@@ -49,6 +49,11 @@ cloned_instead_of_copied = "warn"
 uninlined_format_args = "warn"
 # A clone of a value that is never used again.
 redundant_clone = "warn"
+# `arc.clone()` reads as a copy of what it points to; `Arc::clone(&arc)`
+# says it is a second handle on the one value.
+clone_on_ref_ptr = "warn"
+# `s.to_string()` on a String is a clone that reads as a conversion.
+implicit_clone = "warn"
 
 [[bin]]
 name = "relic"

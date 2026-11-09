@@ -1747,7 +1747,7 @@ mod tests {
         let limit = 2_000;
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = |nth: usize| {
-            let polls = polls.clone();
+            let polls = std::sync::Arc::clone(&polls);
             polls.store(0, std::sync::atomic::Ordering::Relaxed);
             move || polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= nth
         };

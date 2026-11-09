@@ -537,7 +537,7 @@ pub(crate) mod tests {
             &git,
             &Budget {
                 deadline: far,
-                cancel: Some(cancel.clone()),
+                cancel: Some(Arc::clone(&cancel)),
             },
         )
         .unwrap_err();

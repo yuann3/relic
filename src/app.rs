@@ -603,7 +603,7 @@ mod tests {
             "q",
             &store_with(&["ls"]),
             &[],
-            model.clone(),
+            Arc::<crate::rlm::model::FakeModel>::clone(&model),
             &log,
             &Arc::default(),
             &mut |p| {

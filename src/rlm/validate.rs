@@ -202,13 +202,13 @@ pub fn validate_plan(
                 None => {
                     return Err(ValidationError::UnknownInputRef {
                         op_id: id.to_string(),
-                        ref_id: ref_id.to_string(),
+                        ref_id: ref_id.clone(),
                     });
                 }
                 Some(&ref_pos) if ref_pos >= i => {
                     return Err(ValidationError::ForwardReference {
                         op_id: id.to_string(),
-                        ref_id: ref_id.to_string(),
+                        ref_id: ref_id.clone(),
                     });
                 }
                 Some(_) => {}

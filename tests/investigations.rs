@@ -652,7 +652,7 @@ fn run(
                 case.question,
                 None,
                 &store,
-                metered.clone(),
+                Arc::<Metered>::clone(&metered),
                 arm.budget(),
                 &Arc::default(),
                 &mut |_| {},
