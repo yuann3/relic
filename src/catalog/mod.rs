@@ -312,10 +312,7 @@ impl Catalog {
         let (report, digest) = read_report(report)?;
         let (validation_id, confirmed_at) =
             self.confirmed(&digest)?.ok_or(CatalogError::Unconfirmed)?;
-        let key = match store.key_path() {
-            Some(path) => crate::key::load_or_create(path)?.0,
-            None => [0; 32],
-        };
+        let key = store.installation_key()?;
         let mut cites = Vec::new();
         let mut observations = Vec::new();
         for step in &report.procedure {

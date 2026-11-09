@@ -459,6 +459,15 @@ impl Store {
         self.key_path.as_deref()
     }
 
+    /// The installation key, written fresh if it is missing. An in-memory
+    /// store has no file to keep one in, so its key is all zeros.
+    pub fn installation_key(&self) -> std::io::Result<crate::key::InstallationKey> {
+        match &self.key_path {
+            Some(path) => Ok(crate::key::load_or_create(path)?.0),
+            None => Ok([0; 32]),
+        }
+    }
+
     /// Check whether a table exists in the database.
     pub fn has_table(&self, name: &str) -> Result<bool, rusqlite::Error> {
         let count: i64 = self.conn.query_row(
