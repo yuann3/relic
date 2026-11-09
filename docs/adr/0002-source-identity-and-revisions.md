@@ -34,6 +34,7 @@ Status: Accepted · Date: 2026-10-04 · Lock: [Lock the Relic v0.1 architecture]
 **Keys and hashes**
 - Delete the per-record `keyed_fingerprint`. Alignment uses safe-text hash plus occurrence context.
 - The installation key is 32 random bytes from `getrandom`, kept in a 0600 file beside the DB. It keys only the prefix digest and its boundary-guard fallback. It protects only against a leak of the DB file alone. Losing it is harmless: the next import falls back to keyless anchor alignment.
+- Since then the key has two more uses, both keyed hashes of stored safe text, never of raw bytes: a skill's durable citations ([0013](0013-skill-catalog-direction.md)), and the mark `relic forget` keeps of a Git ref ([S13](https://github.com/yuann3/relic/issues/38)). Losing it now also costs those: citations go stale, and a forgotten Git ref comes back on the next import of its repository until it is forgotten again.
 - Evidence handles are random per investigation and use no key.
 
 **Streaming parser**
