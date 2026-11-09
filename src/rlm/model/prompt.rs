@@ -77,12 +77,9 @@ pub fn root_schema() -> Value {
         op("select", json!({"input": input(), "verdicts": {"type": "array", "items": verdict()}, "limit": limit})),
         op("inspect", json!({"input": input(), "limit": limit, "max_item_bytes": int})),
     ]});
-    let cited = |extra: Value| {
-        let mut props = json!({"text": {"type": "string"}, "supports": strings()});
-        props
-            .as_object_mut()
-            .expect("object")
-            .extend(extra.as_object().expect("object").clone());
+    let cited = |mut props: Value| {
+        props["text"] = json!({"type": "string"});
+        props["supports"] = strings();
         object(props)
     };
     let finish = object(json!({
