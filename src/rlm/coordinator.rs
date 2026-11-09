@@ -367,12 +367,14 @@ fn investigate(run: &mut Run, question: &str) -> (InvestigationStatus, Option<Fi
                 };
                 // An answer resting on a citation that does not resolve has
                 // no evidence behind it: it abstains, saying why (ADR 0009).
-                let finish = match finish::validate_finish(&finish, &run.registry) {
-                    Ok(checked) => checked.finish,
-                    Err(e) => {
-                        let why = format!("the finish gate refused the answer: {e}");
+                let refused = finish::validate_finish(&finish, &run.registry)
+                    .err()
+                    .map(|e| format!("the finish gate refused the answer: {e}"));
+                let finish = match refused {
+                    None => finish,
+                    Some(why) => {
                         (run.progress)(Progress::Note(why.clone()));
-                        finish::force_abstention(&finish, vec![why])
+                        finish::force_abstention(finish, vec![why])
                     }
                 };
                 let status = match finish.status {

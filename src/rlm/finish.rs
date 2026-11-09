@@ -1,15 +1,17 @@
 use crate::rlm::evidence::HandleRegistry;
 use crate::rlm::protocol::*;
 
+/// Why a finish was refused, borrowing the finish it names: the refusal is
+/// told once and the finish abstains.
 #[derive(Debug, PartialEq)]
-pub enum FinishValidationError {
-    UnresolvableCitation(String),
-    UncitedClaim { claim_text: String },
-    UncitedProcedureStep { step_text: String },
+pub enum FinishValidationError<'a> {
+    UnresolvableCitation(&'a str),
+    UncitedClaim { claim_text: &'a str },
+    UncitedProcedureStep { step_text: &'a str },
     AnsweredWithoutClaims,
 }
 
-impl std::fmt::Display for FinishValidationError {
+impl std::fmt::Display for FinishValidationError<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnresolvableCitation(id) => {
@@ -26,34 +28,27 @@ impl std::fmt::Display for FinishValidationError {
     }
 }
 
-impl std::error::Error for FinishValidationError {}
+impl std::error::Error for FinishValidationError<'_> {}
 
-/// Result of finish validation — may downgrade status.
-#[derive(Debug)]
-pub struct ValidatedFinish {
-    pub status: AnswerStatus,
-    pub finish: FinishV1,
-}
-
-/// Validate a FinishV1 against the handle registry.
+/// Check a FinishV1 against the handle registry.
 /// - Every citation must resolve to an evidence handle in the registry.
 /// - Every claim must have at least one supporting citation.
 /// - Every procedure step must have at least one supporting citation.
-/// - If validation would fail, downgrade status rather than reject outright.
-pub fn validate_finish(
-    finish: &FinishV1,
+/// - An answered finish must make at least one claim.
+pub fn validate_finish<'a>(
+    finish: &'a FinishV1,
     registry: &HandleRegistry,
-) -> Result<ValidatedFinish, FinishValidationError> {
+) -> Result<(), FinishValidationError<'a>> {
     // Check all claims have supports and all citations resolve.
     for claim in &finish.claims {
         if claim.supports.is_empty() {
             return Err(FinishValidationError::UncitedClaim {
-                claim_text: claim.text.clone(),
+                claim_text: &claim.text,
             });
         }
-        for ev_id in claim.supports.iter().chain(claim.contradicts.iter()) {
+        for ev_id in claim.supports.iter().chain(&claim.contradicts) {
             if registry.resolve_evidence_id(ev_id).is_none() {
-                return Err(FinishValidationError::UnresolvableCitation(ev_id.clone()));
+                return Err(FinishValidationError::UnresolvableCitation(ev_id));
             }
         }
     }
@@ -62,38 +57,31 @@ pub fn validate_finish(
     for step in &finish.procedure {
         if step.supports.is_empty() {
             return Err(FinishValidationError::UncitedProcedureStep {
-                step_text: step.text.clone(),
+                step_text: &step.text,
             });
         }
         for ev_id in &step.supports {
             if registry.resolve_evidence_id(ev_id).is_none() {
-                return Err(FinishValidationError::UnresolvableCitation(ev_id.clone()));
+                return Err(FinishValidationError::UnresolvableCitation(ev_id));
             }
         }
     }
 
-    // Enforce sufficiency: answered requires at least one claim.
-    let status = if finish.status == AnswerStatus::Answered && finish.claims.is_empty() {
+    if finish.status == AnswerStatus::Answered && finish.claims.is_empty() {
         return Err(FinishValidationError::AnsweredWithoutClaims);
-    } else {
-        finish.status.clone()
-    };
-
-    Ok(ValidatedFinish {
-        status,
-        finish: finish.clone(),
-    })
+    }
+    Ok(())
 }
 
 /// Force abstention: downgrade status when evidence is insufficient.
-/// Returns a modified finish with status set to abstained and missing list populated.
-pub fn force_abstention(finish: &FinishV1, reasons: Vec<String>) -> FinishV1 {
+/// Returns the finish with status set to abstained and missing list populated.
+pub fn force_abstention(finish: FinishV1, reasons: Vec<String>) -> FinishV1 {
     FinishV1 {
         status: AnswerStatus::Abstained,
         answer: String::new(),
         claims: vec![],
         procedure: vec![],
-        contradictions: finish.contradictions.clone(),
+        contradictions: finish.contradictions,
         missing: reasons,
     }
 }
@@ -152,8 +140,7 @@ mod tests {
             missing: vec![],
         };
 
-        let result = validate_finish(&finish, &reg).unwrap();
-        assert_eq!(result.status, AnswerStatus::Answered);
+        assert_eq!(validate_finish(&finish, &reg), Ok(()));
     }
 
     #[test]
@@ -174,7 +161,7 @@ mod tests {
 
         assert_eq!(
             validate_finish(&finish, &reg).unwrap_err(),
-            FinishValidationError::UnresolvableCitation("ev1_FORGED_ID".to_string())
+            FinishValidationError::UnresolvableCitation("ev1_FORGED_ID")
         );
     }
 
@@ -289,7 +276,7 @@ mod tests {
             missing: vec![],
         };
 
-        let abstained = force_abstention(&finish, vec!["no decisive evidence".to_string()]);
+        let abstained = force_abstention(finish, vec!["no decisive evidence".to_string()]);
         assert_eq!(abstained.status, AnswerStatus::Abstained);
         assert!(abstained.claims.is_empty());
         assert!(abstained.procedure.is_empty());
@@ -308,7 +295,6 @@ mod tests {
             missing: vec!["no certificate commands found".to_string()],
         };
 
-        let result = validate_finish(&finish, &reg).unwrap();
-        assert_eq!(result.status, AnswerStatus::Abstained);
+        assert_eq!(validate_finish(&finish, &reg), Ok(()));
     }
 }
