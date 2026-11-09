@@ -6,6 +6,18 @@ You've probably had this happen. A few months ago you fixed something nasty: a c
 
 Relic pulls those traces into one store on your own machine. You can search them instantly, ask a model how you did something and get back an answer that points at the exact commands you ran, and turn a fix that worked into an Agent Skill that you or your coding agent can use next time.
 
+## Where it helps
+
+**The 3 a.m. page you've seen before.** The TLS certificate on the API box has expired again. Last time was eight months ago, and you remember it took two tries but not why. `relic recall how did I renew the cert on the api box` finds the `certbot` run, the hook record showing the first attempt exited 1 from the wrong directory, and the `nginx -s reload` that came after. Each step links to the command you actually ran, so you're following what worked rather than a model's guess.
+
+**Work you thought was gone.** A `git reset --hard` took a morning's commit with it, or a coding agent deleted a branch while tidying up. Once you've imported the repository, Relic keeps the reflog entry and the commit hash even after Git expires its own reflog, so as long as Git still has the commit, you can find it and branch from it again.
+
+**What did the agent actually do?** Claude Code ran forty commands yesterday and now the migrations fail. `relic search` over its imported session shows the commands it ran in order, beside your own history, and the start and end of what each one printed, without wading through the chat.
+
+**The procedure you do twice a year.** Restoring a staging database from a backup, rotating a deploy key, rebuilding a dev machine after a toolchain upgrade. Run it once, recall it, confirm it with a check of your own (`pg_isready`, `curl -f`, `git rev-parse --verify`), and keep it as a skill. Next time your agent follows your verified steps instead of improvising, and asks before it runs each one.
+
+**Asking a hosted model without handing over your secrets.** History is full of things like `PGPASSWORD=... psql` and tokens in `curl` headers. Those are redacted before they're stored, so recall can use a hosted model while what leaves your machine is `PGPASSWORD=[REDACTED:password] psql`.
+
 ## What it reads
 
 - zsh and Bash history files
