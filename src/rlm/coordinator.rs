@@ -538,7 +538,7 @@ fn verdict_counts(slots: &[Option<ItemAssessmentV1>]) -> serde_json::Value {
     let count = |v: Option<Verdict>| {
         slots
             .iter()
-            .filter(|s| s.as_ref().map(|a| a.verdict.clone()) == v)
+            .filter(|s| s.as_ref().map(|a| a.verdict) == v)
             .count()
     };
     serde_json::json!({
@@ -962,9 +962,9 @@ mod tests {
                 .into_iter()
                 .filter_map(|item| {
                     let verdict = if item.safe_text.contains("renew") {
-                        renew.clone()
+                        renew
                     } else {
-                        status.clone()
+                        status
                     };
                     Some(ItemAssessmentV1 {
                         item_id: item.item_id,

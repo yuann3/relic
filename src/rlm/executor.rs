@@ -1056,7 +1056,7 @@ mod tests {
             .get_assessments(&a_hid)
             .unwrap()
             .iter()
-            .map(|a| a.as_ref().map(|a| a.verdict.clone()))
+            .map(|a| a.as_ref().map(|a| a.verdict))
             .collect();
         assert_eq!(
             verdicts,

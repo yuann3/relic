@@ -29,7 +29,7 @@ pub struct SearchV1 {
     pub limit: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchMode {
     Any,
@@ -47,7 +47,7 @@ pub struct ExpandV1 {
     pub limit: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpandScope {
     SameSource,
@@ -116,7 +116,7 @@ pub struct RootActionV1 {
     pub finish: Option<FinishV1>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RootActionKind {
     Plan,
@@ -184,7 +184,7 @@ pub struct ItemAssessmentV1 {
     pub missing: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Supports,
@@ -193,7 +193,7 @@ pub enum Verdict {
     Irrelevant,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     Low,
