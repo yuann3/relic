@@ -1024,9 +1024,7 @@ mod tests {
         let honest = FakeModel::default_supports_handler();
         model.add_child_response(move |p| {
             let mut r = honest(p);
-            r.assessments[0].claims[0]
-                .supports
-                .push(other_packet.clone());
+            r.assessments[0].claims[0].supports.push(other_packet);
             r
         });
         model.add_child_response(FakeModel::default_supports_handler());

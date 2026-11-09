@@ -172,8 +172,9 @@ pub fn parse_output<T: DeserializeOwned>(raw: &str, max: usize) -> Result<T, Out
     serde_json::from_value(value).map_err(|e| OutputError::Malformed(e.to_string()))
 }
 
-type ChildHandler = Box<dyn Fn(&EvidencePacket) -> String + Send>;
-type RootHandler = Box<dyn Fn(&serde_json::Value) -> String + Send>;
+// Each handler answers one call, so it may move what it holds into the reply.
+type ChildHandler = Box<dyn FnOnce(EvidencePacket) -> String + Send>;
+type RootHandler = Box<dyn FnOnce(&serde_json::Value) -> String + Send>;
 
 /// A fake model that returns scripted responses for testing.
 #[derive(Default)]
@@ -211,7 +212,7 @@ impl FakeModel {
     /// Add a child response generator. Called in FIFO order for each batch.
     pub fn add_child_response<F>(&self, f: F)
     where
-        F: Fn(&EvidencePacket) -> ChildResultV1 + Send + 'static,
+        F: FnOnce(EvidencePacket) -> ChildResultV1 + Send + 'static,
     {
         self.add_child_raw(move |p| serde_json::to_string(&f(p)).unwrap());
     }
@@ -219,7 +220,7 @@ impl FakeModel {
     /// Add a child reply body exactly as the model would send it.
     pub fn add_child_raw<F>(&self, f: F)
     where
-        F: Fn(&EvidencePacket) -> String + Send + 'static,
+        F: FnOnce(EvidencePacket) -> String + Send + 'static,
     {
         self.child_responses.lock().unwrap().push(Box::new(f));
     }
@@ -231,29 +232,27 @@ impl FakeModel {
 
     /// Add a root reply body exactly as the model would send it.
     pub fn add_root_raw(&self, body: String) {
-        self.add_root_fn(move |_| body.clone());
+        self.add_root_fn(move |_| body);
     }
 
     /// Add a root reply body made from the root state it is shown, so a
     /// finish can cite the evidence ids of this investigation.
     pub fn add_root_fn<F>(&self, f: F)
     where
-        F: Fn(&serde_json::Value) -> String + Send + 'static,
+        F: FnOnce(&serde_json::Value) -> String + Send + 'static,
     {
         self.root_responses.lock().unwrap().push(Box::new(f));
     }
 
     /// Default child handler: mark all items as "supports" with high confidence.
-    pub fn default_supports_handler() -> impl Fn(&EvidencePacket) -> ChildResultV1 + Send + 'static
-    {
-        move |packet: &EvidencePacket| ChildResultV1 {
+    pub fn default_supports_handler() -> impl Fn(EvidencePacket) -> ChildResultV1 + Send + 'static {
+        |packet: EvidencePacket| ChildResultV1 {
             version: 1,
-            packet_id: packet.packet_id.clone(),
+            packet_id: packet.packet_id,
             assessments: packet
                 .items
-                .iter()
+                .into_iter()
                 .map(|item| ItemAssessmentV1 {
-                    item_id: item.item_id.clone(),
                     verdict: Verdict::Supports,
                     confidence: Confidence::High,
                     claims: vec![ClaimV1 {
@@ -261,9 +260,10 @@ impl FakeModel {
                             "Evidence found: {}",
                             &item.safe_text[..item.safe_text.len().min(50)]
                         ),
-                        supports: vec![item.evidence_id.clone()],
+                        supports: vec![item.evidence_id],
                         contradicts: vec![],
                     }],
+                    item_id: item.item_id,
                     missing: vec![],
                 })
                 .collect(),
@@ -305,7 +305,7 @@ impl ModelBoundary for FakeModel {
                         "no more scripted child responses".into(),
                     ));
                 }
-                responses.remove(0)(&sent.packet)
+                responses.remove(0)(sent.packet)
             }
         };
         self.requests.lock().unwrap().push(req);

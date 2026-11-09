@@ -899,7 +899,7 @@ mod tests {
     /// Run search `certbot` -> assess -> select `verdicts` -> inspect with
     /// `child` judging, and return the root state the finish turn saw.
     fn select_through(
-        child: impl Fn(&EvidencePacket) -> ChildResultV1 + Send + 'static,
+        child: impl FnOnce(EvidencePacket) -> ChildResultV1 + Send + 'static,
         verdicts: Vec<Verdict>,
     ) -> serde_json::Value {
         let mut store = Store::open_memory().unwrap();
@@ -953,13 +953,13 @@ mod tests {
     fn judge(
         renew: Option<Verdict>,
         status: Option<Verdict>,
-    ) -> impl Fn(&EvidencePacket) -> ChildResultV1 + Send {
+    ) -> impl FnOnce(EvidencePacket) -> ChildResultV1 + Send {
         move |p| ChildResultV1 {
             version: 1,
-            packet_id: p.packet_id.clone(),
+            packet_id: p.packet_id,
             assessments: p
                 .items
-                .iter()
+                .into_iter()
                 .filter_map(|item| {
                     let verdict = if item.safe_text.contains("renew") {
                         renew.clone()
@@ -967,7 +967,7 @@ mod tests {
                         status.clone()
                     };
                     Some(ItemAssessmentV1 {
-                        item_id: item.item_id.clone(),
+                        item_id: item.item_id,
                         verdict: verdict?,
                         confidence: Confidence::High,
                         claims: vec![],
