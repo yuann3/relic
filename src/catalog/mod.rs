@@ -477,6 +477,13 @@ impl Catalog {
         match bundle {
             Some(hash) => {
                 // Outside Relic's directories: the user's own umask, not 077.
+                #[cfg_attr(
+                    target_os = "linux",
+                    expect(
+                        clippy::useless_conversion,
+                        reason = "mode_t is u32 on Linux but u16 on macOS"
+                    )
+                )]
                 let mode = crate::validation::original_umask().map(|mask| 0o777 & !u32::from(mask));
                 make_dirs(parent, mode)?;
                 std::os::unix::fs::symlink(self.dir.join(hash).join(name), &tmp)?;

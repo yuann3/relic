@@ -29,6 +29,13 @@ static ORIGINAL_UMASK: AtomicU32 = AtomicU32::new(UNSET);
 const UNSET: u32 = u32::MAX;
 
 /// Remember the umask Relic replaced, for verifiers to run under.
+#[cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::useless_conversion,
+        reason = "mode_t is u32 on Linux but u16 on macOS"
+    )
+)]
 pub fn set_original_umask(mask: libc::mode_t) {
     ORIGINAL_UMASK.store(u32::from(mask), Ordering::Relaxed);
 }

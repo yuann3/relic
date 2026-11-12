@@ -453,7 +453,9 @@ fn open_pty(rows: u16, cols: u16) -> (OwnedFd, OwnedFd) {
             &mut s,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut ws,
+            // A raw pointer because openpty takes *mut winsize on macOS and
+            // *const on Linux, where `&mut ws` fails unnecessary_mut_passed.
+            &raw mut ws,
         )
     };
     assert_eq!(r, 0, "openpty: {}", std::io::Error::last_os_error());
