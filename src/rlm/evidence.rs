@@ -15,11 +15,81 @@ pub enum HandleKind {
 /// A unique investigation identifier.
 pub type InvestigationId = u64;
 
-/// A unique handle identifier within an investigation.
-pub type HandleId = String;
+/// A result set's id within an investigation: the registry's counter. The
+/// root sees and names it as `h_N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HandleId(u64);
 
-/// A unique evidence identifier (opaque, keyed).
-pub type EvidenceId = String;
+impl HandleId {
+    /// The id `text` names, if it is one as the root is shown it. Only that
+    /// exact text: `h_07` is not `h_7`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let n = text.strip_prefix("h_")?;
+        let canonical = n == "0" || (!n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit()));
+        n.parse().ok().filter(|_| canonical).map(Self)
+    }
+}
+
+impl std::fmt::Display for HandleId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "h_{}", self.0)
+    }
+}
+
+impl serde::Serialize for HandleId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+/// An observation's id within an investigation: random bytes, so it says
+/// nothing about the observation and no other investigation can name it
+/// (ADR 0002). Shown as `ev1_` and 16 lowercase hex digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EvidenceId([u8; 8]);
+
+impl EvidenceId {
+    /// The id `text` names, if it is one as a model is shown it. Only that
+    /// exact text, as a citation must quote it: uppercase hex is not it.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (pairs, []) = text.strip_prefix("ev1_")?.as_bytes().as_chunks::<2>() else {
+            return None;
+        };
+        let digit = |b: u8| match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
+        };
+        let mut bytes = [0; 8];
+        if pairs.len() != bytes.len() {
+            return None;
+        }
+        for (byte, [hi, lo]) in bytes.iter_mut().zip(pairs) {
+            *byte = digit(*hi)? << 4 | digit(*lo)?;
+        }
+        Some(Self(bytes))
+    }
+}
+
+impl std::fmt::Display for EvidenceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ev1_{}", hex_encode(&self.0))
+    }
+}
+
+impl serde::Serialize for EvidenceId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for EvidenceId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        Self::parse(&text)
+            .ok_or_else(|| serde::de::Error::custom(format!("{text:?} is not an evidence id")))
+    }
+}
 
 /// Identifies one sanitized observation at one immutable source revision.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,10 +182,9 @@ fn random<const N: usize>() -> [u8; N] {
     bytes
 }
 
-/// A fresh evidence id: random, so it says nothing about the observation and
-/// no other investigation can name it (ADR 0002). No key is involved.
+/// A fresh evidence id. No key is involved.
 fn random_evidence_id() -> EvidenceId {
-    format!("ev1_{}", hex_encode(&random::<8>()))
+    EvidenceId(random())
 }
 
 /// A short hex digest of `data`, for audit records.
@@ -203,31 +272,30 @@ impl HandleRegistry {
         observations: Vec<Arc<StoredObservation>>,
         assessments: Vec<Option<ItemAssessmentV1>>,
     ) -> HandleId {
-        let id = format!("h_{}", self.next_handle);
+        let id = HandleId(self.next_handle);
         self.next_handle += 1;
 
         let evidence_handles: Vec<EvidenceHandleV1> = observations
             .iter()
             .map(|obs| {
-                let id = self
+                let id = *self
                     .evidence_ids
                     .entry(obs.id)
-                    .or_insert_with(random_evidence_id)
-                    .clone();
+                    .or_insert_with(random_evidence_id);
                 create_evidence_handle(obs, self.investigation_id, id)
             })
             .collect();
 
         let count = observations.len() as u32;
         let handle = ResultHandleV1 {
-            id: id.clone(),
+            id,
             investigation_id: self.investigation_id,
             kind,
             count,
         };
 
         self.entries.insert(
-            id.clone(),
+            id,
             RegistryEntry {
                 handle,
                 observations,
@@ -240,36 +308,38 @@ impl HandleRegistry {
     }
 
     /// Look up a handle by ID. Returns None if not found or wrong investigation.
-    pub fn get(&self, handle_id: &str) -> Option<&ResultHandleV1> {
-        self.entries.get(handle_id).map(|e| &e.handle)
+    pub fn get(&self, handle_id: HandleId) -> Option<&ResultHandleV1> {
+        self.entries.get(&handle_id).map(|e| &e.handle)
     }
 
     /// Get the observations for a handle.
-    pub fn get_observations(&self, handle_id: &str) -> Option<&[Arc<StoredObservation>]> {
+    pub fn get_observations(&self, handle_id: HandleId) -> Option<&[Arc<StoredObservation>]> {
         self.entries
-            .get(handle_id)
+            .get(&handle_id)
             .map(|e| e.observations.as_slice())
     }
 
     /// Get the evidence handles for a result handle.
-    pub fn get_evidence_handles(&self, handle_id: &str) -> Option<&[EvidenceHandleV1]> {
+    pub fn get_evidence_handles(&self, handle_id: HandleId) -> Option<&[EvidenceHandleV1]> {
         self.entries
-            .get(handle_id)
+            .get(&handle_id)
             .map(|e| e.evidence_handles.as_slice())
     }
 
     /// The verdicts of an assessment set, aligned with its observations.
-    pub fn get_assessments(&self, handle_id: &str) -> Option<&[Option<ItemAssessmentV1>]> {
+    pub fn get_assessments(&self, handle_id: HandleId) -> Option<&[Option<ItemAssessmentV1>]> {
         self.entries
-            .get(handle_id)
+            .get(&handle_id)
             .map(|e| e.assessments.as_slice())
     }
 
-    /// Check if a specific evidence ID exists in any handle of this investigation.
+    /// The handle and record a citation names, if this investigation showed
+    /// them. A citation is what a model wrote, so it may name nothing.
     pub fn resolve_evidence_id(
         &self,
         evidence_id: &str,
     ) -> Option<(&EvidenceHandleV1, &Arc<StoredObservation>)> {
+        let evidence_id = EvidenceId::parse(evidence_id)?;
         for entry in self.entries.values() {
             for (i, eh) in entry.evidence_handles.iter().enumerate() {
                 if eh.id == evidence_id {
@@ -300,7 +370,7 @@ impl HandleRegistry {
         self.entries
             .values()
             .map(|e| HandleSummary {
-                id: e.handle.id.clone(),
+                id: e.handle.id,
                 kind: e.handle.kind,
                 count: e.handle.count,
             })
@@ -339,7 +409,7 @@ mod tests {
         let obs = make_stored(1, 10, 0, "cargo build --release");
         let handle = create_evidence_handle(&obs, 100, random_evidence_id());
 
-        assert!(handle.id.starts_with("ev1_"));
+        assert!(handle.id.to_string().starts_with("ev1_"));
         assert_eq!(handle.observation_id, 1);
         assert_eq!(handle.revision_id, 10);
         assert_eq!(handle.investigation_id, 100);
@@ -408,6 +478,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_id_is_read_back_only_from_the_exact_text_it_is_shown_as() {
+        let fresh = random_evidence_id();
+        assert_eq!(EvidenceId::parse(&fresh.to_string()), Some(fresh));
+        let id = EvidenceId::parse("ev1_00112233aabbccdd").unwrap();
+        assert_eq!(id.to_string(), "ev1_00112233aabbccdd");
+        for wrong in [
+            "ev1_00112233AABBCCDD",
+            "EV1_00112233aabbccdd",
+            "ev1_00112233aabbccd",
+            "ev1_00112233aabbccdd0",
+            "ev1_00112233aabbccdg",
+            " ev1_00112233aabbccdd",
+        ] {
+            assert_eq!(EvidenceId::parse(wrong), None, "{wrong}");
+        }
+
+        for shown in ["h_0", "h_7", "h_18446744073709551615"] {
+            assert_eq!(HandleId::parse(shown).unwrap().to_string(), shown);
+        }
+        for wrong in [
+            "h_07",
+            "h_+7",
+            "h_-7",
+            "h_",
+            "H_7",
+            "h_7 ",
+            "h_18446744073709551616",
+        ] {
+            assert_eq!(HandleId::parse(wrong), None, "{wrong}");
+        }
+    }
+
     // --- Registry tests ---
 
     #[test]
@@ -419,16 +522,16 @@ mod tests {
         ];
 
         let hid = reg.insert_evidence_set(obs);
-        let handle = reg.get(&hid).unwrap();
+        let handle = reg.get(hid).unwrap();
         assert_eq!(handle.kind, HandleKind::EvidenceSet);
         assert_eq!(handle.count, 2);
-        assert_eq!(reg.get_observations(&hid).unwrap().len(), 2);
+        assert_eq!(reg.get_observations(hid).unwrap().len(), 2);
     }
 
     #[test]
     fn registry_nonexistent_handle_returns_none() {
         let reg = HandleRegistry::new(64);
-        assert!(reg.get("nonexistent").is_none());
+        assert!(reg.get(HandleId(99)).is_none());
     }
 
     #[test]
@@ -437,10 +540,10 @@ mod tests {
         let obs = vec![make_stored(1, 10, 0, "cargo build")];
         let hid = reg.insert_evidence_set(obs);
 
-        let ev_handles = reg.get_evidence_handles(&hid).unwrap();
+        let ev_handles = reg.get_evidence_handles(hid).unwrap();
         let ev_id = &ev_handles[0].id;
 
-        let (resolved_handle, resolved_obs) = reg.resolve_evidence_id(ev_id).unwrap();
+        let (resolved_handle, resolved_obs) = reg.resolve_evidence_id(&ev_id.to_string()).unwrap();
         assert_eq!(resolved_handle.observation_id, 1);
         assert_eq!(resolved_obs.safe_text, "cargo build");
     }
@@ -461,10 +564,10 @@ mod tests {
         };
         let ids = |reg: &mut HandleRegistry| {
             let hid = reg.insert_evidence_set(obs());
-            reg.get_evidence_handles(&hid)
+            reg.get_evidence_handles(hid)
                 .unwrap()
                 .iter()
-                .map(|h| h.id.clone())
+                .map(|h| h.id)
                 .collect::<Vec<_>>()
         };
         let (mut first, mut second) = (HandleRegistry::new(64), HandleRegistry::new(64));
@@ -477,7 +580,7 @@ mod tests {
         );
         let b = ids(&mut second);
         assert!(a.iter().all(|id| !b.contains(id)), "{a:?} {b:?}");
-        assert!(second.resolve_evidence_id(&a[0]).is_none());
+        assert!(second.resolve_evidence_id(&a[0].to_string()).is_none());
         assert_ne!(first.investigation_id(), second.investigation_id());
     }
 

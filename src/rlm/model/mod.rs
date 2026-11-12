@@ -21,7 +21,7 @@ pub struct EvidencePacket {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct EvidenceItem {
     pub item_id: String,
-    pub evidence_id: String,
+    pub evidence_id: crate::rlm::evidence::EvidenceId,
     pub safe_text: String,
     pub truncation: Option<TruncationV1>,
 }
@@ -260,7 +260,7 @@ impl FakeModel {
                             "Evidence found: {}",
                             &item.safe_text[..item.safe_text.len().min(50)]
                         ),
-                        supports: vec![item.evidence_id],
+                        supports: vec![item.evidence_id.to_string()],
                         contradicts: vec![],
                     }],
                     item_id: item.item_id,

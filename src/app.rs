@@ -14,6 +14,7 @@ use crate::rlm::Progress;
 use crate::rlm::coordinator::{
     InvestigationResult, InvestigationStatus, SkillSeed, run_investigation,
 };
+use crate::rlm::evidence::EvidenceId;
 use crate::rlm::model::ModelBoundary;
 use crate::rlm::model::egress::Role;
 use crate::rlm::protocol::{AnswerStatus, BudgetV1, FinishV1};
@@ -420,7 +421,7 @@ fn report(question: String, r: InvestigationResult, models: Vec<String>) -> Reca
     let mut ids = |cites: &[String]| -> Vec<i64> {
         cites
             .iter()
-            .filter_map(|c| r.cited.get(c))
+            .filter_map(|c| r.cited.get(&EvidenceId::parse(c)?))
             .map(|o| {
                 if !order.contains(&o.id) {
                     order.push(o.id);

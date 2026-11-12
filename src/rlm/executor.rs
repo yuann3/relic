@@ -1,6 +1,6 @@
 use crate::domain::StoredObservation;
 use crate::rlm::budget::BudgetExhausted;
-use crate::rlm::evidence::{HandleId, HandleKind, HandleRegistry};
+use crate::rlm::evidence::{EvidenceId, HandleId, HandleKind, HandleRegistry};
 use crate::rlm::model::egress::{self, Role};
 use crate::rlm::model::{EvidenceItem, EvidencePacket, OutputError, parse_output};
 use crate::rlm::protocol::*;
@@ -16,7 +16,7 @@ pub enum ExecError {
     HandleNotFound(String),
     /// A handle reference named a set of the wrong kind for its operator.
     WrongKind {
-        handle: String,
+        handle: HandleId,
         expected: HandleKind,
     },
     Budget(BudgetExhausted),
@@ -153,7 +153,7 @@ pub fn execute_expand(
     let source_handle_id = resolve_input(&expand.input, plan_outputs)?;
     let seed_obs = registry
         .get_observations(source_handle_id)
-        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.to_owned()))?;
+        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.to_string()))?;
 
     let stop = {
         let cancel = Arc::clone(cancel);
@@ -230,10 +230,10 @@ pub fn check_child_result(
             .claims
             .iter()
             .flat_map(|c| c.supports.iter().chain(&c.contradicts));
-        if let Some(bad) = cited
-            .into_iter()
-            .find(|ev| !packet.items.iter().any(|item| &item.evidence_id == *ev))
-        {
+        if let Some(bad) = cited.into_iter().find(|ev| {
+            EvidenceId::parse(ev)
+                .is_none_or(|id| !packet.items.iter().any(|item| item.evidence_id == id))
+        }) {
             return Err(ChildRejection::Citation {
                 item_id: a.item_id,
                 evidence_id: bad.clone(),
@@ -336,11 +336,11 @@ pub fn execute_assess(
     let source_handle_id = resolve_input(&assess.input, plan_outputs)?;
     let source_obs = registry
         .get_observations(source_handle_id)
-        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.to_owned()))?;
+        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.to_string()))?;
 
     let evidence_handles = registry
         .get_evidence_handles(source_handle_id)
-        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.to_owned()))?;
+        .ok_or_else(|| ExecError::HandleNotFound(source_handle_id.to_string()))?;
 
     // Select up to max_items observations.
     let selected_count = source_obs.len().min(assess.max_items as usize);
@@ -348,7 +348,7 @@ pub fn execute_assess(
     let items = (0..selected_count)
         .map(|i| EvidenceItem {
             item_id: format!("item_{i}"),
-            evidence_id: evidence_handles[i].id.clone(),
+            evidence_id: evidence_handles[i].id,
             safe_text: source_obs[i].safe_text.clone(),
             truncation: None,
         })
@@ -397,12 +397,12 @@ pub fn execute_select(
     let source = resolve_input(&select.input, plan_outputs)?;
     let handle = registry
         .get(source)
-        .ok_or_else(|| ExecError::HandleNotFound(source.to_owned()))?;
+        .ok_or_else(|| ExecError::HandleNotFound(source.to_string()))?;
     // Plan admission checks plan outputs; a handle from an earlier turn
     // is checked here.
     if handle.kind != HandleKind::AssessmentSet {
         return Err(ExecError::WrongKind {
-            handle: source.to_owned(),
+            handle: source,
             expected: HandleKind::AssessmentSet,
         });
     }
@@ -424,18 +424,21 @@ pub fn execute_select(
 /// The handle each op of the running plan made, by its op_id.
 pub type PlanOutputs<'p> = std::collections::HashMap<&'p str, HandleId>;
 
-/// Resolve an InputRefV1 to the id of the handle it names.
-pub fn resolve_input<'a>(
-    input: &'a InputRefV1,
-    plan_outputs: &'a PlanOutputs,
-) -> Result<&'a str, ExecError> {
+/// Resolve an InputRefV1 to the id of the handle it names. A handle the
+/// root names that no set has is found missing when it is read.
+pub fn resolve_input(
+    input: &InputRefV1,
+    plan_outputs: &PlanOutputs,
+) -> Result<HandleId, ExecError> {
     match input {
-        InputRefV1::Output(op_id) => plan_outputs
-            .get(op_id.as_str())
-            .map(String::as_str)
-            .ok_or_else(|| ExecError::HandleNotFound(op_id.clone())),
-        InputRefV1::Handle(handle_id) => Ok(handle_id),
+        InputRefV1::Output(op_id) => plan_outputs.get(op_id.as_str()).copied(),
+        InputRefV1::Handle(handle_id) => HandleId::parse(handle_id),
     }
+    .ok_or_else(|| match input {
+        InputRefV1::Output(name) | InputRefV1::Handle(name) => {
+            ExecError::HandleNotFound(name.clone())
+        }
+    })
 }
 
 #[cfg(test)]
@@ -535,11 +538,11 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        let handle = registry.get(&hid).unwrap();
+        let handle = registry.get(hid).unwrap();
         assert_eq!(handle.kind, HandleKind::EvidenceSet);
         assert_eq!(handle.count, 2);
 
-        let obs = registry.get_observations(&hid).unwrap();
+        let obs = registry.get_observations(hid).unwrap();
         assert!(obs.iter().all(|o| o.safe_text.contains("cargo")));
     }
 
@@ -575,7 +578,7 @@ mod tests {
             )
             .unwrap();
             registry
-                .get_observations(&hid)
+                .get_observations(hid)
                 .unwrap()
                 .iter()
                 .map(|o| o.safe_text.clone())
@@ -614,7 +617,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(registry.get(&hid).unwrap().count, 5);
+        assert_eq!(registry.get(hid).unwrap().count, 5);
     }
 
     #[test]
@@ -650,7 +653,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(registry.get(&s_hid).unwrap().count, 1);
+        assert_eq!(registry.get(s_hid).unwrap().count, 1);
 
         // Expand around it.
         let expand = ExpandV1 {
@@ -672,7 +675,7 @@ mod tests {
             &Arc::default(),
         )
         .unwrap();
-        let obs = registry.get_observations(&e_hid).unwrap();
+        let obs = registry.get_observations(e_hid).unwrap();
 
         // Should have ordinals 22..=28 (7 items: 3 before + center + 3 after)
         assert_eq!(obs.len(), 7);
@@ -712,7 +715,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(registry.get(&s_hid).unwrap().count, 2);
+        assert_eq!(registry.get(s_hid).unwrap().count, 2);
 
         let expand = ExpandV1 {
             op_id: "e1".to_string(),
@@ -733,7 +736,7 @@ mod tests {
             &Arc::default(),
         )
         .unwrap();
-        let obs = registry.get_observations(&e_hid).unwrap();
+        let obs = registry.get_observations(e_hid).unwrap();
 
         // Ordinals 8..=13 — no duplicates despite overlapping windows.
         let ordinals: Vec<i64> = obs.iter().map(|o| o.ordinal).collect();
@@ -765,7 +768,7 @@ mod tests {
         };
         let mut notes = Vec::new();
         let hid = execute_search(&store, &search, &mut registry, &spent, &mut notes).unwrap();
-        assert_eq!(registry.get(&hid).unwrap().count, 0);
+        assert_eq!(registry.get(hid).unwrap().count, 0);
         assert!(
             notes.len() == 1 && notes[0].starts_with("s1: query too broad"),
             "{notes:?}"
@@ -774,7 +777,7 @@ mod tests {
         // A plan built on it runs on: expanding nothing finds nothing.
         let expand = ExpandV1 {
             op_id: "e1".into(),
-            input: InputRefV1::Handle(hid),
+            input: InputRefV1::Handle(hid.to_string()),
             scope: ExpandScope::SameSource,
             before: 2,
             after: 2,
@@ -788,7 +791,7 @@ mod tests {
             &Arc::default(),
         )
         .unwrap();
-        assert_eq!(registry.get(&e_hid).unwrap().count, 0);
+        assert_eq!(registry.get(e_hid).unwrap().count, 0);
     }
 
     // --- Batching ---
@@ -796,7 +799,7 @@ mod tests {
     fn item(i: usize, text: String) -> EvidenceItem {
         EvidenceItem {
             item_id: format!("item_{i}"),
-            evidence_id: format!("ev1_{i:016x}"),
+            evidence_id: EvidenceId::parse(&format!("ev1_{i:016x}")).unwrap(),
             safe_text: text,
             truncation: None,
         }
@@ -887,7 +890,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(registry.get(&s_hid).unwrap().count, 8);
+        assert_eq!(registry.get(s_hid).unwrap().count, 8);
 
         // The host batches 4 small items per call: 2 calls.
         let model = FakeModel::new();
@@ -921,7 +924,7 @@ mod tests {
         assert_eq!(child_calls, 2);
 
         // Result is an assessment set.
-        let handle = registry.get(&a_hid).unwrap();
+        let handle = registry.get(a_hid).unwrap();
         assert_eq!(handle.kind, HandleKind::AssessmentSet);
         assert_eq!(handle.count, 8);
     }
@@ -932,10 +935,7 @@ mod tests {
             packet_id: "pkt_00".into(),
             items: vec![item(0, "a".into()), item(1, "b".into())],
         };
-        let (ev0, ev1) = (
-            packet.items[0].evidence_id.clone(),
-            packet.items[1].evidence_id.clone(),
-        );
+        let (ev0, ev1) = (packet.items[0].evidence_id, packet.items[1].evidence_id);
         let good = serde_json::json!({"version": 1, "packet_id": "pkt_00", "assessments": [
             {"item_id": "item_0", "verdict": "supports", "confidence": "high",
              "claims": [{"text": "t", "supports": [ev0], "contradicts": [ev1]}]},
@@ -986,7 +986,7 @@ mod tests {
         };
         let outside = Err(ChildRejection::Citation {
             item_id: "item_0".into(),
-            evidence_id: foreign.clone(),
+            evidence_id: foreign.to_string(),
         });
         assert_eq!(cited("supports"), outside);
         assert_eq!(cited("contradicts"), outside);
@@ -1030,7 +1030,9 @@ mod tests {
         )
         .unwrap();
         // Packet 1's evidence, which packet 0's child was never sent.
-        let other_packet = registry.get_evidence_handles(&s_hid).unwrap()[4].id.clone();
+        let other_packet = registry.get_evidence_handles(s_hid).unwrap()[4]
+            .id
+            .to_string();
 
         let model = FakeModel::new();
         let honest = FakeModel::default_supports_handler();
@@ -1044,7 +1046,7 @@ mod tests {
 
         let assess = AssessV1 {
             op_id: "a1".into(),
-            input: InputRefV1::Handle(s_hid),
+            input: InputRefV1::Handle(s_hid.to_string()),
             objective: "o".into(),
             max_items: 12,
         };
@@ -1065,7 +1067,7 @@ mod tests {
         .unwrap();
 
         let verdicts: Vec<_> = registry
-            .get_assessments(&a_hid)
+            .get_assessments(a_hid)
             .unwrap()
             .iter()
             .map(|a| a.as_ref().map(|a| a.verdict))

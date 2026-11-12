@@ -156,10 +156,8 @@ pub fn run_investigation(
             claims.chain(f.procedure.iter().flat_map(|s| &s.supports))
         })
         .filter_map(|id| {
-            Some((
-                id.clone(),
-                Arc::clone(run.registry.resolve_evidence_id(id)?.1),
-            ))
+            let (handle, record) = run.registry.resolve_evidence_id(id)?;
+            Some((handle.id, Arc::clone(record)))
         })
         .collect();
     let cost_microusd = run.model.prices().map(|_| run.ledger.cost_spent());
@@ -204,7 +202,7 @@ fn seed(run: &mut Run, skill: &SkillSeed) -> Result<(), InvestigationStatus> {
     let handle = run.registry.insert_evidence_set(observations);
     let packet = packet(
         &run.registry,
-        &handle,
+        handle,
         SEED_ITEMS,
         SEED_ITEM_BYTES,
         format!("skill_{}", skill.name),
@@ -220,7 +218,7 @@ fn seed(run: &mut Run, skill: &SkillSeed) -> Result<(), InvestigationStatus> {
 /// cut to `max_item_bytes`.
 fn packet(
     registry: &HandleRegistry,
-    handle: &str,
+    handle: HandleId,
     limit: usize,
     max_item_bytes: u32,
     packet_id: String,
@@ -238,7 +236,7 @@ fn packet(
             let sent = text.floor_char_boundary(max_item_bytes as usize);
             EvidenceItem {
                 item_id: format!("item_{idx}"),
-                evidence_id: ev.id.clone(),
+                evidence_id: ev.id,
                 safe_text: text[..sent].to_string(),
                 truncation: (sent < text.len()).then_some(TruncationV1 {
                     original_bytes: text.len(),
@@ -431,7 +429,7 @@ fn execute_op(
                 .map_err(CoordinatorError::Execution)?;
 
             // Release unused row reservation.
-            let actual = registry.get(&hid).map_or(0, |h| u64::from(h.count));
+            let actual = registry.get(hid).map_or(0, |h| u64::from(h.count));
             let reserved = u64::from(s.limit);
             if actual < reserved {
                 ledger.release_rows(reserved - actual);
@@ -452,7 +450,7 @@ fn execute_op(
             let hid = executor::execute_expand(store, e, registry, plan_outputs, cancel)
                 .map_err(CoordinatorError::Execution)?;
 
-            let actual = registry.get(&hid).map_or(0, |h| u64::from(h.count));
+            let actual = registry.get(hid).map_or(0, |h| u64::from(h.count));
             let reserved = u64::from(e.limit);
             if actual < reserved {
                 ledger.release_rows(reserved - actual);
@@ -584,7 +582,7 @@ fn build_root_state(
                 "kind": format!("{:?}", s.kind),
                 "count": s.count,
             });
-            if let Some(slots) = registry.get_assessments(&s.id).filter(|_| s.kind == HandleKind::AssessmentSet) {
+            if let Some(slots) = registry.get_assessments(s.id).filter(|_| s.kind == HandleKind::AssessmentSet) {
                 h["verdicts"] = verdict_counts(slots);
             }
             h
@@ -860,7 +858,7 @@ mod tests {
         assert_eq!(finish.status, AnswerStatus::Answered);
         let cite = &finish.claims[0].supports[0];
         assert_eq!(
-            result.cited[cite].safe_text,
+            result.cited[&EvidenceId::parse(cite).unwrap()].safe_text,
             "certbot renew --nginx -d example.com"
         );
         assert_eq!(
@@ -1208,7 +1206,7 @@ mod tests {
             items: (0..12)
                 .map(|i| EvidenceItem {
                     item_id: format!("item_{i}"),
-                    evidence_id: format!("ev1_{i:016x}"),
+                    evidence_id: EvidenceId::parse(&format!("ev1_{i:016x}")).unwrap(),
                     safe_text: format!("Long command text for item {i} with extra detail"),
                     truncation: None,
                 })

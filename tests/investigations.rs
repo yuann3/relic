@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use relic::rlm::coordinator::{InvestigationResult, InvestigationStatus, run_investigation};
+use relic::rlm::evidence::EvidenceId;
 use relic::rlm::model::chat::{ChatCompletionsClient, ChatConfig};
 use relic::rlm::model::egress::{self, EgressRequest, Role, Target};
 use relic::rlm::model::{ModelBoundary, ModelError, Prices, Reply};
@@ -360,7 +361,7 @@ impl Answer {
             .iter()
             .flat_map(|c| c.supports.iter().chain(&c.contradicts))
             .chain(f.procedure.iter().flat_map(|s| &s.supports));
-        for o in cites.filter_map(|c| r.cited.get(c)) {
+        for o in cites.filter_map(|c| r.cited.get(&EvidenceId::parse(c)?)) {
             if !answer.cited.contains(&o.id) {
                 answer.cited.push(o.id);
             }

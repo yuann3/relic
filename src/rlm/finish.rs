@@ -113,10 +113,10 @@ mod tests {
         ];
         let hid = reg.insert_evidence_set(obs);
         let ev_ids: Vec<String> = reg
-            .get_evidence_handles(&hid)
+            .get_evidence_handles(hid)
             .unwrap()
             .iter()
-            .map(|eh| eh.id.clone())
+            .map(|eh| eh.id.to_string())
             .collect();
         (reg, ev_ids)
     }

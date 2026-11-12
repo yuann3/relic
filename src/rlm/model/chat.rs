@@ -371,7 +371,8 @@ pub fn check(client: &ChatCompletionsClient) -> (Value, Result<(), String>) {
         packet_id: "pkt_00".into(),
         items: vec![EvidenceItem {
             item_id: "item_0".into(),
-            evidence_id: "ev1_0000000000000001".into(),
+            evidence_id: crate::rlm::evidence::EvidenceId::parse("ev1_0000000000000001")
+                .expect("a well-formed evidence id"),
             safe_text: "ls -la /tmp".into(),
             truncation: None,
         }],
