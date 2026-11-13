@@ -2,11 +2,14 @@
 
 # Relic
 
+> [!WARNING]
+> Relic is a research project, and some of the ideas in it are pretty weird, like running recall as a recursive language model (RLM). Expect rough edges, and expect things to change. You don't need any of that to get value out of it, though: search works offline today, so you can just use Relic as a better Ctrl+F for everything you've done in your terminal.
+
 Relic remembers what you did in your terminal, so you can find it again and reuse it.
 
 It imports your shell history, Git reflogs and Claude Code sessions into one store on your machine, with secrets redacted. You can search it offline, ask a model how you did something and get an answer that cites the exact commands you ran, and keep a fix that worked as an Agent Skill for you or your coding agent.
 
-Relic is a research project. It tests two ideas: that recall built as a recursive language model finds the steps of a past fix better than plain search, and that a small judgment model like Jev can do part of that work more cheaply. Neither is proven yet.
+The research tests two ideas: that recall built as a recursive language model finds the steps of a past fix better than plain search, and that a small judgment model like Jev can do part of that work more cheaply. Neither is proven yet.
 
 ![The Relic terminal UI: searching for "rescue", then opening a cherry-pick to see the commands around it and its evidence](docs/images/tui.gif)
 
