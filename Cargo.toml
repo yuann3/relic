@@ -59,6 +59,14 @@ implicit_clone = "warn"
 name = "relic"
 path = "src/main.rs"
 
+# Measured in docs/research/release-build-profile.md: about 14% smaller
+# stripped, with import and search within run-to-run noise on macOS and
+# Linux. opt-level stays 3: "s" cost 15-50% of import and search, "z" twice.
+# panic stays unwind: abort turns the TUI's exit 101 into SIGABRT for 0.4 MiB.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [lib]
 bench = false
 
