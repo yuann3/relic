@@ -1,3 +1,5 @@
+![Relic: remember what you did in your terminal](docs/images/banner.png)
+
 # Relic
 
 Relic remembers what you did in your terminal, so you can find it again and reuse it.
@@ -73,6 +75,10 @@ relic ui
 Search runs entirely offline and is fast enough to update as you type. Results come most recently imported first, which is import order rather than when a command ran, or by relevance with `--rank`. `--json` gives you something to script against, `--fzf` lets you pick a result in fzf, and `relic ui` opens the terminal UI.
 
 ![relic search finding a git reset in both the zsh history and the Git reflog, then ranked searches for certbot and cherry](docs/images/search.gif)
+
+In the UI, Tab out of the query and press `?` to see every key.
+
+![The relic ui help screen listing its keys over the results, timeline and evidence panes](docs/images/tui-help.png)
 
 ## Asking how you did something
 
