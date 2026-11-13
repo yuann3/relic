@@ -6,13 +6,23 @@ You've probably had this happen. A few months ago you fixed something nasty: a c
 
 Relic pulls those traces into one store on your own machine. You can search them instantly, ask a model how you did something and get back an answer that points at the exact commands you ran, and turn a fix that worked into an Agent Skill that you or your coding agent can use next time.
 
-## Where it helps
+Say you restore a staging database from a backup twice a year. Run it once, ask Relic how you did it, confirm the steps with a check of your own (`pg_isready`, say), and keep them as a skill. Next time your agent follows the steps you verified instead of improvising.
 
-**What did the agent actually do?** Claude Code ran forty commands yesterday and now the migrations fail. `relic search` over its imported session shows the commands it ran in order, beside your own history, and the start and end of what each one printed, without wading through the chat.
+Relic is also a research project. The tool is real and works end to end, but it exists to test two ideas: that a model can dig through a large, messy history better as a recursive language model than through plain search, and that a small judgment model like Jev can do part of that digging more cheaply. Neither is proven yet.
 
-**The procedure you do twice a year.** Restoring a staging database from a backup, rotating a deploy key, rebuilding a dev machine after a toolchain upgrade. Run it once, recall it, confirm it with a check of your own (`pg_isready`, `curl -f`, `git rev-parse --verify`), and keep it as a skill. Next time your agent follows your verified steps instead of improvising, and asks before it runs each one.
+## Why recall is a recursive language model
 
-**Asking a hosted model without handing over your secrets.** History is full of things like `PGPASSWORD=... psql` and tokens in `curl` headers. Those are redacted before they're stored, so recall can use a hosted model while what leaves your machine is `PGPASSWORD=[REDACTED:password] psql`.
+Your history can hold hundreds of thousands of commands, and one fix is usually scattered across it: a `git reset` in your zsh history, the exit status the hook recorded, the reflog entry Git kept, a few commands a coding agent ran. All of that doesn't fit in a prompt. The usual shortcut, searching for the question's words and handing the top twenty hits to a model, tends to miss the step that matters, because that step rarely uses the words you asked with.
+
+[Recursive Language Models](https://arxiv.org/abs/2512.24601) (Zhang et al.) handle long inputs differently. The input stays outside the model, the model sees only a description of it, and it writes a small program to look through it, calling smaller models on the pieces it picks. Relic's recall is a bounded version of that. The root model never sees your history. It sees the question, how big the store is and which result sets it has made so far, and it answers with a short plan: search for these words, widen around those hits, have helper models judge these records, keep the ones that support the answer, show me the best few. Relic checks the plan and runs it. Helper models see only a small packet of redacted records at a time, and the final answer can cite only records the investigation actually looked at.
+
+It's bounded on purpose. The paper lets the model run arbitrary Python. Relic's plans have five operations and one level of helper calls, and every investigation has hard caps on calls, bytes, tokens, money and time. That gives up some flexibility for something that can safely run over your own history and can't invent a citation.
+
+## Why Jev
+
+Most of the model calls in a recall are those helper calls, and their job is narrow: for each record in a packet, does it support the answer, contradict it, or have nothing to do with it? That's a judgment rather than writing. [Jev](https://docs.typesafe.ai), TypeSafe's System One model, is built for judgments: it returns typed choices and scores with calibrated probabilities instead of text. In a prototype it judged packets of four records in about 430 ms, was clearly confident on obvious records and unsure on genuinely ambiguous ones, and would cost about $0.0003 for a whole investigation.
+
+It isn't wired in yet. Before Jev replaces the chat model in those calls, it has to judge the same packets at least as well, and TypeSafe's terms for keeping what's sent to it have to be acceptable. That comparison is still open ([#36](https://github.com/yuann3/relic/issues/36)).
 
 ## What it reads
 
@@ -98,10 +108,11 @@ relic skill activate recover-lost-commit --user --claude
 
 The whole loop works end to end: import, search, cited recall, validation, skills, and reuse on a second, similar problem. The privacy rules and the performance targets are checked by the test suite. It's still early, though. Nothing is tagged or packaged yet, and the store format may change between versions (Relic upgrades an older store the next time you import).
 
-Things on the list next:
+The open questions, and the work around them:
 
-- **Packaging.** Release builds, an easy install, and CI on Linux as well as macOS.
-- **An honest benchmark.** There's a set of twelve seeded investigations in `tests/investigations.rs` that compares bounded recall with plain search and simpler pipelines. It hasn't had a clean run against a real model yet, so there's no claim yet that recall beats just searching.
+- **Does recall beat search?** There's a set of twelve seeded investigations in `tests/investigations.rs` that compares bounded recall with plain search and simpler pipelines. It hasn't had a clean run against a real model yet, so there's no claim yet that recall beats just searching.
+- **Does Jev help?** The same-packet comparison above, and only then an adapter.
+- **Packaging.** Release builds for macOS and Linux, an easy install, and CI ([#45](https://github.com/yuann3/relic/issues/45)).
 - **More sources.** Traces from other coding agents, not only Claude Code.
 - **Looking after your data.** A proper lifecycle for the shell hooks, and recovery for a damaged store that keeps the old file instead of deleting it.
 
