@@ -100,7 +100,7 @@ relic skill activate recover-lost-commit --user --claude
 
 `validate` runs a check you write yourself and records whether it passed. Relic never runs the procedure on your behalf. A skill can only be compiled from a report that passed, and it comes out as a plain Agent Skill, a single `SKILL.md`, linked into `~/.agents/skills` (and `.claude/skills` with `--claude`) where agents that read skills will find it. `relic skill rollback` undoes an activation. The next time you ask Relic a similar question, recall starts from the skill instead of digging through everything again.
 
-## Where it's at
+## PROGRESS 
 
 The whole loop works end to end: import, search, cited recall, validation, skills, and reuse on a second, similar problem. The privacy rules and the performance targets are checked by the test suite. It's still early, though. Nothing is tagged or packaged yet, and the store format may change between versions (Relic upgrades an older store the next time you import).
 
