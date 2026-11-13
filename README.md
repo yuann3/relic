@@ -2,13 +2,9 @@
 
 Relic remembers what you did in your terminal, so you can find it again and reuse it.
 
-You've probably had this happen. A few months ago you fixed something nasty: a commit lost to `git reset --hard`, a build that wouldn't link, a certificate that wouldn't renew. Now it's happened again. You know you solved it once, but you can't remember how. The answer is somewhere in your shell history, your Git reflog and an old coding agent session, and none of those are easy to search, let alone together.
+It imports your shell history, Git reflogs and Claude Code sessions into one store on your machine, with secrets redacted. You can search it offline, ask a model how you did something and get an answer that cites the exact commands you ran, and keep a fix that worked as an Agent Skill for you or your coding agent.
 
-Relic pulls those traces into one store on your own machine. You can search them instantly, ask a model how you did something and get back an answer that points at the exact commands you ran, and turn a fix that worked into an Agent Skill that you or your coding agent can use next time.
-
-Say you restore a staging database from a backup twice a year. Run it once, ask Relic how you did it, confirm the steps with a check of your own (`pg_isready`, say), and keep them as a skill. Next time your agent follows the steps you verified instead of improvising.
-
-Relic is also a research project. The tool is real and works end to end, but it exists to test two ideas: that a model can dig through a large, messy history better as a recursive language model than through plain search, and that a small judgment model like Jev can do part of that digging more cheaply. Neither is proven yet.
+Relic is a research project. It tests two ideas: that recall built as a recursive language model finds the steps of a past fix better than plain search, and that a small judgment model like Jev can do part of that work more cheaply. Neither is proven yet.
 
 ## Why recall is a recursive language model
 
