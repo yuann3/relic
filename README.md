@@ -6,6 +6,8 @@ It imports your shell history, Git reflogs and Claude Code sessions into one sto
 
 Relic is a research project. It tests two ideas: that recall built as a recursive language model finds the steps of a past fix better than plain search, and that a small judgment model like Jev can do part of that work more cheaply. Neither is proven yet.
 
+![The Relic terminal UI: searching for "rescue", then opening a cherry-pick to see the commands around it and its evidence](docs/images/tui.gif)
+
 ## Why recall is a recursive language model
 
 Your history can hold hundreds of thousands of commands, and one fix is usually scattered across it: a `git reset` in your zsh history, the exit status the hook recorded, the reflog entry Git kept, a few commands a coding agent ran. All of that doesn't fit in a prompt. The usual shortcut, searching for the question's words and handing the top twenty hits to a model, tends to miss the step that matters, because that step rarely uses the words you asked with.
@@ -29,6 +31,8 @@ It isn't wired in yet. Before Jev replaces the chat model in those calls, it has
 
 Secrets are redacted before anything is stored. Passwords, tokens and keys become markers like `[REDACTED:password]`, and the raw text never reaches the database, the search index, the logs or a model. If something slips through anyway, `relic forget <id>` deletes it for good, and it stays gone when you import again.
 
+![Three history lines with a password, a bearer token and an AWS key, and the same lines in Relic with each secret replaced by a REDACTED marker](docs/images/redaction.png)
+
 ## Getting started
 
 Relic is written in Rust and runs on macOS and Linux. There's no packaged release yet, so build it from source:
@@ -46,6 +50,8 @@ relic import ~/.zsh_history
 relic import ~/src/shop        # a Git repository
 relic import --claude          # your Claude Code sessions
 ```
+
+![Importing a zsh history and a Git repository, then importing the history again, which finds nothing new](docs/images/import.gif)
 
 To also capture exit status and directory from now on, add the hook to your shell, and import what it recorded whenever you like:
 
@@ -65,6 +71,8 @@ relic ui
 ```
 
 Search runs entirely offline and is fast enough to update as you type. Results come most recently imported first, which is import order rather than when a command ran, or by relevance with `--rank`. `--json` gives you something to script against, `--fzf` lets you pick a result in fzf, and `relic ui` opens the terminal UI.
+
+![relic search finding a git reset in both the zsh history and the Git reflog, then ranked searches for certbot and cherry](docs/images/search.gif)
 
 ## Asking how you did something
 
