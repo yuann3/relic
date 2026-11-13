@@ -1,0 +1,11 @@
+variant	build	clean_build_s	bytes	stripped_bytes	file
+gnu-base	headless	28	7158408	5524968	ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpre
+gnu-base	full	29	7874312	6049400	ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpre
+gnu-fat1	headless	43	5791536	4869520	ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpre
+gnu-fat1	full	45	6279432	5262896	ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpre
+gnu-fat1-s	headless	23	4605480	3558784	ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpre
+gnu-fat1-s	full	24	5046176	3886616	ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpre
+musl-base	headless	-	7206120	5524104	ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, BuildID[sha1]
+musl-base	full	-	7849992	5983000	ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, BuildID[sha1]
+musl-fat1	headless	-	5833336	4868648	ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, BuildID[sha1]
+musl-fat1	full	-	6321288	5262024	ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, BuildID[sha1]

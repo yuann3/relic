@@ -1,0 +1,15 @@
+variant	build	clean_build_s	bytes	stripped_bytes	file
+base	headless	17	6276496	5254880
+base	full	18	6860096	5718416
+thin	headless	18	6272208	5278688
+thin	full	19	6874016	5754272
+fat1	headless	29	5097936	4503696
+fat1	full	31	5542896	4885312
+fat1-o2	headless	27	4875872	4272528
+fat1-o2	full	29	5287968	4621088
+fat1-s	headless	20	4177968	3496960
+fat1-s	full	21	4587536	3828832
+fat1-z	headless	18	3987216	2943008
+fat1-z	full	21	4369600	3193088
+fat1-abort	headless	27	4631840	4123232
+fat1-abort	full	29	4995520	4438576

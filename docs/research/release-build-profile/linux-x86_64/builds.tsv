@@ -1,0 +1,9 @@
+variant	build	clean_build_s	bytes	stripped_bytes	file
+gnu-base	headless	-	7476176	6169776	ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /
+gnu-base	full	-	8142608	6674160	ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /
+gnu-fat1	headless	-	6139952	5487496	ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /
+gnu-fat1	full	-	6640784	5921288	ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /
+gnu-fat1-s	headless	-	4666424	3912520	ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /
+gnu-fat1-s	full	-	5078912	4243496	ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /
+musl-fat1	headless	-	6310912	5630776	ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, BuildID[sha1]=
+musl-fat1	full	-	6811816	6065112	ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, BuildID[sha1]=
